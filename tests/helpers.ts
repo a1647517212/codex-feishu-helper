@@ -1,0 +1,157 @@
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { BridgeDatabase } from "../src/db/database.js";
+import { Repository } from "../src/db/repo.js";
+import { Logger } from "../src/logger.js";
+import type { BridgeConfig } from "../src/config.js";
+import type { FeishuCard } from "../src/domain/cards.js";
+import type { FeishuSender, SentMessage } from "../src/feishu/client.js";
+
+export const makeTempRepo = (): {
+  dir: string;
+  db: BridgeDatabase;
+  repo: Repository;
+  cleanup: () => void;
+} => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-feishu-test-"));
+  const db = new BridgeDatabase(join(dir, "bridge.db"));
+  db.migrate();
+  return {
+    dir,
+    db,
+    repo: new Repository(db),
+    cleanup: () => {
+      db.close();
+      try {
+        rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      } catch (error) {
+        const code = typeof error === "object" && error && "code" in error ? String(error.code) : "";
+        if (!["EBUSY", "EPERM", "ENOTEMPTY"].includes(code)) throw error;
+      }
+    }
+  };
+};
+
+export const makeConfig = (dir: string): BridgeConfig => ({
+  configPath: join(dir, "config.json"),
+  machine: { id: "test-machine", name: "Test Machine" },
+  server: { host: "127.0.0.1", port: 0, adminToken: "test-token" },
+  codex: {
+    command: "codex",
+    args: ["app-server"],
+    experimentalApi: true,
+    defaultModel: "gpt-5.4",
+    defaultReasoningEffort: "medium",
+    serviceName: "feishu_codex_bridge_test"
+  },
+  feishu: {
+    appId: "app",
+    appSecret: "secret",
+    defaultChatId: "chat_1",
+    verificationToken: undefined,
+    allowedUserIds: ["user_1"],
+    allowedChatIds: ["chat_1"]
+  },
+  storage: {
+    homeDir: dir,
+    databasePath: join(dir, "bridge.db"),
+    logPath: join(dir, "bridge.log")
+  },
+  bridge: {
+    maxFeishuTextLength: 3500,
+    queueMergeWindowMs: 300000,
+    outboxRetryBaseMs: 10,
+    outboxMaxAttempts: 3,
+    threadListLimit: 20
+  },
+  projects: []
+});
+
+export class MockFeishu implements FeishuSender {
+  sent: Array<{ type: "text" | "card"; chatId: string; root?: string | null; payload: unknown }> = [];
+  failNext = false;
+
+  async sendText(chatId: string, text: string, rootMessageId?: string | null): Promise<SentMessage> {
+    if (this.failNext) {
+      this.failNext = false;
+      throw new Error("mock send failure");
+    }
+    this.sent.push({ type: "text", chatId, root: rootMessageId, payload: text });
+    return { messageId: `msg_${this.sent.length}`, raw: {} };
+  }
+
+  async sendCard(chatId: string, card: FeishuCard, rootMessageId?: string | null): Promise<SentMessage> {
+    if (this.failNext) {
+      this.failNext = false;
+      throw new Error("mock send failure");
+    }
+    this.sent.push({ type: "card", chatId, root: rootMessageId, payload: card });
+    return { messageId: `msg_${this.sent.length}`, raw: {} };
+  }
+
+  async updateCard(): Promise<void> {}
+}
+
+export class MockCodex {
+  status = "connected" as const;
+  notifications: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
+  requests: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
+  turns: Array<{ threadId: string; text: string }> = [];
+  responses: Array<{ requestId: string | number; result: Record<string, unknown> }> = [];
+  threads: any[] = [];
+
+  on(event: "notification" | "serverRequest" | "error", handler: (message: any) => void): void {
+    const bag = event === "serverRequest" ? this.requests : this.notifications;
+    bag[event] ??= [];
+    bag[event].push(handler);
+  }
+
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+
+  async listThreads(): Promise<any[]> {
+    return this.threads;
+  }
+
+  async readThread(threadId: string): Promise<Record<string, unknown>> {
+    const thread =
+      this.threads.find((candidate) => candidate.id === threadId) ?? {
+        id: threadId,
+        name: "Imported task",
+        preview: "Imported task",
+        cwd: null,
+        status: { type: "idle" },
+        updatedAt: Date.now()
+      };
+    return { thread };
+  }
+
+  async startThread(): Promise<any> {
+    return { id: "thr_new", title: null, preview: null, cwd: null, status: "idle", updatedAt: null, raw: {} };
+  }
+
+  async resumeThread(threadId: string): Promise<any> {
+    return { id: threadId, title: null, preview: null, cwd: null, status: "idle", updatedAt: null, raw: {} };
+  }
+
+  async startTurn(threadId: string, text: string): Promise<Record<string, unknown>> {
+    this.turns.push({ threadId, text });
+    return { turn: { id: `turn_${this.turns.length}` } };
+  }
+
+  async steerTurn(threadId: string, text: string): Promise<Record<string, unknown>> {
+    this.turns.push({ threadId, text });
+    return { turnId: `turn_${this.turns.length}` };
+  }
+
+  async interruptTurn(): Promise<Record<string, unknown>> {
+    return {};
+  }
+
+  async respondToServerRequest(requestId: string | number, result: Record<string, unknown>): Promise<void> {
+    this.responses.push({ requestId, result });
+  }
+}
+
+export const makeLogger = (dir: string): Logger => new Logger(join(dir, "test.log"), "error");

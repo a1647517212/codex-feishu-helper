@@ -1,0 +1,241 @@
+import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { createInterface, type Interface } from "node:readline";
+import { EventEmitter } from "node:events";
+import type { BridgeConfig } from "../config.js";
+import type { Logger } from "../logger.js";
+import { CodexProtocolGuard, textInput, toTaskStatus, type JsonRpcMessage, type JsonRpcResponse } from "./protocol.js";
+
+export interface CodexThreadSummary {
+  id: string;
+  title: string | null;
+  preview: string | null;
+  cwd: string | null;
+  status: ReturnType<typeof toTaskStatus>;
+  updatedAt: number | null;
+  raw: Record<string, unknown>;
+}
+
+export interface CodexClientEvents {
+  notification: [message: Record<string, unknown>];
+  serverRequest: [message: Record<string, unknown>];
+  error: [error: Error];
+}
+
+export class CodexClient extends EventEmitter<CodexClientEvents> {
+  private proc: ChildProcessWithoutNullStreams | null = null;
+  private rl: Interface | null = null;
+  private requestId = 1;
+  private pending = new Map<
+    number | string,
+    { resolve: (value: unknown) => void; reject: (reason: Error) => void; timeout: NodeJS.Timeout }
+  >();
+  private initialized = false;
+  private readonly guard = new CodexProtocolGuard();
+
+  constructor(
+    private readonly config: BridgeConfig,
+    private readonly logger: Logger
+  ) {
+    super();
+  }
+
+  get status(): "connected" | "disconnected" | "not_started" | "error" {
+    if (!this.proc) return "not_started";
+    if (this.proc.exitCode != null) return "disconnected";
+    return this.initialized ? "connected" : "disconnected";
+  }
+
+  async start(): Promise<void> {
+    if (this.proc && this.proc.exitCode == null) return;
+    this.proc = spawn(this.config.codex.command, this.config.codex.args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: process.platform === "win32",
+      windowsHide: true
+    });
+    this.proc.stderr.on("data", (chunk: Buffer) => {
+      this.logger.warn("codex app-server stderr", { text: chunk.toString("utf8") });
+    });
+    this.proc.on("exit", (code, signal) => {
+      this.initialized = false;
+      this.rejectAll(new Error(`codex app-server exited: code=${code} signal=${signal}`));
+      this.logger.warn("codex app-server exited", { code, signal });
+    });
+    this.rl = createInterface({ input: this.proc.stdout });
+    this.rl.on("line", (line) => this.handleLine(line));
+    await this.initialize();
+  }
+
+  async stop(): Promise<void> {
+    if (!this.proc) return;
+    this.rl?.close();
+    this.proc.kill();
+    this.proc = null;
+    this.initialized = false;
+  }
+
+  async listThreads(limit: number): Promise<CodexThreadSummary[]> {
+    const result = await this.request("thread/list", {
+      limit,
+      archived: false,
+      sortKey: "updatedAt",
+      sortDirection: "desc"
+    });
+    const data = Array.isArray((result as { data?: unknown }).data) ? (result as { data: unknown[] }).data : [];
+    return data.map((thread) => normalizeThread(thread));
+  }
+
+  async readThread(threadId: string, includeTurns = true): Promise<Record<string, unknown>> {
+    const result = await this.request("thread/read", { threadId, includeTurns });
+    return result as Record<string, unknown>;
+  }
+
+  async startThread(params: { cwd?: string | null; model?: string | null }): Promise<CodexThreadSummary> {
+    const result = await this.request("thread/start", {
+      model: params.model ?? this.config.codex.defaultModel,
+      cwd: params.cwd ?? null,
+      serviceName: this.config.codex.serviceName,
+      experimentalRawEvents: false,
+      persistExtendedHistory: true
+    });
+    return normalizeThread((result as { thread?: unknown }).thread);
+  }
+
+  async resumeThread(threadId: string): Promise<CodexThreadSummary> {
+    const result = await this.request("thread/resume", { threadId });
+    return normalizeThread((result as { thread?: unknown }).thread);
+  }
+
+  async startTurn(threadId: string, text: string, options: { cwd?: string | null; model?: string | null } = {}): Promise<Record<string, unknown>> {
+    const result = await this.request("turn/start", {
+      threadId,
+      input: [textInput(text)],
+      cwd: options.cwd ?? undefined,
+      model: options.model ?? undefined,
+      effort: this.config.codex.defaultReasoningEffort
+    });
+    return result as Record<string, unknown>;
+  }
+
+  async steerTurn(threadId: string, text: string): Promise<Record<string, unknown>> {
+    const result = await this.request("turn/steer", { threadId, input: [textInput(text)] });
+    return result as Record<string, unknown>;
+  }
+
+  async interruptTurn(threadId: string): Promise<Record<string, unknown>> {
+    const result = await this.request("turn/interrupt", { threadId });
+    return result as Record<string, unknown>;
+  }
+
+  async respondToServerRequest(requestId: string | number, result: Record<string, unknown>): Promise<void> {
+    this.send({ id: requestId, result });
+  }
+
+  async request(method: string, params?: unknown, timeoutMs = 120000): Promise<unknown> {
+    await this.start();
+    this.guard.validateClientMethod(method);
+    const id = this.requestId++;
+    const promise = new Promise<unknown>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Codex request timed out: ${method}`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timeout });
+    });
+    this.send({ id, method, params });
+    return promise;
+  }
+
+  private async initialize(): Promise<void> {
+    const initializeResult = await this.rawRequest("initialize", {
+      clientInfo: {
+        name: "feishu_codex_bridge",
+        title: "Feishu Codex Bridge",
+        version: "0.1.0"
+      },
+      capabilities: {
+        experimentalApi: this.config.codex.experimentalApi
+      }
+    });
+    this.send({ method: "initialized", params: {} });
+    this.initialized = true;
+    this.logger.info("codex app-server initialized", {
+      result: initializeResult
+    });
+  }
+
+  private rawRequest(method: string, params?: unknown, timeoutMs = 60000): Promise<unknown> {
+    const id = this.requestId++;
+    const promise = new Promise<unknown>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.pending.delete(id);
+        reject(new Error(`Codex request timed out: ${method}`));
+      }, timeoutMs);
+      this.pending.set(id, { resolve, reject, timeout });
+    });
+    this.send({ id, method, params });
+    return promise;
+  }
+
+  private send(message: Record<string, unknown>): void {
+    if (!this.proc || this.proc.exitCode != null) {
+      throw new Error("codex app-server is not running");
+    }
+    this.proc.stdin.write(`${JSON.stringify(message)}\n`);
+  }
+
+  private handleLine(line: string): void {
+    if (!line.trim()) return;
+    let message: JsonRpcMessage;
+    try {
+      message = JSON.parse(line) as JsonRpcMessage;
+    } catch (error) {
+      this.logger.warn("failed to parse codex app-server line", { line, error: String(error) });
+      return;
+    }
+    if ("id" in message && ("result" in message || "error" in message)) {
+      this.handleResponse(message as JsonRpcResponse);
+      return;
+    }
+    if ("id" in message && "method" in message) {
+      this.emit("serverRequest", message as unknown as Record<string, unknown>);
+      return;
+    }
+    if ("method" in message) {
+      this.emit("notification", message as unknown as Record<string, unknown>);
+    }
+  }
+
+  private handleResponse(message: JsonRpcResponse): void {
+    const pending = this.pending.get(message.id);
+    if (!pending) return;
+    clearTimeout(pending.timeout);
+    this.pending.delete(message.id);
+    if (message.error) {
+      pending.reject(new Error(message.error.message));
+      return;
+    }
+    pending.resolve(message.result);
+  }
+
+  private rejectAll(error: Error): void {
+    for (const [id, pending] of this.pending) {
+      clearTimeout(pending.timeout);
+      pending.reject(error);
+      this.pending.delete(id);
+    }
+    this.emit("error", error);
+  }
+}
+
+const normalizeThread = (value: unknown): CodexThreadSummary => {
+  const raw = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  return {
+    id: String(raw.id ?? ""),
+    title: typeof raw.name === "string" ? raw.name : null,
+    preview: typeof raw.preview === "string" ? raw.preview : null,
+    cwd: typeof raw.cwd === "string" ? raw.cwd : null,
+    status: toTaskStatus(raw.status),
+    updatedAt: typeof raw.updatedAt === "number" ? raw.updatedAt : null,
+    raw
+  };
+};

@@ -1,0 +1,38 @@
+{
+  "name": "codex-feishu",
+  "version": "0.1.0",
+  "description": "Feishu topic control bridge for local Codex app-server sessions.",
+  "type": "module",
+  "bin": {
+    "feishu-codex": "./dist/src/main.js"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/main.ts serve",
+    "start": "node dist/src/main.js serve",
+    "doctor": "tsx src/main.ts doctor",
+    "generate:codex-schema": "node scripts/generate-codex-schema.mjs",
+    "test": "node --no-warnings=ExperimentalWarning --test --import tsx \"tests/**/*.test.ts\"",
+    "check": "npm run build && npm test"
+  },
+  "keywords": [
+    "codex",
+    "feishu",
+    "lark",
+    "bridge",
+    "app-server"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.3",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "machine": {
+    "id": "desktop-windows",
+    "name": "Windows Codex Desktop"
+  },
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "adminToken": "${FEISHU_CODEX_ADMIN_TOKEN}"
+  },
+  "codex": {
+    "command": "${CODEX_COMMAND:-codex}",
+    "args": ["app-server"],
+    "experimentalApi": true,
+    "defaultModel": "gpt-5.4",
+    "defaultReasoningEffort": "medium",
+    "serviceName": "feishu_codex_bridge"
+  },
+  "feishu": {
+    "appId": "${FEISHU_APP_ID}",
+    "appSecret": "${FEISHU_APP_SECRET}",
+    "defaultChatId": "${FEISHU_DEFAULT_CHAT_ID}",
+    "verificationToken": "${FEISHU_VERIFICATION_TOKEN}",
+    "allowedUserIds": ["${FEISHU_ALLOWED_USER_IDS}"],
+    "allowedChatIds": ["${FEISHU_ALLOWED_CHAT_IDS}"]
+  },
+  "storage": {
+    "homeDir": "~/.feishu-codex",
+    "databasePath": "~/.feishu-codex/bridge.db",
+    "logPath": "~/.feishu-codex/bridge.log"
+  },
+  "bridge": {
+    "maxFeishuTextLength": 3500,
+    "queueMergeWindowMs": 300000,
+    "outboxRetryBaseMs": 15000,
+    "outboxMaxAttempts": 8,
+    "threadListLimit": 20
+  },
+  "projects": []
+}
