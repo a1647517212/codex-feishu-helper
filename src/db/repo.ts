@@ -310,6 +310,13 @@ export class Repository {
       .run(nowIso(), id);
   }
 
+  cancelQueuedMessage(id: string): boolean {
+    const result = this.database.db
+      .prepare("UPDATE message_queue SET status = 'cancelled', failed_at = ? WHERE id = ? AND status = 'queued'")
+      .run(nowIso(), id);
+    return Number(result.changes) > 0;
+  }
+
   upsertPendingApproval(input: {
     sessionBindingId: string;
     codexThreadId: string;

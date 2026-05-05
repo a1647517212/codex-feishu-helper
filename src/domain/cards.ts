@@ -1,4 +1,4 @@
-import type { DiagnosticSnapshot, PendingApproval, TaskStatusProjection } from "../core/types.js";
+import type { DiagnosticSnapshot, PendingApproval, QueuedMessage, TaskStatusProjection } from "../core/types.js";
 
 export type FeishuCard = Record<string, unknown>;
 
@@ -85,6 +85,18 @@ export class CardRenderer {
     ]);
   }
 
+  queueCard(bindingId: string, queued: QueuedMessage[]): FeishuCard {
+    if (queued.length === 0) return card("后续要求队列", [text("当前没有排队中的后续要求。")]);
+    const elements: Record<string, unknown>[] = [];
+    for (const item of queued.slice(0, 10)) {
+      elements.push(
+        text([`位置：${item.position}`, `内容：${item.text}`, `时间：${item.createdAt}`].join("\n")),
+        actions([button("取消这条", "queue_cancel", { bindingId, queueId: item.id })])
+      );
+    }
+    return card("后续要求队列", elements);
+  }
+
   diagnosticCard(snapshot: DiagnosticSnapshot): FeishuCard {
     return card("Bridge 诊断", [
       text(
@@ -137,7 +149,7 @@ const taskButtons = (status: string): [string, string][] => {
     case "running":
       return [
         ["查看进度", "task_status"],
-        ["查看变更", "task_diff"],
+        ["查看队列", "queue_view"],
         ["追加要求", "task_append_hint"],
         ["停止任务", "task_stop"]
       ];

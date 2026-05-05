@@ -100,6 +100,8 @@ export class MockCodex {
   turns: Array<{ threadId: string; text: string }> = [];
   responses: Array<{ requestId: string | number; result: Record<string, unknown> }> = [];
   threads: any[] = [];
+  listCalls: Array<{ limit?: number; pageSize?: number; maxPages?: number }> = [];
+  readFailures = new Map<string, Error>();
 
   on(event: "notification" | "serverRequest" | "error", handler: (message: any) => void): void {
     const bag = event === "serverRequest" ? this.requests : this.notifications;
@@ -110,11 +112,14 @@ export class MockCodex {
   async start(): Promise<void> {}
   async stop(): Promise<void> {}
 
-  async listThreads(): Promise<any[]> {
+  async listThreads(limit?: number, options?: { pageSize?: number; maxPages?: number }): Promise<any[]> {
+    this.listCalls.push({ limit, ...options });
     return this.threads;
   }
 
   async readThread(threadId: string): Promise<Record<string, unknown>> {
+    const failure = this.readFailures.get(threadId);
+    if (failure) throw failure;
     const thread =
       this.threads.find((candidate) => candidate.id === threadId) ?? {
         id: threadId,

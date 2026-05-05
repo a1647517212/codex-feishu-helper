@@ -3,7 +3,7 @@ import type { BridgeConfig } from "../config.js";
 import type { FeishuIncomingMessage } from "../core/types.js";
 
 const secretFilePatterns = [
-  /^\.env(\.|$)/i,
+  /(^|[\\/])\.env([\\/.]|$)/i,
   /(^|[\\/])id_rsa$/i,
   /(^|[\\/])id_ed25519$/i,
   /(^|[\\/])\.ssh([\\/]|$)/i,

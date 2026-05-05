@@ -50,6 +50,33 @@ Observed smoke result:
 {"health":true,"doctor":true,"appServer":"connected","verify":"ok-smoke"}
 ```
 
+## Second-Pass Acceptance Review
+
+Reviewed against `FEISHU_CODEX_CONTROL_DESIGN.md` P0 and section 44 acceptance items. The implementation now includes these extra hardening points:
+
+- `thread/list` uses cursor pagination with bounded page size and the app-server `updated_at` sort key.
+- Persisted session bindings are reconciled with `thread/read` during bootstrap, so a restarted bridge can correct stale running or idle status.
+- Busy topic replies are retained in `message_queue`; users can open a queue card and cancel individual queued messages.
+- The next queued message is delivered automatically after the current turn completes.
+- Malformed Codex notifications are recorded as `protocol.validation_failed` semantic events instead of disappearing into logs only.
+- Completed-turn notification outbox entries use turn-level dedupe keys.
+- Project path checks block path traversal and absolute or nested secret files such as `.env`.
+- HTTP smoke coverage is part of `npm run check`, including `/healthz`, authenticated `/doctor`, and Feishu URL verification.
+
+Latest verification:
+
+```powershell
+npm run check
+git diff --check
+```
+
+Result:
+
+```text
+14 tests passed
+no whitespace errors
+```
+
 ## First Real Feishu Setup
 
 1. Create or reuse a Feishu enterprise self-built app.

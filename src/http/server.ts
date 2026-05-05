@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import type { AddressInfo } from "node:net";
 import type { BridgeConfig } from "../config.js";
 import type { CardRenderer } from "../domain/cards.js";
 import type { DiagnosticsService } from "../bridge/diagnostics.js";
@@ -24,9 +25,14 @@ export class BridgeHttpServer {
     if (this.server) return;
     this.server = createServer((req, res) => {
       this.route(req, res).catch((error) => {
-        this.diagnostics.recordError(error);
-        this.logger.error("http request failed", { error: String(error), url: req.url });
         const status = error instanceof HttpError ? error.status : 500;
+        const meta = { error: String(error), url: req.url, status };
+        if (status >= 500) {
+          this.diagnostics.recordError(error);
+          this.logger.error("http request failed", meta);
+        } else {
+          this.logger.warn("http request rejected", meta);
+        }
         writeJson(res, status, { ok: false, error: error instanceof Error ? error.message : String(error) });
       });
     });
@@ -45,6 +51,14 @@ export class BridgeHttpServer {
       this.server!.close((error) => (error ? reject(error) : resolve()));
     });
     this.server = null;
+  }
+
+  localUrl(): string {
+    if (!this.server) throw new Error("bridge http server is not started");
+    const address = this.server.address() as AddressInfo | string | null;
+    if (!address || typeof address === "string") throw new Error("bridge http server address is unavailable");
+    const host = address.address === "::" || address.address === "0.0.0.0" ? "127.0.0.1" : address.address;
+    return `http://${host}:${address.port}`;
   }
 
   private async route(req: IncomingMessage, res: ServerResponse): Promise<void> {

@@ -73,15 +73,27 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
     this.initialized = false;
   }
 
-  async listThreads(limit: number): Promise<CodexThreadSummary[]> {
-    const result = await this.request("thread/list", {
-      limit,
-      archived: false,
-      sortKey: "updatedAt",
-      sortDirection: "desc"
-    });
-    const data = Array.isArray((result as { data?: unknown }).data) ? (result as { data: unknown[] }).data : [];
-    return data.map((thread) => normalizeThread(thread));
+  async listThreads(limit: number, options: { pageSize?: number; maxPages?: number } = {}): Promise<CodexThreadSummary[]> {
+    const target = Math.max(1, limit);
+    const pageSize = Math.max(1, Math.min(options.pageSize ?? target, target, 50));
+    const maxPages = Math.max(1, options.maxPages ?? Math.ceil(target / pageSize));
+    const threads: CodexThreadSummary[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < maxPages && threads.length < target; page++) {
+      const result = await this.request("thread/list", {
+        limit: Math.min(pageSize, target - threads.length),
+        cursor,
+        archived: false,
+        sortKey: "updated_at",
+        sortDirection: "desc"
+      });
+      const response = result && typeof result === "object" ? (result as Record<string, unknown>) : {};
+      const data = Array.isArray(response.data) ? response.data : [];
+      threads.push(...data.map((thread) => normalizeThread(thread)));
+      cursor = typeof response.nextCursor === "string" && response.nextCursor.length > 0 ? response.nextCursor : null;
+      if (!cursor || data.length === 0) break;
+    }
+    return threads.slice(0, target);
   }
 
   async readThread(threadId: string, includeTurns = true): Promise<Record<string, unknown>> {

@@ -33,6 +33,57 @@ test("running topic replies are queued instead of dropped", async () => {
   }
 });
 
+test("three running topic replies stay queued and can be cancelled", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_queue",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_queue",
+      title: "Queue task",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    for (let index = 1; index <= 3; index++) {
+      await service.handleMessage({
+        messageId: `msg_queue_${index}`,
+        chatId: "chat_1",
+        rootMessageId: "root_queue",
+        threadId: null,
+        userId: "user_1",
+        text: `追加要求 ${index}`
+      });
+    }
+    const queued = repo.listQueuedMessages(binding.id);
+    assert.equal(queued.length, 3);
+    await service.handleCardAction({
+      actionId: "act_queue_view",
+      action: "queue_view",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_queue",
+      payload: { bindingId: binding.id }
+    });
+    assert.equal(feishu.sent.some((entry) => entry.type === "card"), true);
+    await service.handleCardAction({
+      actionId: "act_queue_cancel",
+      action: "queue_cancel",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_queue",
+      payload: { bindingId: binding.id, queueId: queued[1]!.id }
+    });
+    assert.equal(repo.getQueuedMessage(queued[1]!.id)?.status, "cancelled");
+    assert.equal(repo.listEventsForBinding(binding.id).some((event) => event.eventType === "queue.cancelled"), true);
+  } finally {
+    cleanup();
+  }
+});
+
 test("approval action is idempotent and sends one codex response", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
@@ -125,6 +176,68 @@ test("claim sessions card can bind an existing Codex thread", async () => {
     assert.ok(binding);
     assert.equal(binding.feishuTopicRootMessageId, "root_existing");
     assert.equal(binding.createdFrom, "codex_app_claimed");
+  } finally {
+    cleanup();
+  }
+});
+
+test("malformed completed notification records protocol validation event", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_bad_event",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_bad_event",
+      title: "Bad event task",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: {
+          status: "completed"
+        }
+      }
+    });
+    const events = repo.listEventsForBinding(binding.id);
+    assert.equal(events.some((event) => event.eventType === "protocol.validation_failed"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("bootstrap reconciles persisted running binding to current thread status", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    codex.threads = [
+      {
+        id: "thr_reconcile",
+        name: "Reconciled task",
+        preview: "Reconciled task",
+        cwd: dir,
+        status: { type: "idle" },
+        updatedAt: Date.now()
+      }
+    ];
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_reconcile",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_reconcile",
+      title: "Reconciled task",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    await service.bootstrapProjectsFromConfig();
+    assert.equal(repo.findBindingById(binding.id)?.status, "idle");
+    assert.equal(repo.listEventsForBinding(binding.id).some((event) => event.eventType === "session.reconciled"), true);
   } finally {
     cleanup();
   }

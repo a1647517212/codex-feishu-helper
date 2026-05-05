@@ -43,6 +43,36 @@ export class TaskService {
         sandboxPolicy: project.sandboxPolicy
       });
     }
+    await this.reconcilePersistedBindings();
+  }
+
+  async reconcilePersistedBindings(): Promise<void> {
+    for (const binding of this.repo.listBindings(this.config.bridge.threadListLimit)) {
+      try {
+        const detail = await this.codex.readThread(binding.codexThreadId, false);
+        const thread = normalizeThreadFromDetail(binding.codexThreadId, detail);
+        if (thread.status !== binding.status) {
+          this.repo.updateBindingStatus(binding.id, thread.status);
+          this.repo.insertEvent({
+            sessionBindingId: binding.id,
+            codexThreadId: binding.codexThreadId,
+            eventType: "session.reconciled",
+            eventPayload: {
+              previousStatus: binding.status,
+              currentStatus: thread.status
+            }
+          });
+          await this.updateTaskCard(binding.id);
+        }
+      } catch (error) {
+        this.repo.insertEvent({
+          sessionBindingId: binding.id,
+          codexThreadId: binding.codexThreadId,
+          eventType: "session.reconcile_failed",
+          eventPayload: { error: String(error) }
+        });
+      }
+    }
   }
 
   async showConsole(chatId: string, rootMessageId?: string | null): Promise<void> {
@@ -235,6 +265,12 @@ export class TaskService {
       case "task_run_tests":
         await this.startSyntheticInstruction(action, "请根据当前项目的测试配置运行相关测试；如果失败，先分析原因，再修复。");
         return { ok: true };
+      case "queue_view":
+        await this.sendQueueCard(action);
+        return { ok: true };
+      case "queue_cancel":
+        await this.cancelQueuedMessage(action);
+        return { ok: true, text: "已处理队列操作。" };
       case "task_stop":
         await this.stopTask(String(action.payload.bindingId ?? ""));
         return { ok: true };
@@ -275,6 +311,32 @@ export class TaskService {
   private async sendProjectList(action: FeishuCardAction): Promise<void> {
     const chatId = action.chatId || this.config.feishu.defaultChatId || "";
     await this.feishu.sendCard(chatId, this.cards.projectListCard(this.repo.listProjects()), action.rootMessageId);
+  }
+
+  private async sendQueueCard(action: FeishuCardAction): Promise<void> {
+    const bindingId = String(action.payload.bindingId ?? "");
+    const binding = this.repo.findBindingById(bindingId);
+    if (!binding) throw new Error("任务不存在");
+    await this.feishu.sendCard(
+      action.chatId || binding.feishuChatId,
+      this.cards.queueCard(binding.id, this.repo.listQueuedMessages(binding.id)),
+      action.rootMessageId ?? binding.feishuTopicRootMessageId
+    );
+  }
+
+  private async cancelQueuedMessage(action: FeishuCardAction): Promise<void> {
+    const bindingId = String(action.payload.bindingId ?? "");
+    const queueId = String(action.payload.queueId ?? "");
+    const binding = this.repo.findBindingById(bindingId);
+    if (!binding) throw new Error("任务不存在");
+    const cancelled = this.repo.cancelQueuedMessage(queueId);
+    this.repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      eventType: "queue.cancelled",
+      eventPayload: { queueId, cancelled }
+    });
+    await this.updateTaskCard(binding.id);
   }
 
   private async startSyntheticInstruction(action: FeishuCardAction, instruction: string): Promise<void> {
@@ -374,6 +436,15 @@ export class TaskService {
   }
 
   private async handleCodexNotification(message: Record<string, unknown>): Promise<void> {
+    try {
+      await this.applyCodexNotification(message);
+    } catch (error) {
+      this.recordProtocolFailure(message, error);
+      this.logger.warn("codex notification parse failed", { error: String(error), message });
+    }
+  }
+
+  private async applyCodexNotification(message: Record<string, unknown>): Promise<void> {
     const method = String(message.method ?? "");
     const params = message.params && typeof message.params === "object" ? (message.params as Record<string, unknown>) : {};
     const threadId = asString(params.threadId);
@@ -395,13 +466,15 @@ export class TaskService {
     }
     if (method === "turn/completed") {
       const turn = params.turn && typeof params.turn === "object" ? (params.turn as Record<string, unknown>) : {};
+      const turnId = asString(turn.id);
+      if (!turnId) throw new Error("turn/completed notification missing turn.id");
       const status = normalizeTurnStatus(turn.status);
-      this.repo.updateBindingStatus(binding.id, status, asString(turn.id));
+      this.repo.updateBindingStatus(binding.id, status, turnId);
       const gitSummary = await this.git.summarize(binding.cwd);
       const event = this.repo.insertEvent({
         sessionBindingId: binding.id,
         codexThreadId: threadId,
-        codexTurnId: asString(turn.id),
+        codexTurnId: turnId,
         eventType: status === "completed" ? "task.completed" : `task.${status}`,
         eventPayload: {
           text: status === "completed" ? "任务完成" : `任务状态：${status}`,
@@ -412,7 +485,7 @@ export class TaskService {
       this.repo.insertEvent({
         sessionBindingId: binding.id,
         codexThreadId: threadId,
-        codexTurnId: asString(turn.id),
+        codexTurnId: turnId,
         eventType: "git.changed_files",
         eventPayload: { count: gitSummary.changedFiles, statusText: gitSummary.statusText }
       });
@@ -423,7 +496,7 @@ export class TaskService {
         feishuChatId: binding.feishuChatId,
         feishuTopicRootMessageId: binding.feishuTopicRootMessageId,
         payload: { card: this.cards.taskStatusCard(this.projection.buildTaskStatus(binding.id)) },
-        dedupeKey: `turn:${threadId}:${turn.id ?? event.seq}:completed`
+        dedupeKey: `turn:${threadId}:${turnId}:completed`
       });
       await this.deliverNextQueuedMessage(binding.id);
       await this.updateTaskCard(binding.id);
@@ -440,6 +513,24 @@ export class TaskService {
         });
       }
     }
+  }
+
+  private recordProtocolFailure(message: Record<string, unknown>, error: unknown): void {
+    const params = message.params && typeof message.params === "object" ? (message.params as Record<string, unknown>) : {};
+    const threadId = asString(params.threadId);
+    if (!threadId) return;
+    const binding = this.repo.findBindingByThreadId(threadId);
+    if (!binding) return;
+    this.repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: threadId,
+      codexTurnId: asString(params.turnId),
+      eventType: "protocol.validation_failed",
+      eventPayload: {
+        method: asString(message.method),
+        error: String(error)
+      }
+    });
   }
 
   private async deliverNextQueuedMessage(bindingId: string): Promise<void> {
