@@ -57,6 +57,7 @@ const ConfigSchema = z.object({
       appSecret: z.string().optional(),
       defaultChatId: z.string().optional(),
       verificationToken: z.string().optional(),
+      encryptKey: z.string().optional(),
       transport: TransportModeSchema.optional(),
       messageTransport: TransportModeSchema.optional(),
       cardActionTransport: TransportModeSchema.optional(),
@@ -165,7 +166,7 @@ export const loadConfig = (override?: string): BridgeConfig => {
       ...parsed.feishu,
       messageTransport: parsed.feishu.messageTransport ?? parsed.feishu.transport ?? "long_connection",
       cardActionTransport: parsed.feishu.cardActionTransport ?? parsed.feishu.transport ?? "long_connection",
-      interactionMode: parsed.feishu.interactionMode ?? "message_command"
+      interactionMode: parsed.feishu.interactionMode ?? "hybrid"
     },
     configPath,
     storage: { ...parsed.storage, homeDir, databasePath, logPath },

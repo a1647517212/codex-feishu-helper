@@ -11,7 +11,7 @@ import type { InteractionMode } from "../config.js";
 export type FeishuCard = Record<string, unknown>;
 
 export class CardRenderer {
-  constructor(private readonly interactionMode: InteractionMode = "message_command") {}
+  constructor(private readonly interactionMode: InteractionMode = "hybrid") {}
 
   consoleCard(stats: { running: number; approvals: number; queued: number; completedToday: number }): FeishuCard {
     const elements = [
@@ -227,19 +227,28 @@ export class CardRenderer {
 }
 
 const card = (title: string, elements: Record<string, unknown>[]): FeishuCard => ({
-  config: { wide_screen_mode: true },
+  schema: "2.0",
   header: { title: { tag: "plain_text", content: title }, template: "blue" },
-  elements
+  body: {
+    elements
+  }
 });
 
 const text = (content: string): Record<string, unknown> => ({
-  tag: "div",
-  text: { tag: "lark_md", content: truncate(content, 3000) }
+  tag: "markdown",
+  content: truncate(content, 3000)
 });
 
 const actions = (items: Record<string, unknown>[]): Record<string, unknown> => ({
-  tag: "action",
-  actions: items.slice(0, 4)
+  tag: "column_set",
+  horizontal_align: "left",
+  columns: items.slice(0, 4).map((item) => ({
+    tag: "column",
+    width: "weighted",
+    weight: 1,
+    vertical_align: "top",
+    elements: [item]
+  }))
 });
 
 const maybeActions = (mode: InteractionMode, items: Record<string, unknown>[]): Record<string, unknown> | null =>
@@ -252,16 +261,28 @@ const pushMaybe = (elements: Record<string, unknown>[], element: Record<string, 
 const commandText = (commands: string[]): Record<string, unknown> =>
   text(`可直接发送命令：\n${commands.map((command) => `- ${command}`).join("\n")}`);
 
-const button = (label: string, action: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
-  tag: "button",
-  text: { tag: "plain_text", content: label },
-  type: action.includes("deny") || action.includes("stop") ? "danger" : "default",
-  value: {
+const button = (label: string, action: string, extra: Record<string, unknown> = {}): Record<string, unknown> => {
+  const actionId = `act_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const value = {
     action,
-    actionId: `act_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+    actionId,
     ...extra
-  }
-});
+  };
+  return {
+    tag: "button",
+    text: { tag: "plain_text", content: label },
+    type: action.includes("deny") || action.includes("stop") ? "danger_filled" : "default",
+    width: "default",
+    size: "medium",
+    name: `Button_${action}`,
+    behaviors: [
+      {
+        type: "callback",
+        value
+      }
+    ]
+  };
+};
 
 const taskButtons = (status: string): [string, string][] => {
   switch (status) {

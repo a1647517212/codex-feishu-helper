@@ -2,6 +2,28 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { TaskService } from "../src/bridge/task-service.js";
 import { makeConfig, makeLogger, makeTempRepo, MockCodex, MockFeishu } from "./helpers.js";
+import { CardRenderer } from "../src/domain/cards.js";
+
+test("hybrid cards render Card JSON 2.0 callback buttons for long connection", () => {
+  const card = new CardRenderer("hybrid").consoleCard({ running: 0, approvals: 0, queued: 0, completedToday: 0 });
+  const buttons = collectButtons(card);
+  assert.equal(card.schema, "2.0");
+  assert.ok(buttons.length > 0);
+  for (const button of buttons) {
+    assert.equal("value" in button, false);
+    const behaviors = button.behaviors as Array<Record<string, unknown>>;
+    assert.equal(behaviors[0]?.type, "callback");
+    const value = behaviors[0]?.value as Record<string, unknown>;
+    assert.equal(typeof value.action, "string");
+    assert.equal(typeof value.actionId, "string");
+  }
+});
+
+test("message-command cards hide callback buttons but keep commands", () => {
+  const card = new CardRenderer("message_command").consoleCard({ running: 0, approvals: 0, queued: 0, completedToday: 0 });
+  assert.equal(collectButtons(card).length, 0);
+  assert.equal(JSON.stringify(card).includes("/tasks"), true);
+});
 
 test("running topic replies are queued instead of dropped", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
@@ -776,3 +798,19 @@ test("approval list and detail buttons render stored pending approvals", async (
     cleanup();
   }
 });
+
+const collectButtons = (value: unknown): Array<Record<string, unknown>> => {
+  const found: Array<Record<string, unknown>> = [];
+  const visit = (node: unknown): void => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      for (const item of node) visit(item);
+      return;
+    }
+    const object = node as Record<string, unknown>;
+    if (object.tag === "button") found.push(object);
+    for (const child of Object.values(object)) visit(child);
+  };
+  visit(value);
+  return found;
+};

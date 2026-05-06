@@ -29,6 +29,7 @@ export class FeishuLongConnectionServer {
     }
     const dispatcher = new Lark.EventDispatcher({
       verificationToken: this.config.feishu.verificationToken,
+      encryptKey: this.config.feishu.encryptKey,
       loggerLevel: Lark.LoggerLevel.warn
     });
     if (this.config.feishu.messageTransport === "long_connection") {

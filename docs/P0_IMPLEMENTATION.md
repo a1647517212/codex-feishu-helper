@@ -89,7 +89,7 @@ no whitespace errors
 3. Configure Events subscription mode to long connection for message events.
 4. Subscribe to `im.message.receive_v1`.
 5. Grant message receive/send/reply permissions. Enable the permission that lets the bot receive all group messages if it should work without `@`.
-6. If you also want interactive buttons, subscribe to the callback `card.action.trigger`, configure a public HTTPS card callback URL, and use `interactionMode=hybrid` or `card_callback`.
+6. If you also want interactive buttons, subscribe to the newer callback `card.action.trigger`. Prefer long connection for this callback and use `interactionMode=hybrid`; only configure a public HTTPS card callback URL when the tenant requires HTTP callback fallback.
 7. For HTTP callback fallback, configure only the URLs you actually use:
    - Event callback: `https://<public-url>/feishu/events`
    - Card callback: `https://<public-url>/feishu/card`
@@ -110,8 +110,8 @@ Verified with the bot in group `codex-ep` using long connection:
 
 ## Current Boundaries
 
-- Long connection is still the default for messages; card callbacks are optional because message-command mode covers the local-only case.
-- Card button callbacks require the Feishu app to subscribe to `card.action.trigger` and provide a public callback path. If the bridge never records `lastFeishuCardActionAt`, the failing path is before `TaskService`; use message commands or add a public callback/relay.
+- Long connection is still the default for messages and newer card callbacks; message-command mode remains the local-only fallback.
+- Card button callbacks require the Feishu app to subscribe to the newer `card.action.trigger` callback. Prefer long connection for this callback. If the bridge never records `lastFeishuCardActionAt`, the failing path is before `TaskService`; verify the Feishu callback subscription first, then fall back to message commands or add a public callback/relay only if the tenant requires HTTP callbacks.
 - Desktop owner IPC routing is intentionally not implemented in P0.
 - The bridge does not mirror the Codex App GUI. It controls persisted Codex sessions through `app-server`.
 - High-risk approvals do not expose a task-wide trust button.

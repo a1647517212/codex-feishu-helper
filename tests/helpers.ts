@@ -50,6 +50,7 @@ export const makeConfig = (dir: string): BridgeConfig => ({
     appSecret: "secret",
     defaultChatId: "chat_1",
     verificationToken: undefined,
+    encryptKey: undefined,
     transport: "long_connection",
     messageTransport: "long_connection",
     cardActionTransport: "long_connection",

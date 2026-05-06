@@ -9,8 +9,8 @@ Design coverage is tracked in [docs/FULL_DESIGN_COVERAGE.md](docs/FULL_DESIGN_CO
 ## P0 Scope
 
 - Feishu long-connection message transport by default.
-- Message-command interaction mode by default, so local-only deployments do not need a public callback URL for core controls.
-- Card actions can use HTTP callback as an optional fallback/enhancement when a public callback endpoint is available.
+- Button-first hybrid interaction by default: cards render buttons and also show equivalent commands.
+- Card actions use Feishu long connection by default through the newer `card.action.trigger` callback event; HTTP callback remains an optional fallback when a public endpoint is available.
 - Local Codex `app-server` JSONL transport over stdio.
 - `thread/list`, `thread/read`, `thread/start`, `thread/resume`, `turn/start`, `turn/steer`, and `turn/interrupt` wrappers.
 - SQLite tables for projects, session bindings, semantic events, pending approvals, idempotent actions, incoming message dedupe, message queue, notification outbox, trusted Feishu subjects, and device state.
@@ -45,9 +45,9 @@ Start the bridge:
 npm run start
 ```
 
-The default Feishu control path is long-connection group messages plus text commands. Keep the local HTTP server on `127.0.0.1`; it is used for health, diagnostics, and optional HTTP fallback, not as the primary Feishu entry point.
+The default Feishu control path is long-connection group messages plus long-connection card actions. Keep the local HTTP server on `127.0.0.1`; it is used for health, diagnostics, and optional HTTP fallback, not as the primary Feishu entry point.
 
-Card button callbacks are not required for local-only deployments. If your tenant or app version needs card callbacks, Feishu must be able to call a public HTTPS callback URL. Without a public URL, keep `feishu.interactionMode` as `message_command`; cards will show equivalent commands instead of callback buttons.
+Card button callbacks do not require exposing the local machine when the Feishu app uses the newer `card.action.trigger` callback event in long-connection mode. If a tenant is still wired to the older card callback path that only supports HTTP callback URLs, switch `feishu.interactionMode` to `message_command`, or set `feishu.cardActionTransport` to `http_callback` and expose only `/feishu/card` through a public relay/tunnel.
 
 Expose these endpoints only when the matching transport is `http_callback`:
 
@@ -67,13 +67,14 @@ curl http://127.0.0.1:8787/doctor -H "authorization: Bearer <token>"
 In the Feishu developer console:
 
 - Enable the bot and add it to the target group.
-- Set Events and Callbacks subscription mode to long connection if both messages and callbacks should enter by WebSocket.
+- Set Events and Callbacks subscription mode to long connection if both messages and newer card callbacks should enter by WebSocket.
 - Subscribe to `im.message.receive_v1`.
-- Subscribe to the card callback `card.action.trigger` only if you will expose a public HTTPS callback URL for interactive card buttons.
+- Subscribe to the newer card callback `card.action.trigger` for interactive card buttons. Choose long connection for this callback when available.
 - Enable the permission to receive all group messages, so the bot can read group messages without `@`.
 - Grant message send/reply/card scopes needed by `im/v1/messages` APIs.
 - Grant `im:chat:readonly` or equivalent chat read scope if you want to search or verify group information by API.
-- If card clicks show a Feishu-side error and `/doctor` never records `lastFeishuCardActionAt`, leave `feishu.interactionMode` as `message_command` and use the commands below. To restore buttons, configure the bot card callback request URL to `https://<public-url>/feishu/card`, set `feishu.cardActionTransport` to `http_callback`, and set `feishu.interactionMode` to `hybrid` or `card_callback`.
+- If event encryption is enabled in the app, set `feishu.encryptKey`; otherwise keep encryption disabled while using the bridge.
+- If card clicks show a Feishu-side error and `/doctor` never records `lastFeishuCardActionAt`, first confirm the app subscribes to the newer `card.action.trigger` callback with long connection. If the tenant only supports HTTP callbacks for cards, either leave `feishu.interactionMode` as `message_command` or configure a public relay/tunnel for `https://<public-url>/feishu/card`, set `feishu.cardActionTransport` to `http_callback`, and keep `feishu.interactionMode` as `hybrid`.
 
 Operational notes:
 
@@ -98,8 +99,9 @@ Inside the allowed Feishu chat:
 
 When the bridge must run on a private local IP with no domain, use one of these patterns:
 
-- Message-command mode, recommended: Feishu messages arrive through the bot long connection, and every card action has an equivalent text command. This is the current default.
-- Hybrid callback mode: keep message commands, but expose only `/feishu/card` through a public HTTPS endpoint or tunnel for better button UX.
+- Long-connection hybrid mode, recommended: Feishu messages and newer card actions arrive through the bot long connection. Cards show buttons plus equivalent text commands, with no public local IP or domain required.
+- Message-command mode: disable buttons and use the command text only. This is the most conservative fallback when the app cannot receive card callbacks over long connection.
+- HTTP hybrid fallback: keep message commands, but expose only `/feishu/card` through a public HTTPS endpoint or tunnel when a tenant requires HTTP for cards.
 - Cloud relay: deploy a tiny public relay that accepts Feishu callbacks while the local bridge maintains an outbound WebSocket or polling connection to it. This avoids exposing the local machine, but adds a small hosted component.
 - Local custom protocol: use URL buttons such as `codex-feishu://...` on Feishu Desktop. This is Windows-desktop-only and less reliable across web/mobile clients.
 - Polling/search fallback: have the local bridge poll message history through OpenAPI. This avoids event delivery but needs extra message-history permissions and is slower than long connection.
