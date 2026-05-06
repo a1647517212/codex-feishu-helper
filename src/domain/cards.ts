@@ -1,4 +1,11 @@
-import type { DiagnosticSnapshot, PendingApproval, QueuedMessage, TaskStatusProjection } from "../core/types.js";
+import type {
+  DiagnosticSnapshot,
+  NotificationOutboxItem,
+  PendingApproval,
+  QueuedMessage,
+  TaskEvent,
+  TaskStatusProjection
+} from "../core/types.js";
 
 export type FeishuCard = Record<string, unknown>;
 
@@ -85,6 +92,44 @@ export class CardRenderer {
     ]);
   }
 
+  approvalDetailCard(approval: PendingApproval): FeishuCard {
+    return card("审批详情", [
+      text(
+        [
+          `类型：${approval.approvalType === "command_execution" ? "命令执行" : "文件修改"}`,
+          `状态：${approval.status}`,
+          `风险：${riskText(approval.riskLevel)}`,
+          approval.command ? `命令：${approval.command}` : null,
+          approval.filePaths.length > 0 ? `文件：\n${approval.filePaths.slice(0, 12).join("\n")}` : null,
+          approval.reason ? `原因：${approval.reason}` : null,
+          `请求时间：${approval.requestedAt}`,
+          approval.resolvedAt ? `处理时间：${approval.resolvedAt}` : null
+        ]
+          .filter(Boolean)
+          .join("\n")
+      )
+    ]);
+  }
+
+  approvalListCard(approvals: PendingApproval[]): FeishuCard {
+    if (approvals.length === 0) return card("待确认列表", [text("当前没有待确认项。")]);
+    const elements: Record<string, unknown>[] = [];
+    for (const approval of approvals.slice(0, 10)) {
+      elements.push(
+        text(
+          [
+            `类型：${approval.approvalType === "command_execution" ? "命令执行" : "文件修改"}`,
+            `风险：${riskText(approval.riskLevel)}`,
+            approval.command ? `命令：${approval.command}` : `文件数：${approval.filePaths.length}`,
+            `时间：${approval.requestedAt}`
+          ].join("\n")
+        ),
+        actions([button("查看详情", "approval_detail", { approvalId: approval.id })])
+      );
+    }
+    return card("待确认列表", elements);
+  }
+
   queueCard(bindingId: string, queued: QueuedMessage[]): FeishuCard {
     if (queued.length === 0) return card("后续要求队列", [text("当前没有排队中的后续要求。")]);
     const elements: Record<string, unknown>[] = [];
@@ -95,6 +140,45 @@ export class CardRenderer {
       );
     }
     return card("后续要求队列", elements);
+  }
+
+  eventListCard(title: string, events: TaskEvent[]): FeishuCard {
+    if (events.length === 0) return card(title, [text("暂无记录。")]);
+    return card(
+      title,
+      events.slice(0, 12).map((event) =>
+        text(
+          [
+            `#${event.seq} ${event.eventType}`,
+            event.codexTurnId ? `turn：${event.codexTurnId}` : null,
+            event.eventPayload.text ? `内容：${String(event.eventPayload.text)}` : null,
+            `时间：${event.createdAt}`
+          ]
+            .filter(Boolean)
+            .join("\n")
+        )
+      )
+    );
+  }
+
+  notificationHistoryCard(items: NotificationOutboxItem[]): FeishuCard {
+    if (items.length === 0) return card("通知历史", [text("暂无通知记录。")]);
+    return card(
+      "通知历史",
+      items.slice(0, 12).map((item) =>
+        text(
+          [
+            `类型：${item.notificationType}`,
+            `状态：${item.status}`,
+            `尝试：${item.attempts}`,
+            item.lastError ? `错误：${item.lastError}` : null,
+            `时间：${item.createdAt}`
+          ]
+            .filter(Boolean)
+            .join("\n")
+        )
+      )
+    );
   }
 
   diagnosticCard(snapshot: DiagnosticSnapshot): FeishuCard {

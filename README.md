@@ -4,6 +4,8 @@
 
 The first implementation uses TypeScript on Node.js 22 with the built-in `node:sqlite` module. That keeps the Windows install path simple while still giving the bridge durable state for task bindings, queues, approvals, and notification retry.
 
+Design coverage is tracked in [docs/FULL_DESIGN_COVERAGE.md](docs/FULL_DESIGN_COVERAGE.md). It compares every section of `FEISHU_CODEX_CONTROL_DESIGN.md` against the current implementation, including unfinished P1/P2 work.
+
 ## P0 Scope
 
 - Feishu HTTP event callback and card action callback.

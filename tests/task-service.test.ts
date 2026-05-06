@@ -242,3 +242,105 @@ test("bootstrap reconciles persisted running binding to current thread status", 
     cleanup();
   }
 });
+
+test("visible task and diagnostic buttons have concrete handlers", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_buttons",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_buttons",
+      title: "Button task",
+      cwd: dir,
+      status: "completed",
+      createdFrom: "manual_import"
+    });
+    repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      eventType: "task.completed",
+      eventPayload: { text: "done" }
+    });
+    repo.enqueueOutbox({
+      sessionBindingId: binding.id,
+      notificationType: "task_completed",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_buttons",
+      payload: { text: "done" },
+      dedupeKey: "button-history"
+    });
+    for (const [index, action] of ["task_status", "task_logs", "task_diff", "notification_history", "send_test_notification"].entries()) {
+      await service.handleCardAction({
+        actionId: `act_button_${index}`,
+        action,
+        userId: "user_1",
+        chatId: "chat_1",
+        rootMessageId: "root_buttons",
+        payload: { bindingId: binding.id }
+      });
+    }
+    await service.handleCardAction({
+      actionId: "act_archive",
+      action: "task_archive",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_buttons",
+      payload: { bindingId: binding.id }
+    });
+    assert.equal(repo.findBindingById(binding.id)?.status, "archived");
+    assert.equal(feishu.sent.filter((entry) => entry.type === "card").length >= 3, true);
+    assert.equal(feishu.sent.filter((entry) => entry.type === "text").length >= 2, true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("approval list and detail buttons render stored pending approvals", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_approval_buttons",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_approval_buttons",
+      title: "Approval button task",
+      status: "waiting_for_approval",
+      createdFrom: "manual_import"
+    });
+    const approval = repo.upsertPendingApproval({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      requestId: "req_approval_buttons",
+      approvalType: "command_execution",
+      command: "npm test",
+      riskLevel: "low"
+    });
+    await service.handleCardAction({
+      actionId: "act_approval_list",
+      action: "approval_list",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_approval_buttons",
+      payload: { bindingId: binding.id }
+    });
+    await service.handleCardAction({
+      actionId: "act_approval_detail",
+      action: "approval_detail",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_approval_buttons",
+      payload: { approvalId: approval.id }
+    });
+    assert.equal(feishu.sent.length, 2);
+    assert.equal(feishu.sent.every((entry) => entry.type === "card"), true);
+  } finally {
+    cleanup();
+  }
+});

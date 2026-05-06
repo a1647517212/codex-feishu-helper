@@ -443,6 +443,13 @@ export class Repository {
       .map((row) => mapOutbox(row as DbRow));
   }
 
+  listRecentOutbox(limit = 20): NotificationOutboxItem[] {
+    return this.database.db
+      .prepare("SELECT * FROM notification_outbox ORDER BY created_at DESC LIMIT ?")
+      .all(limit)
+      .map((row) => mapOutbox(row as DbRow));
+  }
+
   updateOutbox(id: string, status: OutboxStatus, attempts: number, lastError?: string | null, nextAttemptAt?: string | null): void {
     this.database.db
       .prepare(

@@ -35,11 +35,15 @@ export class GitInspector {
   }
 
   async diffSummary(cwd: string): Promise<string> {
-    const status = await this.git(cwd, ["status", "--short"]);
-    if (!status.trim()) return "当前项目没有 Git 变更。";
-    const lines = status.trim().split(/\r?\n/).slice(0, 40);
-    const suffix = status.trim().split(/\r?\n/).length > lines.length ? "\n..." : "";
-    return `Git 变更摘要：\n${lines.join("\n")}${suffix}`;
+    try {
+      const status = await this.git(cwd, ["status", "--short"]);
+      if (!status.trim()) return "当前项目没有 Git 变更。";
+      const lines = status.trim().split(/\r?\n/).slice(0, 40);
+      const suffix = status.trim().split(/\r?\n/).length > lines.length ? "\n..." : "";
+      return `Git 变更摘要：\n${lines.join("\n")}${suffix}`;
+    } catch {
+      return "当前工作目录不是 Git 仓库，暂时无法展示 Git 变更。";
+    }
   }
 
   private async git(cwd: string, args: string[]): Promise<string> {

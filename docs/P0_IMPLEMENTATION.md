@@ -73,7 +73,7 @@ git diff --check
 Result:
 
 ```text
-14 tests passed
+16 tests passed
 no whitespace errors
 ```
 

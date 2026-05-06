@@ -259,6 +259,19 @@ export class TaskService {
       case "project_list":
         await this.sendProjectList(action);
         return { ok: true };
+      case "send_test_notification":
+        await this.sendTestNotification(action);
+        return { ok: true };
+      case "notification_history":
+        await this.sendNotificationHistory(action);
+        return { ok: true };
+      case "task_status":
+      case "task_logs":
+        await this.sendTaskEvents(action, action.action === "task_logs" ? "任务日志" : "任务进度");
+        return { ok: true };
+      case "task_diff":
+        await this.sendTaskDiff(action);
+        return { ok: true };
       case "task_continue":
       case "task_append_hint":
         return { ok: true, text: "请直接在本话题回复要追加的要求。" };
@@ -273,6 +286,24 @@ export class TaskService {
         return { ok: true, text: "已处理队列操作。" };
       case "task_stop":
         await this.stopTask(String(action.payload.bindingId ?? ""));
+        return { ok: true };
+      case "task_retry":
+        await this.startSyntheticInstruction(action, "请重试刚才失败的任务；先复盘失败原因，再继续执行。");
+        return { ok: true };
+      case "task_analyze_failure":
+        await this.startSyntheticInstruction(action, "请分析刚才任务失败的原因，给出修复方案，并在安全范围内修复。");
+        return { ok: true };
+      case "task_archive":
+        await this.archiveTask(String(action.payload.bindingId ?? ""));
+        return { ok: true, text: "任务已归档。" };
+      case "new_related_task":
+        await this.sendNewTaskDraft(action);
+        return { ok: true };
+      case "approval_list":
+        await this.sendApprovalList(action);
+        return { ok: true };
+      case "approval_detail":
+        await this.sendApprovalDetail(action);
         return { ok: true };
       case "approval_once":
         await this.resolveApproval(String(action.payload.approvalId ?? ""), "once", action.userId);
@@ -313,10 +344,67 @@ export class TaskService {
     await this.feishu.sendCard(chatId, this.cards.projectListCard(this.repo.listProjects()), action.rootMessageId);
   }
 
-  private async sendQueueCard(action: FeishuCardAction): Promise<void> {
-    const bindingId = String(action.payload.bindingId ?? "");
+  private async sendTestNotification(action: FeishuCardAction): Promise<void> {
+    const chatId = action.chatId || this.config.feishu.defaultChatId || "";
+    await this.feishu.sendText(chatId, "测试通知：Bridge 可以向飞书发送消息。", action.rootMessageId);
+  }
+
+  private async sendNotificationHistory(action: FeishuCardAction): Promise<void> {
+    const chatId = action.chatId || this.config.feishu.defaultChatId || "";
+    await this.feishu.sendCard(chatId, this.cards.notificationHistoryCard(this.repo.listRecentOutbox(20)), action.rootMessageId);
+  }
+
+  private async sendTaskEvents(action: FeishuCardAction, title: string): Promise<void> {
+    const binding = this.requireBinding(action);
+    await this.feishu.sendCard(
+      action.chatId || binding.feishuChatId,
+      this.cards.eventListCard(title, this.repo.listEventsForBinding(binding.id, 20)),
+      action.rootMessageId ?? binding.feishuTopicRootMessageId
+    );
+  }
+
+  private async sendTaskDiff(action: FeishuCardAction): Promise<void> {
+    const binding = this.requireBinding(action);
+    const summary = binding.cwd ? await this.git.diffSummary(binding.cwd) : "当前任务没有可用工作目录。";
+    await this.feishu.sendText(action.chatId || binding.feishuChatId, summary, action.rootMessageId ?? binding.feishuTopicRootMessageId);
+  }
+
+  private async sendApprovalList(action: FeishuCardAction): Promise<void> {
+    const binding = this.requireBinding(action);
+    await this.feishu.sendCard(
+      action.chatId || binding.feishuChatId,
+      this.cards.approvalListCard(this.repo.listPendingApprovals(binding.id)),
+      action.rootMessageId ?? binding.feishuTopicRootMessageId
+    );
+  }
+
+  private async sendApprovalDetail(action: FeishuCardAction): Promise<void> {
+    const approvalId = String(action.payload.approvalId ?? "");
+    const approval = this.repo.findApprovalById(approvalId);
+    if (!approval) throw new Error("审批不存在");
+    const binding = this.repo.findBindingById(approval.sessionBindingId);
+    await this.feishu.sendCard(
+      action.chatId || binding?.feishuChatId || this.config.feishu.defaultChatId || "",
+      this.cards.approvalDetailCard(approval),
+      action.rootMessageId ?? binding?.feishuTopicRootMessageId
+    );
+  }
+
+  private async archiveTask(bindingId: string): Promise<void> {
     const binding = this.repo.findBindingById(bindingId);
     if (!binding) throw new Error("任务不存在");
+    this.repo.updateBindingStatus(binding.id, "archived");
+    this.repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      eventType: "task.archived",
+      eventPayload: {}
+    });
+    await this.updateTaskCard(binding.id);
+  }
+
+  private async sendQueueCard(action: FeishuCardAction): Promise<void> {
+    const binding = this.requireBinding(action);
     await this.feishu.sendCard(
       action.chatId || binding.feishuChatId,
       this.cards.queueCard(binding.id, this.repo.listQueuedMessages(binding.id)),
@@ -325,10 +413,8 @@ export class TaskService {
   }
 
   private async cancelQueuedMessage(action: FeishuCardAction): Promise<void> {
-    const bindingId = String(action.payload.bindingId ?? "");
     const queueId = String(action.payload.queueId ?? "");
-    const binding = this.repo.findBindingById(bindingId);
-    if (!binding) throw new Error("任务不存在");
+    const binding = this.requireBinding(action);
     const cancelled = this.repo.cancelQueuedMessage(queueId);
     this.repo.insertEvent({
       sessionBindingId: binding.id,
@@ -340,9 +426,7 @@ export class TaskService {
   }
 
   private async startSyntheticInstruction(action: FeishuCardAction, instruction: string): Promise<void> {
-    const bindingId = String(action.payload.bindingId ?? "");
-    const binding = this.repo.findBindingById(bindingId);
-    if (!binding) throw new Error("任务不存在");
+    const binding = this.requireBinding(action);
     await this.continueBindingFromFeishu(binding, {
       messageId: newId("synthetic_msg"),
       chatId: binding.feishuChatId,
@@ -365,6 +449,13 @@ export class TaskService {
       eventPayload: {}
     });
     await this.updateTaskCard(binding.id);
+  }
+
+  private requireBinding(action: FeishuCardAction): SessionBinding {
+    const bindingId = String(action.payload.bindingId ?? "");
+    const binding = this.repo.findBindingById(bindingId);
+    if (!binding) throw new Error("任务不存在");
+    return binding;
   }
 
   private async resolveApproval(id: string, decision: "once" | "task" | "deny", userId: string): Promise<void> {
