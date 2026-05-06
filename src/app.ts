@@ -30,7 +30,7 @@ export class BridgeApp {
     this.logger = new Logger(config.storage.logPath);
     this.codex = new CodexClient(config, this.logger);
     this.feishu = new FeishuClient(config, this.logger);
-    this.diagnostics = new DiagnosticsService(config, this.repo, this.codex);
+    this.diagnostics = new DiagnosticsService(config, this.repo, this.codex, this.feishu);
     this.tasks = new TaskService(config, this.repo, this.codex, this.feishu, this.logger, this.diagnostics);
     this.outbox = new OutboxWorker(config, this.repo, this.feishu, this.logger);
     this.http = new BridgeHttpServer(config, this.tasks, this.diagnostics, new CardRenderer(config.feishu.interactionMode), this.logger);

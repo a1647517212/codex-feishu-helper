@@ -12,6 +12,7 @@ test("repository persists bindings and keeps action requests idempotent", () => 
       codexThreadId: "thr_1",
       feishuChatId: "chat_1",
       feishuTopicRootMessageId: "msg_root",
+      feishuThreadId: "omt_1",
       title: "Fix bug",
       cwd: "C:\\repo",
       status: "idle",
@@ -19,6 +20,7 @@ test("repository persists bindings and keeps action requests idempotent", () => 
       createdByFeishuUserId: "user_1"
     });
     assert.equal(repo.findBindingByTopic("chat_1", "msg_root")?.id, binding.id);
+    assert.equal(repo.findBindingByFeishuThreadId("chat_1", "omt_1")?.id, binding.id);
     const first = repo.beginAction({
       actionId: "act_1",
       actionType: "task_continue",
@@ -103,6 +105,24 @@ test("notification outbox deduplicates completed turn notifications", () => {
       dedupeKey: "turn:thr_1:turn_1:completed"
     });
     assert.equal(repo.listDueOutbox(10).length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("repository matches project path across Windows slash styles", () => {
+  const { repo, cleanup } = makeTempRepo();
+  try {
+    const project = repo.upsertProject({ name: "Playground", rootPath: "C:/Users/EPEANZ/Documents/Playground/" });
+    assert.equal(repo.findProjectForPath("C:\\Users\\EPEANZ\\Documents\\Playground")?.id, project.id);
+    assert.equal(repo.findProjectForPath("C:\\Users\\EPEANZ\\Documents\\Playground\\src")?.id, project.id);
+    assert.equal(
+      repo.findProjectForContext({
+        cwd: "C:\\Users\\EPEANZ\\Documents\\Playground\\src",
+        gitRepoRoot: "C:\\Users\\EPEANZ\\Documents\\Playground"
+      })?.id,
+      project.id
+    );
   } finally {
     cleanup();
   }

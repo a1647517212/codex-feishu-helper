@@ -25,3 +25,26 @@ test("outbox retries after transient Feishu failure", async () => {
     cleanup();
   }
 });
+
+test("outbox prefers replying inside Feishu thread when binding has thread id", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const worker = new OutboxWorker(config, repo, feishu, makeLogger(dir));
+    repo.enqueueOutbox({
+      notificationType: "console",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "msg_root",
+      feishuThreadId: "omt_1",
+      payload: { text: "hello in thread" },
+      dedupeKey: "threaded-hello"
+    });
+    await worker.flush();
+    assert.equal(feishu.sent.length, 1);
+    assert.equal(feishu.sent[0]?.mode, "thread");
+    assert.equal(feishu.sent[0]?.root, "msg_root");
+  } finally {
+    cleanup();
+  }
+});

@@ -33,20 +33,56 @@ export class CardRenderer {
     ]);
   }
 
-  claimableSessionsCard(threads: Array<{ id: string; title: string; status: string; cwd: string | null }>): FeishuCard {
+  waitingForPromptCard(project: { name: string; rootPath: string }): FeishuCard {
+    return card("新任务", [
+      text(`项目：${project.name}\n状态：等待任务描述\n目录：${project.rootPath}\n\n请直接回复你希望 Codex 完成的事情。`),
+      commandText(["直接回复任务描述", "/projects", "/doctor"])
+    ]);
+  }
+
+  claimableSessionsCard(
+    threads: Array<{
+      id: string;
+      title: string;
+      status: string;
+      cwd: string | null;
+      projectName?: string | null;
+      claimed?: boolean;
+      bindingId?: string | null;
+      rootMessageId?: string | null;
+      unclassified?: boolean;
+    }>
+  ): FeishuCard {
     const elements: Record<string, unknown>[] = [];
     for (const thread of threads.slice(0, 10)) {
       elements.push(
         text(
           [
+            thread.projectName ? `项目：${thread.projectName}` : null,
             `任务：${thread.title}`,
             `状态：${statusText(thread.status)}`,
             `工作目录：${thread.cwd ?? "未知"}`,
-            `继续命令：/claim ${thread.id}`
-          ].join("\n")
+            thread.unclassified ? "归类：未归类任务" : null,
+            thread.claimed ? "状态：这个任务已经可以在飞书继续" : `继续命令：/claim ${thread.id}`
+          ]
+            .filter(Boolean)
+            .join("\n")
         )
       );
-      pushMaybe(elements, maybeActions(this.interactionMode, [button("在飞书继续", "claim_thread", { codexThreadId: thread.id })]));
+      const actionsForThread = thread.claimed
+        ? [
+            button("打开话题", "open_bound_topic", {
+              bindingId: thread.bindingId,
+              rootMessageId: thread.rootMessageId ?? thread.bindingId
+            }),
+            button("查看摘要", "claim_summary", { codexThreadId: thread.id })
+          ]
+        : [
+            button("在飞书继续", "claim_thread", { codexThreadId: thread.id }),
+            button("查看摘要", "claim_summary", { codexThreadId: thread.id }),
+            button("忽略", "claim_ignore", { codexThreadId: thread.id })
+          ];
+      pushMaybe(elements, maybeActions(this.interactionMode, actionsForThread));
     }
     return card("电脑上的 Codex 任务", elements.length > 0 ? elements : [text("没有发现可接管的本机 Codex 任务。")]);
   }
@@ -61,6 +97,37 @@ export class CardRenderer {
           text([`项目：${project.name}`, `目录：${project.rootPath}`, `飞书群：${project.feishuChatId ?? "默认控制台"}`].join("\n"))
         )
     );
+  }
+
+  projectCard(project: {
+    id: string;
+    name: string;
+    rootPath: string;
+    branchName?: string | null;
+    runningCount: number;
+    pendingApprovals: number;
+    completedCount: number;
+  }): FeishuCard {
+    const elements = [
+      text(
+        [
+          `路径：${project.rootPath}`,
+          project.branchName ? `分支：${project.branchName}` : null,
+          `运行中：${project.runningCount}`,
+          `待确认：${project.pendingApprovals}`,
+          `最近完成：${project.completedCount}`
+        ]
+          .filter(Boolean)
+          .join("\n")
+      ),
+      maybeActions(this.interactionMode, [
+        button("新建任务", "new_task", { projectId: project.id }),
+        button("接管任务", "claim_sessions", { projectId: project.id }),
+        button("查看变更", "project_diff", { projectId: project.id }),
+        button("运行中任务", "project_running", { projectId: project.id })
+      ])
+    ].filter(Boolean) as Record<string, unknown>[];
+    return card(project.name, elements);
   }
 
   taskStatusCard(projection: TaskStatusProjection): FeishuCard {
@@ -175,6 +242,97 @@ export class CardRenderer {
     );
   }
 
+  unclassifiedThreadsCard(
+    threads: Array<{
+      id: string;
+      title: string;
+      cwd: string | null;
+      status: string;
+      canCreateProject?: boolean;
+    }>
+  ): FeishuCard {
+    if (threads.length === 0) return card("未归类任务", [text("当前没有未归类任务。")]);
+    const elements: Record<string, unknown>[] = [];
+    for (const thread of threads.slice(0, 10)) {
+      elements.push(
+        text(
+          [
+            `任务：${thread.title}`,
+            `状态：${statusText(thread.status)}`,
+            `路径：${thread.cwd ?? "未知"}`,
+            this.interactionMode === "message_command" ? `继续：/claim ${thread.id}` : null,
+            this.interactionMode === "message_command" ? `摘要：/claim summary ${thread.id}` : null,
+            this.interactionMode === "message_command" && thread.canCreateProject ? `创建项目：/create-project ${thread.id}` : null,
+            this.interactionMode === "message_command" ? `归入已有项目：/pick-project ${thread.id}` : null,
+            this.interactionMode === "message_command" ? `忽略：/claim ignore ${thread.id}` : null
+          ]
+            .filter(Boolean)
+            .join("\n")
+        )
+      );
+      pushMaybe(
+        elements,
+        maybeActions(this.interactionMode, [
+          button("在飞书继续", "claim_thread", { codexThreadId: thread.id }),
+          button("查看摘要", "claim_summary", { codexThreadId: thread.id })
+        ])
+      );
+      pushMaybe(
+        elements,
+        maybeActions(this.interactionMode, [
+          ...(thread.canCreateProject ? [button("创建为新项目", "unclassified_create_project", { codexThreadId: thread.id })] : []),
+          button("归入已有项目", "unclassified_pick_project", { codexThreadId: thread.id }),
+          button("忽略", "claim_ignore", { codexThreadId: thread.id })
+        ])
+      );
+    }
+    return card("未归类任务", elements);
+  }
+
+  projectAssignmentCard(
+    thread: { id: string; title: string; cwd: string | null },
+    projects: Array<{ id: string; name: string; rootPath: string }>
+  ): FeishuCard {
+    const elements: Record<string, unknown>[] = [
+      text(
+        [
+          `任务：${thread.title}`,
+          `路径：${thread.cwd ?? "未知"}`,
+          projects.length === 0 ? `创建项目：/create-project ${thread.id}` : null
+        ]
+          .filter(Boolean)
+          .join("\n")
+      )
+    ];
+    if (projects.length === 0) {
+      elements.push(text("当前没有可归入的项目，请先创建为新项目。"));
+      return card("归入已有项目", elements);
+    }
+    for (const project of projects.slice(0, 10)) {
+      elements.push(
+        text(
+          [
+            `项目：${project.name}`,
+            `目录：${project.rootPath}`,
+            this.interactionMode === "message_command" ? `归入命令：/assign-project ${thread.id} ${project.id}` : null
+          ]
+            .filter(Boolean)
+            .join("\n")
+        )
+      );
+      pushMaybe(
+        elements,
+        maybeActions(this.interactionMode, [
+          button("归入这个项目", "unclassified_assign_project", {
+            codexThreadId: thread.id,
+            projectId: project.id
+          })
+        ])
+      );
+    }
+    return card("归入已有项目", elements);
+  }
+
   notificationHistoryCard(items: NotificationOutboxItem[]): FeishuCard {
     if (items.length === 0) return card("通知历史", [text("暂无通知记录。")]);
     return card(
@@ -206,6 +364,7 @@ export class CardRenderer {
           `消息接入：${snapshot.feishuMessageTransport === "long_connection" ? "长连接" : "HTTP 回调"}`,
           `卡片回调：${snapshot.feishuCardActionTransport === "long_connection" ? "长连接" : "HTTP 回调"}`,
           `交互模式：${interactionModeText(snapshot.feishuInteractionMode)}`,
+          `默认群：${chatDiagnosticText(snapshot)}`,
           `运行中任务：${snapshot.runningTasksCount}`,
           `待确认：${snapshot.pendingApprovalsCount}`,
           `待发送通知：${snapshot.pendingOutboxCount}`,
@@ -274,7 +433,7 @@ const button = (label: string, action: string, extra: Record<string, unknown> = 
     type: action.includes("deny") || action.includes("stop") ? "danger_filled" : "default",
     width: "default",
     size: "medium",
-    name: `Button_${action}`,
+    name: `Button_${actionId}`,
     behaviors: [
       {
         type: "callback",
@@ -357,6 +516,15 @@ const riskText = (risk: string): string => ({ low: "低", medium: "中", high: "
 
 const interactionModeText = (mode: string): string =>
   ({ message_command: "消息命令", hybrid: "按钮+消息命令", card_callback: "卡片按钮" })[mode] ?? mode;
+
+const chatDiagnosticText = (snapshot: DiagnosticSnapshot): string => {
+  const chat = snapshot.feishuDefaultChatDiagnostic;
+  if (!snapshot.feishuDefaultChatId) return "未配置";
+  if (!chat) return `${snapshot.feishuDefaultChatId}（未检查）`;
+  if (!chat.ok) return `${snapshot.feishuDefaultChatId}（检查失败：${truncate(chat.error ?? chat.recommendation, 120)}）`;
+  const mode = chat.fullTopicMode ? "话题消息形式" : "普通会话消息形式";
+  return [chat.name ?? snapshot.feishuDefaultChatId, mode, chat.recommendation].join("\n");
+};
 
 const truncate = (value: string, max: number): string =>
   value.length > max ? `${value.slice(0, max - 20)}\n...(已截断)` : value;

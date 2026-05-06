@@ -7,6 +7,7 @@ import type {
   ActionStatus,
   ApprovalStatus,
   CreatedFrom,
+  IgnoredThread,
   NotificationOutboxItem,
   NotificationType,
   OutboxStatus,
@@ -29,36 +30,49 @@ export class Repository {
     id?: string;
     name: string;
     rootPath: string;
+    gitRepoRoot?: string | null;
+    gitRemote?: string | null;
+    defaultBranch?: string | null;
     feishuChatId?: string | null;
     defaultModel?: string | null;
     approvalPolicy?: string | null;
     sandboxPolicy?: string | null;
+    notificationPolicy?: string | null;
   }): Project {
     const now = nowIso();
     const id = input.id ?? newId("proj");
     this.database.db
       .prepare(
         `INSERT INTO projects (
-          id, name, root_path, default_model, approval_policy, sandbox_policy,
-          feishu_chat_id, status, created_at, updated_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+          id, name, root_path, git_repo_root, git_remote, default_branch,
+          default_model, approval_policy, sandbox_policy, feishu_chat_id,
+          notification_policy, status, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
         ON CONFLICT(id) DO UPDATE SET
           name = excluded.name,
           root_path = excluded.root_path,
+          git_repo_root = COALESCE(excluded.git_repo_root, projects.git_repo_root),
+          git_remote = COALESCE(excluded.git_remote, projects.git_remote),
+          default_branch = COALESCE(excluded.default_branch, projects.default_branch),
           default_model = excluded.default_model,
           approval_policy = excluded.approval_policy,
           sandbox_policy = excluded.sandbox_policy,
           feishu_chat_id = excluded.feishu_chat_id,
+          notification_policy = COALESCE(excluded.notification_policy, projects.notification_policy),
           updated_at = excluded.updated_at`
       )
       .run(
         id,
         input.name,
         input.rootPath,
+        input.gitRepoRoot ?? null,
+        input.gitRemote ?? null,
+        input.defaultBranch ?? null,
         input.defaultModel ?? null,
         input.approvalPolicy ?? null,
         input.sandboxPolicy ?? null,
         input.feishuChatId ?? null,
+        input.notificationPolicy ?? null,
         now,
         now
       );
@@ -77,15 +91,113 @@ export class Repository {
       .map((row) => mapProject(row as DbRow));
   }
 
+  updateBindingProject(bindingId: string, projectId: string | null): void {
+    this.database.db
+      .prepare("UPDATE session_bindings SET project_id = ?, updated_at = ? WHERE id = ?")
+      .run(projectId, nowIso(), bindingId);
+  }
+
+  ignoreThread(input: {
+    codexThreadId: string;
+    title?: string | null;
+    cwd?: string | null;
+    gitRepoRoot?: string | null;
+    reason?: string | null;
+    createdByFeishuUserId?: string | null;
+  }): IgnoredThread {
+    this.database.db
+      .prepare(
+        `INSERT INTO ignored_threads (
+          codex_thread_id, title, cwd, git_repo_root, reason, created_by_feishu_user_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(codex_thread_id) DO UPDATE SET
+          title = COALESCE(excluded.title, ignored_threads.title),
+          cwd = COALESCE(excluded.cwd, ignored_threads.cwd),
+          git_repo_root = COALESCE(excluded.git_repo_root, ignored_threads.git_repo_root),
+          reason = COALESCE(excluded.reason, ignored_threads.reason),
+          created_by_feishu_user_id = COALESCE(excluded.created_by_feishu_user_id, ignored_threads.created_by_feishu_user_id)`
+      )
+      .run(
+        input.codexThreadId,
+        input.title ?? null,
+        input.cwd ?? null,
+        input.gitRepoRoot ?? null,
+        input.reason ?? null,
+        input.createdByFeishuUserId ?? null,
+        nowIso()
+      );
+    return this.findIgnoredThread(input.codexThreadId)!;
+  }
+
+  unignoreThread(codexThreadId: string): void {
+    this.database.db.prepare("DELETE FROM ignored_threads WHERE codex_thread_id = ?").run(codexThreadId);
+  }
+
+  findIgnoredThread(codexThreadId: string): IgnoredThread | null {
+    const row = this.database.db
+      .prepare("SELECT * FROM ignored_threads WHERE codex_thread_id = ?")
+      .get(codexThreadId) as DbRow | undefined;
+    return row ? mapIgnoredThread(row) : null;
+  }
+
+  listIgnoredThreads(limit = 100): IgnoredThread[] {
+    return this.database.db
+      .prepare("SELECT * FROM ignored_threads ORDER BY created_at DESC LIMIT ?")
+      .all(limit)
+      .map((row) => mapIgnoredThread(row as DbRow));
+  }
+
   findProjectForPath(cwd: string | null | undefined): Project | null {
     if (!cwd) return null;
-    const normalized = cwd.toLowerCase();
+    const normalized = normalizeFsPath(cwd);
     return (
       this.listProjects().find((project) => {
-        const root = project.rootPath.toLowerCase();
-        return normalized === root || normalized.startsWith(`${root}\\`) || normalized.startsWith(`${root}/`);
+        const root = normalizeFsPath(project.rootPath);
+        return normalized === root || normalized.startsWith(`${root}/`);
       }) ?? null
     );
+  }
+
+  findProjectForContext(input: {
+    cwd?: string | null;
+    gitRepoRoot?: string | null;
+    gitRemote?: string | null;
+  }): Project | null {
+    const byPath = this.findProjectForPath(input.cwd);
+    if (byPath) return byPath;
+    if (input.cwd) {
+      const byRule = this.findProjectByPrefixRule("cwd_prefix", input.cwd);
+      if (byRule) return byRule;
+    }
+    const projects = this.listProjects();
+    if (input.gitRepoRoot) {
+      const normalizedRoot = normalizeFsPath(input.gitRepoRoot);
+      const matched = projects.find((project) => {
+        const projectRoot = project.gitRepoRoot ? normalizeFsPath(project.gitRepoRoot) : null;
+        return projectRoot === normalizedRoot;
+      });
+      if (matched) return matched;
+      const byRule = this.findProjectByExactRule("git_repo_root", input.gitRepoRoot);
+      if (byRule) return byRule;
+    }
+    if (input.gitRemote) {
+      return projects.find((project) => project.gitRemote === input.gitRemote) ?? this.findProjectByExactRule("git_remote", input.gitRemote);
+    }
+    return null;
+  }
+
+  addProjectMatchRule(input: {
+    projectId: string;
+    ruleType: "cwd_prefix" | "git_repo_root" | "git_remote";
+    ruleValue: string;
+  }): void {
+    this.database.db
+      .prepare(
+        `INSERT INTO project_match_rules (id, project_id, rule_type, rule_value, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(project_id, rule_type, rule_value) DO NOTHING`
+      )
+      .run(newId("rule"), input.projectId, input.ruleType, normalizeRuleValue(input.ruleValue), nowIso());
   }
 
   createOrUpdateBinding(input: {
@@ -156,6 +268,55 @@ export class Repository {
       .run(status, lastTurnId ?? null, nowIso(), bindingId);
   }
 
+  updateBindingTopic(input: {
+    bindingId: string;
+    feishuChatId: string;
+    feishuTopicRootMessageId: string;
+    feishuThreadId?: string | null;
+  }): void {
+    this.database.db
+      .prepare(
+        `UPDATE session_bindings
+         SET feishu_chat_id = ?, feishu_topic_root_message_id = ?, feishu_thread_id = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(input.feishuChatId, input.feishuTopicRootMessageId, input.feishuThreadId ?? null, nowIso(), input.bindingId);
+  }
+
+  activateDraftBinding(input: {
+    bindingId: string;
+    codexThreadId: string;
+    projectId?: string | null;
+    title: string;
+    cwd?: string | null;
+    gitRepoRoot?: string | null;
+    branchName?: string | null;
+    worktreePath?: string | null;
+    status: TaskStatus;
+    lastTurnId?: string | null;
+  }): void {
+    this.database.db
+      .prepare(
+        `UPDATE session_bindings
+         SET codex_thread_id = ?, project_id = ?, title = ?, cwd = ?, git_repo_root = ?,
+             branch_name = ?, worktree_path = ?, status = ?, last_turn_id = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(
+        input.codexThreadId,
+        input.projectId ?? null,
+        input.title,
+        input.cwd ?? null,
+        input.gitRepoRoot ?? null,
+        input.branchName ?? null,
+        input.worktreePath ?? null,
+        input.status,
+        input.lastTurnId ?? null,
+        nowIso(),
+        input.bindingId
+      );
+  }
+
   findBindingById(id: string): SessionBinding | null {
     const row = this.database.db.prepare("SELECT * FROM session_bindings WHERE id = ?").get(id) as
       | DbRow
@@ -167,6 +328,13 @@ export class Repository {
     const row = this.database.db.prepare("SELECT * FROM session_bindings WHERE codex_thread_id = ?").get(threadId) as
       | DbRow
       | undefined;
+    return row ? mapBinding(row) : null;
+  }
+
+  findBindingByFeishuThreadId(chatId: string, feishuThreadId: string): SessionBinding | null {
+    const row = this.database.db
+      .prepare("SELECT * FROM session_bindings WHERE feishu_chat_id = ? AND feishu_thread_id = ?")
+      .get(chatId, feishuThreadId) as DbRow | undefined;
     return row ? mapBinding(row) : null;
   }
 
@@ -427,6 +595,7 @@ export class Repository {
     notificationType: NotificationType;
     feishuChatId: string;
     feishuTopicRootMessageId?: string | null;
+    feishuThreadId?: string | null;
     payload: Record<string, unknown>;
     dedupeKey: string;
     delayMs?: number;
@@ -437,9 +606,9 @@ export class Repository {
       .prepare(
         `INSERT INTO notification_outbox (
           id, session_binding_id, event_seq, notification_type, feishu_chat_id,
-          feishu_topic_root_message_id, payload_json, dedupe_key, status,
-          attempts, next_attempt_at, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+          feishu_topic_root_message_id, feishu_thread_id, payload_json, dedupe_key,
+          status, attempts, next_attempt_at, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
         ON CONFLICT(dedupe_key) DO NOTHING`
       )
       .run(
@@ -449,6 +618,7 @@ export class Repository {
         input.notificationType,
         input.feishuChatId,
         input.feishuTopicRootMessageId ?? null,
+        input.feishuThreadId ?? null,
         stringifyJson(input.payload),
         input.dedupeKey,
         plusMsIso(input.delayMs ?? 0),
@@ -496,7 +666,8 @@ export class Repository {
       "notification_outbox",
       "pending_approvals",
       "message_queue",
-      "incoming_messages"
+      "incoming_messages",
+      "ignored_threads"
     ]);
     if (!allowed.has(table)) throw new Error(`Unsupported count table: ${table}`);
     const row = this.database.db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${where}`).get() as {
@@ -509,6 +680,39 @@ export class Repository {
     this.database.db
       .prepare("UPDATE action_requests SET status = ?, result_json = ?, updated_at = ? WHERE action_id = ?")
       .run(status, stringifyJson(result), nowIso(), actionId);
+  }
+
+  private findProjectByExactRule(ruleType: "git_repo_root" | "git_remote", ruleValue: string): Project | null {
+    const row = this.database.db
+      .prepare(
+        `SELECT p.*
+         FROM project_match_rules r
+         JOIN projects p ON p.id = r.project_id
+         WHERE r.rule_type = ? AND r.rule_value = ? AND p.status = 'active'
+         LIMIT 1`
+      )
+      .get(ruleType, normalizeRuleValue(ruleValue)) as DbRow | undefined;
+    return row ? mapProject(row) : null;
+  }
+
+  private findProjectByPrefixRule(ruleType: "cwd_prefix", value: string): Project | null {
+    const normalized = normalizeRuleValue(value);
+    const rows = this.database.db
+      .prepare(
+        `SELECT p.*, r.rule_value
+         FROM project_match_rules r
+         JOIN projects p ON p.id = r.project_id
+         WHERE r.rule_type = ? AND p.status = 'active'`
+      )
+      .all(ruleType) as Array<DbRow & { rule_value?: unknown }>;
+    const matched = rows
+      .map((row) => ({
+        project: mapProject(row),
+        ruleValue: String(row.rule_value ?? "")
+      }))
+      .filter(({ ruleValue }) => normalized === ruleValue || normalized.startsWith(`${ruleValue}/`))
+      .sort((left, right) => right.ruleValue.length - left.ruleValue.length)[0];
+    return matched?.project ?? null;
   }
 }
 
@@ -613,6 +817,7 @@ const mapOutbox = (row: DbRow): NotificationOutboxItem => ({
   notificationType: String(row.notification_type) as NotificationType,
   feishuChatId: String(row.feishu_chat_id),
   feishuTopicRootMessageId: asString(row.feishu_topic_root_message_id),
+  feishuThreadId: asString(row.feishu_thread_id),
   payload: parseJsonObject(asString(row.payload_json)),
   dedupeKey: String(row.dedupe_key),
   status: String(row.status) as OutboxStatus,
@@ -623,6 +828,16 @@ const mapOutbox = (row: DbRow): NotificationOutboxItem => ({
   createdAt: String(row.created_at)
 });
 
+const mapIgnoredThread = (row: DbRow): IgnoredThread => ({
+  codexThreadId: String(row.codex_thread_id),
+  title: asString(row.title),
+  cwd: asString(row.cwd),
+  gitRepoRoot: asString(row.git_repo_root),
+  reason: asString(row.reason),
+  createdByFeishuUserId: asString(row.created_by_feishu_user_id),
+  createdAt: String(row.created_at)
+});
+
 const hashText = (text: string): string => {
   let hash = 2166136261;
   for (let index = 0; index < text.length; index += 1) {
@@ -630,4 +845,14 @@ const hashText = (text: string): string => {
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(16).padStart(8, "0");
+};
+
+const normalizeFsPath = (value: string): string => {
+  const normalized = value.trim().replace(/[\\/]+/g, "/").replace(/\/+$/g, "").toLowerCase();
+  return normalized || "/";
+};
+
+const normalizeRuleValue = (value: string): string => {
+  const trimmed = value.trim();
+  return /^[a-z]+:\/\//i.test(trimmed) ? trimmed.toLowerCase() : normalizeFsPath(trimmed);
 };

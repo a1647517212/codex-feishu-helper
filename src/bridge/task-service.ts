@@ -1,17 +1,24 @@
 import type { BridgeConfig } from "../config.js";
 import { newId } from "../core/ids.js";
 import { asString } from "../core/json.js";
-import type { FeishuCardAction, FeishuIncomingMessage, PendingApproval, SessionBinding, TaskStatus } from "../core/types.js";
+import type { FeishuCardAction, FeishuIncomingMessage, PendingApproval, Project, SessionBinding, TaskStatus } from "../core/types.js";
 import type { Repository } from "../db/repo.js";
 import { commandApprovalDecision, fileApprovalDecision, classifyCommandRisk } from "../domain/approval.js";
 import { CardRenderer } from "../domain/cards.js";
 import { GitInspector } from "../domain/git.js";
+import type { GitSummary } from "../domain/git.js";
 import { ProjectionBuilder } from "../domain/projection.js";
 import { SecurityPolicy } from "../domain/security.js";
 import type { CodexClient, CodexThreadSummary } from "../codex/client.js";
 import type { FeishuSender } from "../feishu/client.js";
 import type { Logger } from "../logger.js";
 import { DiagnosticsService } from "./diagnostics.js";
+
+type FeishuReplyTarget = {
+  chatId: string;
+  rootMessageId?: string | null;
+  threadId?: string | null;
+};
 
 export class TaskService {
   private readonly cards: CardRenderer;
@@ -36,10 +43,14 @@ export class TaskService {
 
   async bootstrapProjectsFromConfig(): Promise<void> {
     for (const project of this.config.projects) {
+      const gitSummary = await this.git.summarize(project.rootPath);
       this.repo.upsertProject({
         id: project.id,
         name: project.name,
         rootPath: project.rootPath,
+        gitRepoRoot: gitSummary.repoRoot,
+        gitRemote: gitSummary.remoteUrl,
+        defaultBranch: gitSummary.branchName,
         feishuChatId: project.feishuChatId,
         defaultModel: project.defaultModel,
         approvalPolicy: project.approvalPolicy,
@@ -105,20 +116,39 @@ export class TaskService {
     await this.feishu.sendCard(chatId, card, rootMessageId);
   }
 
-  async listClaimableSessions(chatId: string, rootMessageId?: string | null): Promise<void> {
+  async listClaimableSessions(chatId: string, rootMessageId?: string | null, projectId?: string | null): Promise<void> {
     const threads = await this.codex.listThreads(this.config.bridge.threadListLimit);
-    if (threads.length === 0) {
+    const filtered = threads
+      .map((thread) => {
+        const binding = this.repo.findBindingByThreadId(thread.id);
+        const project =
+          (binding?.projectId ? this.repo.getProject(binding.projectId) : null) ?? this.repo.findProjectForPath(thread.cwd);
+        const ignored = this.repo.findIgnoredThread(thread.id);
+        return {
+          thread,
+          binding,
+          project,
+          ignored
+        };
+      })
+      .filter(({ project, ignored }) => !ignored && (!projectId || project?.id === projectId));
+    if (filtered.length === 0) {
       await this.feishu.sendText(chatId, "没有发现可接管的本机 Codex 任务。", rootMessageId);
       return;
     }
     await this.feishu.sendCard(
       chatId,
       this.cards.claimableSessionsCard(
-        threads.map((thread) => ({
+        filtered.map(({ thread, binding, project }) => ({
           id: thread.id,
           title: thread.title ?? thread.preview ?? thread.id,
           status: thread.status,
-          cwd: thread.cwd
+          cwd: thread.cwd,
+          projectName: project?.name ?? null,
+          claimed: Boolean(binding),
+          bindingId: binding?.id ?? null,
+          rootMessageId: binding?.feishuTopicRootMessageId ?? null,
+          unclassified: !project
         }))
       ),
       rootMessageId
@@ -158,8 +188,14 @@ export class TaskService {
       return;
     }
     const rootMessageId = message.rootMessageId ?? message.messageId;
-    const binding = this.repo.findBindingByTopic(message.chatId, rootMessageId);
+    const binding =
+      (message.threadId ? this.repo.findBindingByFeishuThreadId(message.chatId, message.threadId) : null) ??
+      this.repo.findBindingByTopic(message.chatId, rootMessageId);
     if (binding) {
+      if (binding.status === "waiting_for_prompt") {
+        await this.startNewTaskFromPrompt(binding, message);
+        return;
+      }
       await this.continueBindingFromFeishu(binding, message);
       return;
     }
@@ -192,9 +228,7 @@ export class TaskService {
       if (result.repeated === true) return;
       const text = typeof result.text === "string" ? result.text.trim() : "";
       if (!text) return;
-      const chatId = action.chatId || this.config.feishu.defaultChatId || "";
-      if (!chatId) return;
-      await this.feishu.sendText(chatId, text, action.rootMessageId);
+      await this.sendTextToTarget(this.resolveActionReplyTarget(action), text);
     } catch (error) {
       this.logger.error("feishu card action failed", {
         action: action.action,
@@ -202,19 +236,17 @@ export class TaskService {
         chatId: action.chatId,
         error: String(error)
       });
-      const chatId = action.chatId || this.config.feishu.defaultChatId || "";
-      if (!chatId) return;
       try {
-        await this.feishu.sendText(
-          chatId,
-          `按钮处理失败：${error instanceof Error ? error.message : String(error)}`,
-          action.rootMessageId
+        await this.sendTextToTarget(
+          this.resolveActionReplyTarget(action),
+          `按钮处理失败：${error instanceof Error ? error.message : String(error)}`
         );
       } catch (notifyError) {
+        const fallbackChatId = action.chatId || this.config.feishu.defaultChatId || "";
         this.logger.error("feishu card action failure notification failed", {
           action: action.action,
           actionId: action.actionId,
-          chatId,
+          chatId: fallbackChatId,
           error: String(notifyError)
         });
       }
@@ -226,9 +258,14 @@ export class TaskService {
     chatId: string;
     rootMessageId: string;
     userId: string;
+    skipCardRefresh?: boolean;
   }): Promise<SessionBinding> {
-    const project = this.repo.findProjectForPath(params.thread.cwd);
     const gitSummary = await this.git.summarize(params.thread.cwd);
+    const project = this.repo.findProjectForContext({
+      cwd: params.thread.cwd,
+      gitRepoRoot: gitSummary.repoRoot,
+      gitRemote: gitSummary.remoteUrl
+    });
     const binding = this.repo.createOrUpdateBinding({
       projectId: project?.id ?? null,
       codexThreadId: params.thread.id,
@@ -244,16 +281,23 @@ export class TaskService {
     });
     this.repo.insertEvent({
       sessionBindingId: binding.id,
-      codexThreadId: binding.codexThreadId,
-      eventType: "session.claimed",
-      eventPayload: { title: binding.title, cwd: binding.cwd }
-    });
-    await this.updateTaskCard(binding.id);
+        codexThreadId: binding.codexThreadId,
+        eventType: "session.claimed",
+        eventPayload: { title: binding.title, cwd: binding.cwd }
+      });
+    if (!params.skipCardRefresh) {
+      await this.updateTaskCard(binding.id);
+    }
     return binding;
   }
 
   private async createNewTaskFromFeishu(message: FeishuIncomingMessage, rootMessageId: string): Promise<void> {
     const project = this.repo.listProjects()[0] ?? null;
+    const topic = await this.ensureTaskTopic({
+      chatId: project?.feishuChatId ?? message.chatId,
+      title: summarizeTitle(message.text),
+      card: project ? this.cards.waitingForPromptCard(project) : this.cards.newTaskDraftCard()
+    });
     const thread = await this.codex.startThread({
       cwd: project?.rootPath ?? null,
       model: project?.defaultModel ?? this.config.codex.defaultModel
@@ -263,9 +307,9 @@ export class TaskService {
     const binding = this.repo.createOrUpdateBinding({
       projectId: project?.id ?? null,
       codexThreadId: thread.id,
-      feishuChatId: message.chatId,
-      feishuTopicRootMessageId: rootMessageId,
-      feishuThreadId: message.threadId,
+      feishuChatId: topic.chatId,
+      feishuTopicRootMessageId: topic.rootMessageId,
+      feishuThreadId: topic.threadId,
       title,
       cwd: thread.cwd ?? project?.rootPath ?? null,
       gitRepoRoot: gitSummary.repoRoot,
@@ -281,13 +325,69 @@ export class TaskService {
       eventPayload: { text: message.text },
       feishuMessageId: message.messageId
     });
-    await this.codex.startTurn(binding.codexThreadId, message.text, {
+    const turn = await this.codex.startTurn(binding.codexThreadId, message.text, {
       cwd: binding.cwd,
       model: project?.defaultModel ?? this.config.codex.defaultModel
     });
+    this.repo.updateBindingStatus(binding.id, "running", extractTurnId(turn));
+    await this.updateTaskCard(binding.id);
+  }
+
+  private async startNewTaskFromPrompt(binding: SessionBinding, message: FeishuIncomingMessage): Promise<void> {
+    const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
+    const thread = await this.codex.startThread({
+      cwd: project?.rootPath ?? binding.cwd ?? null,
+      model: project?.defaultModel ?? this.config.codex.defaultModel
+    });
+    const gitSummary = await this.git.summarize(thread.cwd ?? project?.rootPath ?? binding.cwd);
+    const title = summarizeTitle(message.text);
+    const turn = await this.codex.startTurn(thread.id, message.text, {
+      cwd: thread.cwd ?? project?.rootPath ?? binding.cwd ?? null,
+      model: project?.defaultModel ?? this.config.codex.defaultModel
+    });
+    this.repo.activateDraftBinding({
+      bindingId: binding.id,
+      codexThreadId: thread.id,
+      projectId: project?.id ?? null,
+      title,
+      cwd: thread.cwd ?? project?.rootPath ?? binding.cwd ?? null,
+      gitRepoRoot: gitSummary.repoRoot,
+      branchName: gitSummary.branchName,
+      worktreePath: thread.cwd ?? project?.rootPath ?? binding.cwd ?? null,
+      status: "running",
+      lastTurnId: extractTurnId(turn)
+    });
+    this.repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: thread.id,
+      eventType: "task.created_from_feishu",
+      eventPayload: { text: message.text, fromDraft: true },
+      feishuMessageId: message.messageId
+    });
+    await this.updateTaskCard(binding.id);
   }
 
   private async continueBindingFromFeishu(binding: SessionBinding, message: FeishuIncomingMessage): Promise<void> {
+    if (binding.status === "running") {
+      try {
+        await this.codex.steerTurn(binding.codexThreadId, message.text);
+        this.repo.insertEvent({
+          sessionBindingId: binding.id,
+          codexThreadId: binding.codexThreadId,
+          eventType: "turn.steer_requested_from_feishu",
+          eventPayload: { text: message.text },
+          feishuMessageId: message.messageId
+        });
+        await this.sendTextToTarget(this.targetForBinding(binding, message.chatId), "已追加要求，当前任务会优先按这条继续处理。");
+        return;
+      } catch (error) {
+        this.logger.warn("codex steer failed, fallback to queue", {
+          bindingId: binding.id,
+          threadId: binding.codexThreadId,
+          error: String(error)
+        });
+      }
+    }
     if (binding.status === "running" || binding.status === "waiting_for_approval") {
       const queued = this.repo.enqueueMessage({
         sessionBindingId: binding.id,
@@ -295,10 +395,9 @@ export class TaskService {
         text: message.text,
         createdByFeishuUserId: message.userId
       });
-      await this.feishu.sendText(
-        message.chatId,
-        `已收到，当前任务完成后继续处理。\n\n排队：第 ${queued.position} 条`,
-        message.rootMessageId ?? binding.feishuTopicRootMessageId
+      await this.sendTextToTarget(
+        this.targetForBinding(binding, message.chatId),
+        `已收到，当前任务完成后继续处理。\n\n排队：第 ${queued.position} 条`
       );
       await this.updateTaskCard(binding.id);
       return;
@@ -324,13 +423,43 @@ export class TaskService {
         await this.sendNewTaskDraft(action);
         return { ok: true };
       case "claim_sessions":
-        await this.listClaimableSessions(action.chatId || this.config.feishu.defaultChatId || "", action.rootMessageId);
+        await this.listClaimableSessions(
+          action.chatId || this.config.feishu.defaultChatId || "",
+          action.rootMessageId,
+          asString(action.payload.projectId)
+        );
         return { ok: true };
       case "claim_thread":
-        await this.claimThreadById(action);
+        return this.claimThreadById(action);
+      case "claim_summary":
+        await this.sendClaimSummary(action);
         return { ok: true };
+      case "claim_ignore":
+        return this.ignoreClaimableThread(action);
+      case "unclassified_create_project":
+        return this.createProjectFromThread(action);
+      case "unclassified_pick_project":
+        await this.showProjectAssignment(action);
+        return { ok: true };
+      case "unclassified_assign_project":
+        return this.assignThreadToProject(action);
+      case "open_bound_topic":
+        return this.openBoundTopic(action);
       case "project_list":
         await this.sendProjectList(action);
+        return { ok: true };
+      case "project_running":
+        await this.listClaimableSessions(
+          action.chatId || this.config.feishu.defaultChatId || "",
+          action.rootMessageId,
+          asString(action.payload.projectId)
+        );
+        return { ok: true };
+      case "project_diff":
+        await this.sendProjectDiff(action);
+        return { ok: true };
+      case "unclassified_threads":
+        await this.sendUnclassifiedThreads(action);
         return { ok: true };
       case "send_test_notification":
         await this.sendTestNotification(action);
@@ -419,7 +548,9 @@ export class TaskService {
     const parts = splitCommand(text);
     const command = parts[0] ?? "";
     if (!command) return null;
-    const currentBinding = this.repo.findBindingByTopic(message.chatId, rootMessageId);
+    const currentBinding =
+      (message.threadId ? this.repo.findBindingByFeishuThreadId(message.chatId, message.threadId) : null) ??
+      this.repo.findBindingByTopic(message.chatId, rootMessageId);
     const actionId = newId("cmd");
     const base = (action: string, payload: Record<string, unknown> = {}, root = rootMessageId): FeishuCardAction => ({
       actionId,
@@ -431,6 +562,23 @@ export class TaskService {
     });
 
     if (command === "projects") return base("project_list");
+    if (command === "unclassified") return base("unclassified_threads");
+    if (command === "create-project") {
+      return base("unclassified_create_project", {
+        codexThreadId: requireArgument(parts[1], "/create-project <codexThreadId>")
+      });
+    }
+    if (command === "pick-project") {
+      return base("unclassified_pick_project", {
+        codexThreadId: requireArgument(parts[1], "/pick-project <codexThreadId>")
+      });
+    }
+    if (command === "assign-project") {
+      return base("unclassified_assign_project", {
+        codexThreadId: requireArgument(parts[1], "/assign-project <codexThreadId> <projectId>"),
+        projectId: requireArgument(parts[2], "/assign-project <codexThreadId> <projectId>")
+      });
+    }
     if (command === "status") return base("task_status", { bindingId: requireCurrentBindingId(currentBinding, command) });
     if (command === "logs") return base("task_logs", { bindingId: requireCurrentBindingId(currentBinding, command) });
     if (command === "diff") return base("task_diff", { bindingId: requireCurrentBindingId(currentBinding, command) });
@@ -444,6 +592,12 @@ export class TaskService {
       return base("queue_view", { bindingId: requireCurrentBindingId(currentBinding, command) });
     }
     if (command === "claim") {
+      if (parts[1]?.toLowerCase() === "summary") {
+        return base("claim_summary", { codexThreadId: requireArgument(parts[2], "/claim summary <codexThreadId>") });
+      }
+      if (parts[1]?.toLowerCase() === "ignore") {
+        return base("claim_ignore", { codexThreadId: requireArgument(parts[2], "/claim ignore <codexThreadId>") });
+      }
       return base("claim_thread", { codexThreadId: requireArgument(parts[1], "/claim <codexThreadId>") });
     }
     if (command === "notify") {
@@ -475,32 +629,299 @@ export class TaskService {
   }
 
   private async sendNewTaskDraft(action: FeishuCardAction): Promise<void> {
-    const chatId = action.chatId || this.config.feishu.defaultChatId || "";
-    await this.feishu.sendCard(chatId, this.cards.newTaskDraftCard(), action.rootMessageId);
+    const projectId = asString(action.payload.projectId);
+    const project = projectId ? this.repo.getProject(projectId) : this.repo.listProjects()[0] ?? null;
+    const chatId = project?.feishuChatId ?? action.chatId ?? this.config.feishu.defaultChatId ?? "";
+    const card = project ? this.cards.waitingForPromptCard(project) : this.cards.newTaskDraftCard();
+    const topic = await this.ensureTaskTopic({
+      chatId,
+      title: project ? `新任务：${project.name}` : "新任务",
+      card
+    });
+    this.repo.createOrUpdateBinding({
+      projectId: project?.id ?? null,
+      codexThreadId: newId("draft"),
+      feishuChatId: chatId,
+      feishuTopicRootMessageId: topic.rootMessageId,
+      feishuThreadId: topic.threadId,
+      title: "新任务",
+      cwd: project?.rootPath ?? null,
+      gitRepoRoot: project?.gitRepoRoot ?? null,
+      branchName: project?.defaultBranch ?? null,
+      status: "waiting_for_prompt",
+      createdByFeishuUserId: action.userId,
+      createdFrom: "feishu_new_task"
+    });
+  }
+
+  /**
+   * Creates a Feishu task topic anchor owned by the bridge so later replies can
+   * consistently stay inside the same thread instead of piggybacking on a user message.
+   */
+  private async ensureTaskTopic(input: {
+    chatId: string;
+    title: string;
+    card: ReturnType<CardRenderer["newTaskDraftCard"]>;
+  }): Promise<{
+    chatId: string;
+    rootMessageId: string;
+    threadId: string | null;
+  }> {
+    const anchor = await this.feishu.sendText(input.chatId, input.title);
+    const sent = await this.feishu.replyCardInThread(anchor.messageId, input.card);
+    return {
+      chatId: input.chatId,
+      rootMessageId: sent.rootId ?? anchor.messageId,
+      threadId: sent.threadId
+    };
   }
 
   private async sendDoctorCard(chatId: string, rootMessageId?: string | null): Promise<void> {
     await this.feishu.sendCard(chatId, this.cards.diagnosticCard(await this.diagnostics.snapshot()), rootMessageId);
   }
 
-  private async claimThreadById(action: FeishuCardAction): Promise<void> {
+  private async claimThreadById(action: FeishuCardAction): Promise<Record<string, unknown>> {
     const threadId = String(action.payload.codexThreadId ?? "");
     if (!threadId) throw new Error("缺少 Codex 任务 ID");
+    const existing = this.repo.findBindingByThreadId(threadId);
+    if (existing) {
+      await this.feishu.sendCard(
+        action.chatId || existing.feishuChatId,
+        this.cards.taskStatusCard(this.projection.buildTaskStatus(existing.id)),
+        action.rootMessageId
+      );
+      return { ok: true, text: "这个任务已经可以在飞书继续，已回显当前状态。" };
+    }
     const detail = await this.codex.readThread(threadId, false);
     const thread = normalizeThreadFromDetail(threadId, detail);
     const chatId = action.chatId || this.config.feishu.defaultChatId || "";
-    const rootMessageId = action.rootMessageId || String(action.payload.rootMessageId ?? "") || newId("feishu_topic");
-    await this.claimThread({
+    const anchor = await this.feishu.sendText(chatId, `任务接管：${thread.title ?? thread.preview ?? thread.id}`);
+    const binding = await this.claimThread({
       thread,
       chatId,
-      rootMessageId,
-      userId: action.userId
+      rootMessageId: anchor.messageId,
+      userId: action.userId,
+      skipCardRefresh: true
     });
+    const sent = await this.feishu.replyCardInThread(
+      anchor.messageId,
+      this.cards.taskStatusCard(this.projection.buildTaskStatus(binding.id))
+    );
+    this.repo.updateBindingTopic({
+      bindingId: binding.id,
+      feishuChatId: chatId,
+      feishuTopicRootMessageId: sent.rootId ?? sent.messageId,
+      feishuThreadId: sent.threadId
+    });
+    return { ok: true };
   }
 
   private async sendProjectList(action: FeishuCardAction): Promise<void> {
     const chatId = action.chatId || this.config.feishu.defaultChatId || "";
-    await this.feishu.sendCard(chatId, this.cards.projectListCard(this.repo.listProjects()), action.rootMessageId);
+    const projects = this.repo.listProjects();
+    await this.feishu.sendCard(chatId, this.cards.projectListCard(projects), action.rootMessageId);
+    for (const project of projects.slice(0, 3)) {
+      await this.feishu.sendCard(chatId, this.cards.projectCard(this.buildProjectCardInput(project)), action.rootMessageId);
+    }
+  }
+
+  private async sendUnclassifiedThreads(action: FeishuCardAction): Promise<void> {
+    const chatId = action.chatId || this.config.feishu.defaultChatId || "";
+    const threads = await this.codex.listThreads(this.config.bridge.threadListLimit);
+    const unclassified = (
+      await Promise.all(
+        threads.map(async (thread) => {
+          if (this.repo.findIgnoredThread(thread.id)) return null;
+          const binding = this.repo.findBindingByThreadId(thread.id);
+          if (binding?.projectId) return null;
+          const { project } = await this.classifyThreadContext(thread, binding);
+          return project ? null : thread;
+        })
+      )
+    ).filter((thread): thread is CodexThreadSummary => Boolean(thread));
+    await this.feishu.sendCard(
+      chatId,
+      this.cards.unclassifiedThreadsCard(
+        unclassified.map((thread) => ({
+          id: thread.id,
+          title: thread.title ?? thread.preview ?? thread.id,
+          cwd: thread.cwd,
+          status: thread.status,
+          canCreateProject: Boolean(thread.cwd)
+        }))
+      ),
+      action.rootMessageId
+    );
+  }
+
+  private async classifyThreadContext(
+    thread: CodexThreadSummary,
+    binding?: SessionBinding | null
+  ): Promise<{
+    project: Project | null;
+    gitSummary: GitSummary;
+  }> {
+    const gitSummary = await this.git.summarize(thread.cwd ?? binding?.cwd);
+    const project = this.repo.findProjectForContext({
+      cwd: thread.cwd ?? binding?.cwd,
+      gitRepoRoot: binding?.gitRepoRoot ?? gitSummary.repoRoot,
+      gitRemote: gitSummary.remoteUrl
+    });
+    return { project, gitSummary };
+  }
+
+  private async sendProjectDiff(action: FeishuCardAction): Promise<void> {
+    const project = this.requireProject(action);
+    const summary = await this.git.diffSummary(project.rootPath);
+    await this.feishu.sendText(action.chatId || project.feishuChatId || this.config.feishu.defaultChatId || "", summary, action.rootMessageId);
+  }
+
+  private async sendClaimSummary(action: FeishuCardAction): Promise<void> {
+    const threadId = String(action.payload.codexThreadId ?? "");
+    if (!threadId) throw new Error("缺少 Codex 任务 ID");
+    const detail = await this.codex.readThread(threadId, true);
+    const thread = normalizeThreadFromDetail(threadId, detail);
+    const summary = summarizeThreadDetail(detail);
+    await this.feishu.sendText(
+      action.chatId || this.config.feishu.defaultChatId || "",
+      [
+        `任务摘要：${thread.title ?? thread.preview ?? thread.id}`,
+        `状态：${thread.status}`,
+        `目录：${thread.cwd ?? "未知"}`,
+        summary
+      ]
+        .filter(Boolean)
+        .join("\n"),
+      action.rootMessageId
+    );
+  }
+
+  private async ignoreClaimableThread(action: FeishuCardAction): Promise<Record<string, unknown>> {
+    const threadId = String(action.payload.codexThreadId ?? "");
+    if (!threadId) throw new Error("缺少 Codex 任务 ID");
+    const detail = await this.codex.readThread(threadId, false);
+    const thread = normalizeThreadFromDetail(threadId, detail);
+    const gitSummary = await this.git.summarize(thread.cwd);
+    this.repo.ignoreThread({
+      codexThreadId: thread.id,
+      title: thread.title ?? thread.preview ?? thread.id,
+      cwd: thread.cwd,
+      gitRepoRoot: gitSummary.repoRoot,
+      reason: "feishu_claim_ignored",
+      createdByFeishuUserId: action.userId
+    });
+    return { ok: true, text: "已忽略这个任务；后续不会再出现在接管列表里。" };
+  }
+
+  private async createProjectFromThread(action: FeishuCardAction): Promise<Record<string, unknown>> {
+    const threadId = String(action.payload.codexThreadId ?? "");
+    if (!threadId) throw new Error("缺少 Codex 任务 ID");
+    const detail = await this.codex.readThread(threadId, false);
+    const thread = normalizeThreadFromDetail(threadId, detail);
+    if (!thread.cwd) throw new Error("这个任务没有可用工作目录，无法创建项目。");
+    const { gitSummary } = await this.classifyThreadContext(thread, this.repo.findBindingByThreadId(thread.id));
+    const projectName = inferProjectName(thread.cwd, thread.title ?? thread.preview ?? thread.id);
+    const project = this.repo.upsertProject({
+      name: projectName,
+      rootPath: gitSummary.repoRoot ?? thread.cwd,
+      gitRepoRoot: gitSummary.repoRoot,
+      gitRemote: gitSummary.remoteUrl,
+      defaultBranch: gitSummary.branchName,
+      feishuChatId: action.chatId || this.config.feishu.defaultChatId || null
+    });
+    this.repo.addProjectMatchRule({
+      projectId: project.id,
+      ruleType: "cwd_prefix",
+      ruleValue: thread.cwd
+    });
+    if (gitSummary.repoRoot) {
+      this.repo.addProjectMatchRule({
+        projectId: project.id,
+        ruleType: "git_repo_root",
+        ruleValue: gitSummary.repoRoot
+      });
+    }
+    if (gitSummary.remoteUrl) {
+      this.repo.addProjectMatchRule({
+        projectId: project.id,
+        ruleType: "git_remote",
+        ruleValue: gitSummary.remoteUrl
+      });
+    }
+    const binding = this.repo.findBindingByThreadId(thread.id);
+    if (binding) {
+      this.repo.updateBindingProject(binding.id, project.id);
+    }
+    this.repo.unignoreThread(thread.id);
+    return { ok: true, text: `已创建项目：${project.name}` };
+  }
+
+  private async showProjectAssignment(action: FeishuCardAction): Promise<void> {
+    const threadId = String(action.payload.codexThreadId ?? "");
+    if (!threadId) throw new Error("缺少 Codex 任务 ID");
+    const detail = await this.codex.readThread(threadId, false);
+    const thread = normalizeThreadFromDetail(threadId, detail);
+    await this.feishu.sendCard(
+      action.chatId || this.config.feishu.defaultChatId || "",
+      this.cards.projectAssignmentCard(
+        {
+          id: thread.id,
+          title: thread.title ?? thread.preview ?? thread.id,
+          cwd: thread.cwd
+        },
+        this.repo.listProjects().map((project) => ({
+          id: project.id,
+          name: project.name,
+          rootPath: project.rootPath
+        }))
+      ),
+      action.rootMessageId
+    );
+  }
+
+  private async assignThreadToProject(action: FeishuCardAction): Promise<Record<string, unknown>> {
+    const threadId = String(action.payload.codexThreadId ?? "");
+    const projectId = String(action.payload.projectId ?? "");
+    if (!threadId) throw new Error("缺少 Codex 任务 ID");
+    if (!projectId) throw new Error("缺少项目 ID");
+    const project = this.repo.getProject(projectId);
+    if (!project) throw new Error("项目不存在");
+    const detail = await this.codex.readThread(threadId, false);
+    const thread = normalizeThreadFromDetail(threadId, detail);
+    const { gitSummary } = await this.classifyThreadContext(thread, this.repo.findBindingByThreadId(thread.id));
+    if (thread.cwd) {
+      this.repo.addProjectMatchRule({
+        projectId,
+        ruleType: "cwd_prefix",
+        ruleValue: thread.cwd
+      });
+    }
+    if (gitSummary.repoRoot) {
+      this.repo.addProjectMatchRule({
+        projectId,
+        ruleType: "git_repo_root",
+        ruleValue: gitSummary.repoRoot
+      });
+    }
+    if (gitSummary.remoteUrl) {
+      this.repo.addProjectMatchRule({
+        projectId,
+        ruleType: "git_remote",
+        ruleValue: gitSummary.remoteUrl
+      });
+    }
+    const binding = this.repo.findBindingByThreadId(threadId);
+    if (binding) {
+      this.repo.updateBindingProject(binding.id, projectId);
+    }
+    this.repo.unignoreThread(threadId);
+    return { ok: true, text: `已将任务归入项目：${project.name}` };
+  }
+
+  private async openBoundTopic(action: FeishuCardAction): Promise<Record<string, unknown>> {
+    const binding = this.requireBinding(action);
+    await this.sendCardToTarget(this.targetForBinding(binding, action.chatId), this.cards.taskStatusCard(this.projection.buildTaskStatus(binding.id)));
+    return { ok: true, text: "已在这个任务绑定的话题里回发最新状态，可直接在那条回复链继续。"};
   }
 
   private async sendTestNotification(action: FeishuCardAction): Promise<void> {
@@ -515,25 +936,23 @@ export class TaskService {
 
   private async sendTaskEvents(action: FeishuCardAction, title: string): Promise<void> {
     const binding = this.requireBinding(action);
-    await this.feishu.sendCard(
-      action.chatId || binding.feishuChatId,
-      this.cards.eventListCard(title, this.repo.listEventsForBinding(binding.id, 20)),
-      action.rootMessageId ?? binding.feishuTopicRootMessageId
+    await this.sendCardToTarget(
+      this.targetForBinding(binding, action.chatId),
+      this.cards.eventListCard(title, this.repo.listEventsForBinding(binding.id, 20))
     );
   }
 
   private async sendTaskDiff(action: FeishuCardAction): Promise<void> {
     const binding = this.requireBinding(action);
     const summary = binding.cwd ? await this.git.diffSummary(binding.cwd) : "当前任务没有可用工作目录。";
-    await this.feishu.sendText(action.chatId || binding.feishuChatId, summary, action.rootMessageId ?? binding.feishuTopicRootMessageId);
+    await this.sendTextToTarget(this.targetForBinding(binding, action.chatId), summary);
   }
 
   private async sendApprovalList(action: FeishuCardAction): Promise<void> {
     const binding = this.requireBinding(action);
-    await this.feishu.sendCard(
-      action.chatId || binding.feishuChatId,
-      this.cards.approvalListCard(this.repo.listPendingApprovals(binding.id)),
-      action.rootMessageId ?? binding.feishuTopicRootMessageId
+    await this.sendCardToTarget(
+      this.targetForBinding(binding, action.chatId),
+      this.cards.approvalListCard(this.repo.listPendingApprovals(binding.id))
     );
   }
 
@@ -542,10 +961,9 @@ export class TaskService {
     const approval = this.repo.findApprovalById(approvalId);
     if (!approval) throw new Error("审批不存在");
     const binding = this.repo.findBindingById(approval.sessionBindingId);
-    await this.feishu.sendCard(
-      action.chatId || binding?.feishuChatId || this.config.feishu.defaultChatId || "",
-      this.cards.approvalDetailCard(approval),
-      action.rootMessageId ?? binding?.feishuTopicRootMessageId
+    await this.sendCardToTarget(
+      binding ? this.targetForBinding(binding, action.chatId) : this.targetForAction(action),
+      this.cards.approvalDetailCard(approval)
     );
   }
 
@@ -564,10 +982,9 @@ export class TaskService {
 
   private async sendQueueCard(action: FeishuCardAction): Promise<void> {
     const binding = this.requireBinding(action);
-    await this.feishu.sendCard(
-      action.chatId || binding.feishuChatId,
-      this.cards.queueCard(binding.id, this.repo.listQueuedMessages(binding.id)),
-      action.rootMessageId ?? binding.feishuTopicRootMessageId
+    await this.sendCardToTarget(
+      this.targetForBinding(binding, action.chatId),
+      this.cards.queueCard(binding.id, this.repo.listQueuedMessages(binding.id))
     );
   }
 
@@ -615,6 +1032,70 @@ export class TaskService {
     const binding = this.repo.findBindingById(bindingId);
     if (!binding) throw new Error("任务不存在");
     return binding;
+  }
+
+  private requireProject(action: FeishuCardAction): Project {
+    const projectId = String(action.payload.projectId ?? "");
+    const project = this.repo.getProject(projectId);
+    if (!project) throw new Error("项目不存在");
+    return project;
+  }
+
+  /**
+   * Returns the canonical Feishu reply target for a bound task so later status,
+   * approval and queue messages stay inside the same reply thread.
+   */
+  private targetForBinding(binding: SessionBinding, chatId?: string | null): FeishuReplyTarget {
+    return {
+      chatId: chatId || binding.feishuChatId || this.config.feishu.defaultChatId || "",
+      rootMessageId: binding.feishuTopicRootMessageId,
+      threadId: binding.feishuThreadId
+    };
+  }
+
+  private targetForAction(action: FeishuCardAction): FeishuReplyTarget {
+    return {
+      chatId: action.chatId || this.config.feishu.defaultChatId || "",
+      rootMessageId: action.rootMessageId
+    };
+  }
+
+  private resolveActionReplyTarget(action: FeishuCardAction): FeishuReplyTarget {
+    const bindingId = asString(action.payload.bindingId);
+    if (bindingId) {
+      const binding = this.repo.findBindingById(bindingId);
+      if (binding) return this.targetForBinding(binding, action.chatId);
+    }
+    const approvalId = asString(action.payload.approvalId);
+    if (approvalId) {
+      const approval = this.repo.findApprovalById(approvalId);
+      if (approval) {
+        const binding = this.repo.findBindingById(approval.sessionBindingId);
+        if (binding) return this.targetForBinding(binding, action.chatId);
+      }
+    }
+    const codexThreadId = asString(action.payload.codexThreadId);
+    if (codexThreadId) {
+      const binding = this.repo.findBindingByThreadId(codexThreadId);
+      if (binding) return this.targetForBinding(binding, action.chatId);
+    }
+    return this.targetForAction(action);
+  }
+
+  private async sendTextToTarget(target: FeishuReplyTarget, text: string): Promise<void> {
+    if (target.threadId) {
+      await this.feishu.replyTextInThread(target.rootMessageId ?? target.threadId, text);
+      return;
+    }
+    await this.feishu.sendText(target.chatId, text, target.rootMessageId);
+  }
+
+  private async sendCardToTarget(target: FeishuReplyTarget, card: ReturnType<CardRenderer["taskStatusCard"]>): Promise<void> {
+    if (target.threadId) {
+      await this.feishu.replyCardInThread(target.rootMessageId ?? target.threadId, card);
+      return;
+    }
+    await this.feishu.sendCard(target.chatId, card, target.rootMessageId);
   }
 
   private async resolveApproval(id: string, decision: "once" | "task" | "deny", userId: string): Promise<void> {
@@ -679,6 +1160,7 @@ export class TaskService {
       notificationType: "approval_required",
       feishuChatId: binding.feishuChatId,
       feishuTopicRootMessageId: binding.feishuTopicRootMessageId,
+      feishuThreadId: binding.feishuThreadId,
       payload: { card: this.cards.approvalCard(approval) },
       dedupeKey: `approval:${approval.codexThreadId}:${approval.requestId}`
     });
@@ -745,6 +1227,7 @@ export class TaskService {
         notificationType: status === "completed" ? "task_completed" : "task_failed",
         feishuChatId: binding.feishuChatId,
         feishuTopicRootMessageId: binding.feishuTopicRootMessageId,
+        feishuThreadId: binding.feishuThreadId,
         payload: { card: this.cards.taskStatusCard(this.projection.buildTaskStatus(binding.id)) },
         dedupeKey: `turn:${threadId}:${turnId}:completed`
       });
@@ -802,6 +1285,7 @@ export class TaskService {
       notificationType: "task_status",
       feishuChatId: binding.feishuChatId,
       feishuTopicRootMessageId: binding.feishuTopicRootMessageId,
+      feishuThreadId: binding.feishuThreadId,
       payload: { card: this.cards.taskStatusCard(projection) },
       dedupeKey: [
         "task-status",
@@ -828,6 +1312,31 @@ export class TaskService {
     }
     return null;
   }
+
+  private buildProjectCardInput(project: Project): {
+    id: string;
+    name: string;
+    rootPath: string;
+    branchName?: string | null;
+    runningCount: number;
+    pendingApprovals: number;
+    completedCount: number;
+  } {
+    const bindings = this.repo.listBindings(500).filter((binding) => binding.projectId === project.id);
+    const runningCount = bindings.filter((binding) => binding.status === "running").length;
+    const completedCount = bindings.filter((binding) => binding.status === "completed").length;
+    const pendingApprovals = bindings.reduce((sum, binding) => sum + this.repo.listPendingApprovals(binding.id).length, 0);
+    const recentBinding = bindings[0] ?? null;
+    return {
+      id: project.id,
+      name: project.name,
+      rootPath: project.rootPath,
+      branchName: recentBinding?.branchName ?? project.defaultBranch,
+      runningCount,
+      pendingApprovals,
+      completedCount
+    };
+  }
 }
 
 const summarizeTitle = (text: string): string => {
@@ -842,6 +1351,13 @@ const normalizeTurnStatus = (status: unknown): TaskStatus => {
   return "idle";
 };
 
+const extractTurnId = (result: Record<string, unknown>): string | null => {
+  const turn = result.turn;
+  if (!turn || typeof turn !== "object") return null;
+  const id = (turn as Record<string, unknown>).id;
+  return typeof id === "string" ? id : null;
+};
+
 const truncate = (text: string, max: number): string => (text.length > max ? `${text.slice(0, max - 20)}\n...(已截断)` : text);
 
 const isTerminalStatus = (status: TaskStatus): boolean =>
@@ -849,14 +1365,22 @@ const isTerminalStatus = (status: TaskStatus): boolean =>
 
 const isCommandText = (text: string): boolean =>
   text.startsWith("/") ||
-  ["项目列表", "查看进度", "查看日志", "查看变更", "查看队列", "通知历史", "发送测试通知"].includes(text);
+  ["项目列表", "查看进度", "查看日志", "查看变更", "查看队列", "通知历史", "发送测试通知", "未归类任务"].includes(text);
 
 const normalizeCommand = (value: string): string => {
   const lowered = value.trim().toLowerCase().replace(/^\/+/, "");
   const aliases: Record<string, string> = {
     "项目列表": "projects",
+    "未归类任务": "unclassified",
     project: "projects",
     projects: "projects",
+    unclassified: "unclassified",
+    "创建为新项目": "create-project",
+    "create-project": "create-project",
+    createproject: "create-project",
+    "pick-project": "pick-project",
+    pickproject: "pick-project",
+    "归入已有项目": "pick-project",
     "查看进度": "status",
     status: "status",
     "查看日志": "logs",
@@ -928,4 +1452,41 @@ const normalizeThreadFromDetail = (threadId: string, detail: Record<string, unkn
     updatedAt: typeof rawThread.updatedAt === "number" ? rawThread.updatedAt : null,
     raw: rawThread
   };
+};
+
+const summarizeThreadDetail = (detail: Record<string, unknown>): string => {
+  const rawThread = detail.thread && typeof detail.thread === "object" ? (detail.thread as Record<string, unknown>) : detail;
+  const turns = Array.isArray(rawThread.turns) ? rawThread.turns : [];
+  const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+  const turnObject = lastTurn && typeof lastTurn === "object" ? (lastTurn as Record<string, unknown>) : null;
+  const items = Array.isArray(turnObject?.items) ? (turnObject?.items as unknown[]) : [];
+  const agentMessages = items
+    .filter((item) => item && typeof item === "object")
+    .map((item) => item as Record<string, unknown>)
+    .filter((item) => item.type === "agentMessage" && typeof item.text === "string")
+    .map((item) => String(item.text).trim())
+    .filter(Boolean);
+  const commandItems = items
+    .filter((item) => item && typeof item === "object")
+    .map((item) => item as Record<string, unknown>)
+    .filter((item) => item.type === "commandExecution");
+  const commands = commandItems
+    .map((item) => (typeof item.command === "string" ? item.command.trim() : ""))
+    .filter(Boolean)
+    .slice(-3);
+  const status = typeof turnObject?.status === "string" ? turnObject.status : null;
+  const lines = [
+    turns.length > 0 ? `历史轮次：${turns.length}` : "历史轮次：0",
+    status ? `最近一轮：${status}` : null,
+    commands.length > 0 ? `最近命令：${commands.join(" | ")}` : null,
+    agentMessages.length > 0 ? `最近回复：${truncate(agentMessages[agentMessages.length - 1]!, 600)}` : "最近回复：暂无"
+  ].filter(Boolean);
+  return lines.join("\n");
+};
+
+const inferProjectName = (cwd: string, fallback: string): string => {
+  const normalized = cwd.replace(/[\\/]+$/, "");
+  const segments = normalized.split(/[\\/]/).filter(Boolean);
+  const leaf = segments[segments.length - 1];
+  return leaf && leaf.trim().length > 0 ? leaf.trim() : fallback;
 };

@@ -74,7 +74,13 @@ export const makeConfig = (dir: string): BridgeConfig => ({
 });
 
 export class MockFeishu implements FeishuSender {
-  sent: Array<{ type: "text" | "card"; chatId: string; root?: string | null; payload: unknown }> = [];
+  sent: Array<{
+    type: "text" | "card";
+    mode?: "thread";
+    chatId: string;
+    root?: string | null;
+    payload: unknown;
+  }> = [];
   failNext = false;
 
   async sendText(chatId: string, text: string, rootMessageId?: string | null): Promise<SentMessage> {
@@ -83,7 +89,7 @@ export class MockFeishu implements FeishuSender {
       throw new Error("mock send failure");
     }
     this.sent.push({ type: "text", chatId, root: rootMessageId, payload: text });
-    return { messageId: `msg_${this.sent.length}`, raw: {} };
+    return { messageId: `msg_${this.sent.length}`, rootId: null, parentId: null, threadId: null, raw: {} };
   }
 
   async sendCard(chatId: string, card: FeishuCard, rootMessageId?: string | null): Promise<SentMessage> {
@@ -92,10 +98,55 @@ export class MockFeishu implements FeishuSender {
       throw new Error("mock send failure");
     }
     this.sent.push({ type: "card", chatId, root: rootMessageId, payload: card });
-    return { messageId: `msg_${this.sent.length}`, raw: {} };
+    return { messageId: `msg_${this.sent.length}`, rootId: null, parentId: null, threadId: null, raw: {} };
+  }
+
+  async replyTextInThread(messageId: string, text: string): Promise<SentMessage> {
+    if (this.failNext) {
+      this.failNext = false;
+      throw new Error("mock send failure");
+    }
+    this.sent.push({ type: "text", mode: "thread", chatId: "thread", root: messageId, payload: text });
+    const index = this.sent.length;
+    return {
+      messageId: `msg_${index}`,
+      rootId: messageId,
+      parentId: messageId,
+      threadId: `omt_${index}`,
+      raw: {}
+    };
+  }
+
+  async replyCardInThread(messageId: string, card: FeishuCard): Promise<SentMessage> {
+    if (this.failNext) {
+      this.failNext = false;
+      throw new Error("mock send failure");
+    }
+    this.sent.push({ type: "card", mode: "thread", chatId: "thread", root: messageId, payload: card });
+    const index = this.sent.length;
+    return {
+      messageId: `msg_${index}`,
+      rootId: messageId,
+      parentId: messageId,
+      threadId: `omt_${index}`,
+      raw: {}
+    };
   }
 
   async updateCard(): Promise<void> {}
+
+  async getChatInfo() {
+    return {
+      chatId: "chat_1",
+      name: "Test Chat",
+      chatMode: "group",
+      groupMessageType: "thread",
+      chatType: "private",
+      chatStatus: "normal",
+      external: false,
+      raw: {}
+    };
+  }
 }
 
 export class MockCodex {
@@ -103,11 +154,13 @@ export class MockCodex {
   notifications: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
   requests: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
   turns: Array<{ threadId: string; text: string }> = [];
+  steerRequests: Array<{ threadId: string; text: string }> = [];
   responses: Array<{ requestId: string | number; result: Record<string, unknown> }> = [];
   interrupted: string[] = [];
   threads: any[] = [];
   listCalls: Array<{ limit?: number; pageSize?: number; maxPages?: number }> = [];
   readFailures = new Map<string, Error>();
+  failSteer = false;
 
   on(event: "notification" | "serverRequest" | "error", handler: (message: any) => void): void {
     const bag = event === "serverRequest" ? this.requests : this.notifications;
@@ -152,7 +205,8 @@ export class MockCodex {
   }
 
   async steerTurn(threadId: string, text: string): Promise<Record<string, unknown>> {
-    this.turns.push({ threadId, text });
+    if (this.failSteer) throw new Error("mock steer failure");
+    this.steerRequests.push({ threadId, text });
     return { turnId: `turn_${this.turns.length}` };
   }
 

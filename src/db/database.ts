@@ -12,6 +12,12 @@ export class BridgeDatabase {
 
   migrate(): void {
     this.db.exec(schemaSql);
+    ensureColumn(this.db, "projects", "git_repo_root", "TEXT");
+    ensureColumn(this.db, "projects", "git_remote", "TEXT");
+    ensureColumn(this.db, "projects", "default_branch", "TEXT");
+    ensureColumn(this.db, "projects", "notification_policy", "TEXT");
+    ensureColumn(this.db, "session_bindings", "feishu_thread_id", "TEXT");
+    ensureColumn(this.db, "notification_outbox", "feishu_thread_id", "TEXT");
   }
 
   close(): void {
@@ -156,6 +162,7 @@ CREATE TABLE IF NOT EXISTS notification_outbox (
   notification_type TEXT NOT NULL,
   feishu_chat_id TEXT NOT NULL,
   feishu_topic_root_message_id TEXT,
+  feishu_thread_id TEXT,
   payload_json TEXT NOT NULL,
   dedupe_key TEXT NOT NULL,
   status TEXT NOT NULL,
@@ -205,6 +212,27 @@ CREATE TABLE IF NOT EXISTS trusted_feishu_subjects (
 CREATE INDEX IF NOT EXISTS idx_trusted_subjects_user ON trusted_feishu_subjects(user_id, status);
 CREATE INDEX IF NOT EXISTS idx_trusted_subjects_chat ON trusted_feishu_subjects(chat_id, status);
 
+CREATE TABLE IF NOT EXISTS ignored_threads (
+  codex_thread_id TEXT PRIMARY KEY,
+  title TEXT,
+  cwd TEXT,
+  git_repo_root TEXT,
+  reason TEXT,
+  created_by_feishu_user_id TEXT,
+  created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS project_match_rules (
+  id TEXT PRIMARY KEY,
+  project_id TEXT NOT NULL,
+  rule_type TEXT NOT NULL,
+  rule_value TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE(project_id, rule_type, rule_value)
+);
+
+CREATE INDEX IF NOT EXISTS idx_project_match_rules_lookup ON project_match_rules(rule_type, rule_value);
+
 CREATE TABLE IF NOT EXISTS thread_ownership (
   codex_thread_id TEXT PRIMARY KEY,
   owner_kind TEXT NOT NULL,
@@ -213,3 +241,9 @@ CREATE TABLE IF NOT EXISTS thread_ownership (
   confidence TEXT NOT NULL
 );
 `;
+
+const ensureColumn = (db: DatabaseSync, table: string, column: string, definition: string): void => {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: unknown }>;
+  if (columns.some((item) => String(item.name ?? "") === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition};`);
+};

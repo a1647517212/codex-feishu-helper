@@ -131,6 +131,7 @@ export interface NotificationOutboxItem {
   notificationType: NotificationType;
   feishuChatId: string;
   feishuTopicRootMessageId: string | null;
+  feishuThreadId: string | null;
   payload: Record<string, unknown>;
   dedupeKey: string;
   status: OutboxStatus;
@@ -138,6 +139,16 @@ export interface NotificationOutboxItem {
   nextAttemptAt: string | null;
   sentAt: string | null;
   lastError: string | null;
+  createdAt: string;
+}
+
+export interface IgnoredThread {
+  codexThreadId: string;
+  title: string | null;
+  cwd: string | null;
+  gitRepoRoot: string | null;
+  reason: string | null;
+  createdByFeishuUserId: string | null;
   createdAt: string;
 }
 
@@ -164,6 +175,8 @@ export interface DiagnosticSnapshot {
   feishuMessageTransport: "long_connection" | "http_callback";
   feishuCardActionTransport: "long_connection" | "http_callback";
   feishuInteractionMode: "message_command" | "hybrid" | "card_callback";
+  feishuDefaultChatId: string | null;
+  feishuDefaultChatDiagnostic: FeishuChatDiagnostic | null;
   databasePath: string;
   projectsCount: number;
   sessionBindingsCount: number;
@@ -176,6 +189,19 @@ export interface DiagnosticSnapshot {
   lastFeishuCardAction: string | null;
   lastFeishuCardActionId: string | null;
   lastError: string | null;
+}
+
+export interface FeishuChatDiagnostic {
+  ok: boolean;
+  chatId: string;
+  name: string | null;
+  chatMode: string | null;
+  groupMessageType: string | null;
+  topicReplySupported: boolean | null;
+  fullTopicMode: boolean | null;
+  recommendation: string;
+  requiredScopes: string[];
+  error: string | null;
 }
 
 export interface TaskStatusProjection {

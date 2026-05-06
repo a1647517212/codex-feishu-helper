@@ -2,9 +2,10 @@ import { execFile } from "node:child_process";
 import { hostname, platform } from "node:os";
 import { promisify } from "node:util";
 import type { BridgeConfig } from "../config.js";
-import type { DiagnosticSnapshot } from "../core/types.js";
+import type { DiagnosticSnapshot, FeishuChatDiagnostic } from "../core/types.js";
 import type { CodexClient } from "../codex/client.js";
 import type { Repository } from "../db/repo.js";
+import type { FeishuChatInfoProvider } from "../feishu/client.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -20,7 +21,8 @@ export class DiagnosticsService {
   constructor(
     private readonly config: BridgeConfig,
     private readonly repo: Repository,
-    private readonly codex: CodexClient
+    private readonly codex: CodexClient,
+    private readonly feishu?: FeishuChatInfoProvider
   ) {}
 
   recordError(error: unknown): void {
@@ -51,6 +53,8 @@ export class DiagnosticsService {
       feishuMessageTransport: this.config.feishu.messageTransport,
       feishuCardActionTransport: this.config.feishu.cardActionTransport,
       feishuInteractionMode: this.config.feishu.interactionMode,
+      feishuDefaultChatId: this.config.feishu.defaultChatId ?? null,
+      feishuDefaultChatDiagnostic: await this.defaultChatDiagnostic(),
       databasePath: this.config.storage.databasePath,
       projectsCount: this.repo.count("projects"),
       sessionBindingsCount: this.repo.count("session_bindings"),
@@ -78,4 +82,53 @@ export class DiagnosticsService {
       return false;
     }
   }
+
+  private async defaultChatDiagnostic(): Promise<FeishuChatDiagnostic | null> {
+    const chatId = this.config.feishu.defaultChatId;
+    if (!chatId || !this.feishu) return null;
+    try {
+      const chat = await this.feishu.getChatInfo(chatId);
+      const fullTopicMode = chat.chatMode === "topic" || chat.groupMessageType === "thread";
+      const topicReplySupported = chat.chatMode === "group" || chat.chatMode === "topic" || chat.groupMessageType === "thread";
+      return {
+        ok: true,
+        chatId,
+        name: chat.name,
+        chatMode: chat.chatMode,
+        groupMessageType: chat.groupMessageType,
+        topicReplySupported,
+        fullTopicMode,
+        recommendation: chatRecommendation(chat.chatMode, chat.groupMessageType),
+        requiredScopes: ["im:chat:readonly"],
+        error: null
+      };
+    } catch (error) {
+      this.lastError = String(error);
+      return {
+        ok: false,
+        chatId,
+        name: null,
+        chatMode: null,
+        groupMessageType: null,
+        topicReplySupported: null,
+        fullTopicMode: null,
+        recommendation: "无法读取默认群信息。请确认机器人仍在群里，并为应用开通 im:chat:readonly 或 im:chat:read / im:chat 权限。",
+        requiredScopes: ["im:chat:readonly", "im:chat:read", "im:chat"],
+        error: error instanceof Error ? error.message : String(error)
+      };
+    }
+  }
 }
+
+const chatRecommendation = (chatMode: string | null, groupMessageType: string | null): string => {
+  if (chatMode === "topic" || groupMessageType === "thread") {
+    return "当前群已经是话题消息形式；新的任务回复会在话题流中展示。";
+  }
+  if (chatMode === "group" && (!groupMessageType || groupMessageType === "chat")) {
+    return "当前群是普通会话消息形式。桥接已用 reply_in_thread 创建任务话题，但主界面仍会像普通群回复；如需所有任务按话题流展示，需要把群的 group_message_type 改为 thread。";
+  }
+  if (chatMode === "p2p") {
+    return "当前默认会话是单聊，不适合承载多人任务话题；建议配置一个群聊 chat_id。";
+  }
+  return "未能判断当前群的话题展示形态；请用 feishu-chat doctor 或 /doctor 查看原始群属性。";
+};

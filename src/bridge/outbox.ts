@@ -38,9 +38,17 @@ export class OutboxWorker {
       const card = item.payload.card as Record<string, unknown> | undefined;
       const text = typeof item.payload.text === "string" ? item.payload.text : null;
       if (card) {
-        await this.feishu.sendCard(item.feishuChatId, card, item.feishuTopicRootMessageId);
+        if (item.feishuThreadId) {
+          await this.feishu.replyCardInThread(item.feishuTopicRootMessageId ?? item.feishuThreadId, card);
+        } else {
+          await this.feishu.sendCard(item.feishuChatId, card, item.feishuTopicRootMessageId);
+        }
       } else if (text) {
-        await this.feishu.sendText(item.feishuChatId, text, item.feishuTopicRootMessageId);
+        if (item.feishuThreadId) {
+          await this.feishu.replyTextInThread(item.feishuTopicRootMessageId ?? item.feishuThreadId, text);
+        } else {
+          await this.feishu.sendText(item.feishuChatId, text, item.feishuTopicRootMessageId);
+        }
       } else {
         throw new Error("outbox payload must include card or text");
       }

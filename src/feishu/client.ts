@@ -4,13 +4,33 @@ import type { FeishuCard } from "../domain/cards.js";
 
 export interface SentMessage {
   messageId: string;
+  rootId: string | null;
+  parentId: string | null;
+  threadId: string | null;
+  raw: Record<string, unknown>;
+}
+
+export interface FeishuChatInfo {
+  chatId: string;
+  name: string | null;
+  chatMode: string | null;
+  groupMessageType: string | null;
+  chatType: string | null;
+  chatStatus: string | null;
+  external: boolean | null;
   raw: Record<string, unknown>;
 }
 
 export interface FeishuSender {
   sendText(chatId: string, text: string, rootMessageId?: string | null): Promise<SentMessage>;
   sendCard(chatId: string, card: FeishuCard, rootMessageId?: string | null): Promise<SentMessage>;
+  replyTextInThread(messageId: string, text: string): Promise<SentMessage>;
+  replyCardInThread(messageId: string, card: FeishuCard): Promise<SentMessage>;
   updateCard(messageId: string, card: FeishuCard): Promise<void>;
+}
+
+export interface FeishuChatInfoProvider {
+  getChatInfo(chatId: string): Promise<FeishuChatInfo>;
 }
 
 export class FeishuClient implements FeishuSender {
@@ -35,6 +55,14 @@ export class FeishuClient implements FeishuSender {
     return this.createMessage(chatId, "interactive", card);
   }
 
+  async replyTextInThread(messageId: string, text: string): Promise<SentMessage> {
+    return this.replyMessage(messageId, "text", { text }, true);
+  }
+
+  async replyCardInThread(messageId: string, card: FeishuCard): Promise<SentMessage> {
+    return this.replyMessage(messageId, "interactive", card, true);
+  }
+
   async updateCard(messageId: string, card: FeishuCard): Promise<void> {
     const token = await this.getTenantAccessToken();
     const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
@@ -49,6 +77,42 @@ export class FeishuClient implements FeishuSender {
       })
     });
     await this.assertOk(response, "update card");
+  }
+
+  async getChatInfo(chatId: string): Promise<FeishuChatInfo> {
+    const token = await this.getTenantAccessToken();
+    const response = await fetch(
+      `https://open.feishu.cn/open-apis/im/v1/chats/${encodeURIComponent(chatId)}?user_id_type=open_id`,
+      {
+        method: "GET",
+        headers: { authorization: `Bearer ${token}` }
+      }
+    );
+    const body = await this.assertOk(response, "get chat info");
+    const data = getObject(body.data);
+    return {
+      chatId,
+      name: asOptionalString(data.name),
+      chatMode: asOptionalString(data.chat_mode),
+      groupMessageType: asOptionalString(data.group_message_type),
+      chatType: asOptionalString(data.chat_type),
+      chatStatus: asOptionalString(data.chat_status),
+      external: typeof data.external === "boolean" ? data.external : null,
+      raw: data
+    };
+  }
+
+  async setGroupMessageType(chatId: string, groupMessageType: "chat" | "thread"): Promise<void> {
+    const token = await this.getTenantAccessToken();
+    const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, {
+      method: "PUT",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json; charset=utf-8"
+      },
+      body: JSON.stringify({ group_message_type: groupMessageType })
+    });
+    await this.assertOk(response, "update chat group message type");
   }
 
   private async createMessage(chatId: string, msgType: "text" | "interactive", content: unknown): Promise<SentMessage> {
@@ -69,7 +133,12 @@ export class FeishuClient implements FeishuSender {
     return extractMessage(body);
   }
 
-  private async replyMessage(messageId: string, msgType: "text" | "interactive", content: unknown): Promise<SentMessage> {
+  private async replyMessage(
+    messageId: string,
+    msgType: "text" | "interactive",
+    content: unknown,
+    replyInThread = false
+  ): Promise<SentMessage> {
     const token = await this.getTenantAccessToken();
     const response = await fetch(
       `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reply`,
@@ -81,7 +150,8 @@ export class FeishuClient implements FeishuSender {
         },
         body: JSON.stringify({
           msg_type: msgType,
-          content: JSON.stringify(content)
+          content: JSON.stringify(content),
+          reply_in_thread: replyInThread
         })
       }
     );
@@ -128,6 +198,15 @@ const extractMessage = (body: Record<string, unknown>): SentMessage => {
   const data = body.data && typeof body.data === "object" ? (body.data as Record<string, unknown>) : {};
   return {
     messageId: String(data.message_id ?? data.messageId ?? ""),
+    rootId: typeof data.root_id === "string" ? data.root_id : null,
+    parentId: typeof data.parent_id === "string" ? data.parent_id : null,
+    threadId: typeof data.thread_id === "string" ? data.thread_id : null,
     raw: body
   };
 };
+
+const getObject = (value: unknown): Record<string, unknown> =>
+  value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+
+const asOptionalString = (value: unknown): string | null =>
+  typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
