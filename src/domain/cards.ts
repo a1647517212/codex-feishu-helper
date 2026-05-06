@@ -6,20 +6,25 @@ import type {
   TaskEvent,
   TaskStatusProjection
 } from "../core/types.js";
+import type { InteractionMode } from "../config.js";
 
 export type FeishuCard = Record<string, unknown>;
 
 export class CardRenderer {
+  constructor(private readonly interactionMode: InteractionMode = "message_command") {}
+
   consoleCard(stats: { running: number; approvals: number; queued: number; completedToday: number }): FeishuCard {
-    return card("Codex 控制台", [
+    const elements = [
       text(`运行中 ${stats.running}   待确认 ${stats.approvals}   已排队 ${stats.queued}   今日完成 ${stats.completedToday}`),
-      actions([
+      commandText(["/tasks", "/projects", "/doctor", "/notify test", "/notify history"]),
+      maybeActions(this.interactionMode, [
         button("新建任务", "new_task"),
         button("接管电脑任务", "claim_sessions"),
         button("项目列表", "project_list"),
         button("诊断", "doctor")
       ])
-    ]);
+    ].filter(Boolean) as Record<string, unknown>[];
+    return card("Codex 控制台", elements);
   }
 
   newTaskDraftCard(): FeishuCard {
@@ -36,11 +41,12 @@ export class CardRenderer {
           [
             `任务：${thread.title}`,
             `状态：${statusText(thread.status)}`,
-            `工作目录：${thread.cwd ?? "未知"}`
+            `工作目录：${thread.cwd ?? "未知"}`,
+            `继续命令：/claim ${thread.id}`
           ].join("\n")
-        ),
-        actions([button("在飞书继续", "claim_thread", { codexThreadId: thread.id })])
+        )
       );
+      pushMaybe(elements, maybeActions(this.interactionMode, [button("在飞书继续", "claim_thread", { codexThreadId: thread.id })]));
     }
     return card("电脑上的 Codex 任务", elements.length > 0 ? elements : [text("没有发现可接管的本机 Codex 任务。")]);
   }
@@ -65,12 +71,17 @@ export class CardRenderer {
       `变更：${projection.changedFiles} 个文件`,
       projection.queuedMessages > 0 ? `队列：${projection.queuedMessages} 条后续要求` : null,
       projection.pendingApprovals > 0 ? `待确认：${projection.pendingApprovals} 项` : null,
-      projection.lastSummary ? `摘要：${projection.lastSummary}` : null
+      projection.lastSummary ? `摘要：${projection.lastSummary}` : null,
+      commandHintForStatus(projection.status)
     ].filter(Boolean);
-    return card(projection.title, [
+    const elements = [
       text(lines.join("\n")),
-      actions(taskButtons(projection.status).map(([label, action]) => button(label, action, { bindingId: projection.bindingId })))
-    ]);
+      maybeActions(
+        this.interactionMode,
+        taskButtons(projection.status).map(([label, action]) => button(label, action, { bindingId: projection.bindingId }))
+      )
+    ].filter(Boolean) as Record<string, unknown>[];
+    return card(projection.title, elements);
   }
 
   approvalCard(approval: PendingApproval): FeishuCard {
@@ -86,10 +97,14 @@ export class CardRenderer {
       button("拒绝", "approval_deny", { approvalId: approval.id }),
       button("查看详情", "approval_detail", { approvalId: approval.id })
     ];
-    return card("需要确认", [
-      text(`${target}\n\n用途：${approval.reason ?? "Codex 请求继续执行"}\n风险：${riskText(approval.riskLevel)}`),
-      actions(buttons.slice(0, 4))
-    ]);
+    const elements = [
+      text(
+        `${target}\n\n用途：${approval.reason ?? "Codex 请求继续执行"}\n风险：${riskText(approval.riskLevel)}\n\n` +
+          [`允许一次：/approval once ${approval.id}`, ...(approval.riskLevel === "low" ? [`本任务允许：/approval task ${approval.id}`] : []), `拒绝：/approval deny ${approval.id}`, `详情：/approval detail ${approval.id}`].join("\n")
+      )
+    ];
+    pushMaybe(elements, maybeActions(this.interactionMode, buttons.slice(0, 4)));
+    return card("需要确认", elements);
   }
 
   approvalDetailCard(approval: PendingApproval): FeishuCard {
@@ -121,11 +136,12 @@ export class CardRenderer {
             `类型：${approval.approvalType === "command_execution" ? "命令执行" : "文件修改"}`,
             `风险：${riskText(approval.riskLevel)}`,
             approval.command ? `命令：${approval.command}` : `文件数：${approval.filePaths.length}`,
-            `时间：${approval.requestedAt}`
+            `时间：${approval.requestedAt}`,
+            `命令：/approval detail ${approval.id}`
           ].join("\n")
-        ),
-        actions([button("查看详情", "approval_detail", { approvalId: approval.id })])
+        )
       );
+      pushMaybe(elements, maybeActions(this.interactionMode, [button("查看详情", "approval_detail", { approvalId: approval.id })]));
     }
     return card("待确认列表", elements);
   }
@@ -134,10 +150,8 @@ export class CardRenderer {
     if (queued.length === 0) return card("后续要求队列", [text("当前没有排队中的后续要求。")]);
     const elements: Record<string, unknown>[] = [];
     for (const item of queued.slice(0, 10)) {
-      elements.push(
-        text([`位置：${item.position}`, `内容：${item.text}`, `时间：${item.createdAt}`].join("\n")),
-        actions([button("取消这条", "queue_cancel", { bindingId, queueId: item.id })])
-      );
+      elements.push(text([`位置：${item.position}`, `内容：${item.text}`, `时间：${item.createdAt}`, `取消命令：/queue cancel ${item.id}`].join("\n")));
+      pushMaybe(elements, maybeActions(this.interactionMode, [button("取消这条", "queue_cancel", { bindingId, queueId: item.id })]));
     }
     return card("后续要求队列", elements);
   }
@@ -182,22 +196,33 @@ export class CardRenderer {
   }
 
   diagnosticCard(snapshot: DiagnosticSnapshot): FeishuCard {
-    return card("Bridge 诊断", [
+    const elements = [
       text(
         [
           `电脑：${snapshot.machineName}`,
           `Codex：${snapshot.codexAvailable ? "可用" : "不可用"}`,
           `app-server：${snapshot.appServerStatus}`,
           `飞书配置：${snapshot.feishuConfigured ? "已配置" : "未完整配置"}`,
+          `消息接入：${snapshot.feishuMessageTransport === "long_connection" ? "长连接" : "HTTP 回调"}`,
+          `卡片回调：${snapshot.feishuCardActionTransport === "long_connection" ? "长连接" : "HTTP 回调"}`,
+          `交互模式：${interactionModeText(snapshot.feishuInteractionMode)}`,
           `运行中任务：${snapshot.runningTasksCount}`,
           `待确认：${snapshot.pendingApprovalsCount}`,
           `待发送通知：${snapshot.pendingOutboxCount}`,
+          `最近消息：${snapshot.lastFeishuMessageAt ? `${snapshot.lastFeishuMessageAt} (${snapshot.lastFeishuMessageId ?? "unknown"})` : "暂无"}`,
+          `最近卡片点击：${
+            snapshot.lastFeishuCardActionAt
+              ? `${snapshot.lastFeishuCardActionAt} (${snapshot.lastFeishuCardAction ?? "unknown"} / ${snapshot.lastFeishuCardActionId ?? "unknown"})`
+              : "暂无"
+          }`,
           `数据库：${snapshot.databasePath}`,
           `最近错误：${snapshot.lastError ?? "无"}`
         ].join("\n")
       ),
-      actions([button("重试连接", "doctor"), button("发送测试通知", "send_test_notification"), button("通知历史", "notification_history")])
-    ]);
+      commandText(["/doctor", "/notify test", "/notify history"]),
+      maybeActions(this.interactionMode, [button("重试连接", "doctor"), button("发送测试通知", "send_test_notification"), button("通知历史", "notification_history")])
+    ].filter(Boolean) as Record<string, unknown>[];
+    return card("Bridge 诊断", elements);
   }
 }
 
@@ -216,6 +241,16 @@ const actions = (items: Record<string, unknown>[]): Record<string, unknown> => (
   tag: "action",
   actions: items.slice(0, 4)
 });
+
+const maybeActions = (mode: InteractionMode, items: Record<string, unknown>[]): Record<string, unknown> | null =>
+  mode === "message_command" ? null : actions(items);
+
+const pushMaybe = (elements: Record<string, unknown>[], element: Record<string, unknown> | null): void => {
+  if (element) elements.push(element);
+};
+
+const commandText = (commands: string[]): Record<string, unknown> =>
+  text(`可直接发送命令：\n${commands.map((command) => `- ${command}`).join("\n")}`);
 
 const button = (label: string, action: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
   tag: "button",
@@ -267,6 +302,21 @@ const taskButtons = (status: string): [string, string][] => {
   }
 };
 
+const commandHintForStatus = (status: string): string => {
+  switch (status) {
+    case "running":
+      return "命令：/status、/queue、/stop；直接回复可追加要求";
+    case "waiting_for_approval":
+      return "命令：/approval list、/diff、/stop";
+    case "completed":
+      return "命令：/diff、/archive；直接回复可继续处理";
+    case "failed":
+      return "命令：/retry、/analyze-failure、/logs、/stop";
+    default:
+      return "命令：/status、/run-tests、/diff、/archive；直接回复可继续处理";
+  }
+};
+
 const statusText = (status: string): string => {
   const map: Record<string, string> = {
     draft: "草稿",
@@ -283,6 +333,9 @@ const statusText = (status: string): string => {
 };
 
 const riskText = (risk: string): string => ({ low: "低", medium: "中", high: "高" })[risk] ?? risk;
+
+const interactionModeText = (mode: string): string =>
+  ({ message_command: "消息命令", hybrid: "按钮+消息命令", card_callback: "卡片按钮" })[mode] ?? mode;
 
 const truncate = (value: string, max: number): string =>
   value.length > max ? `${value.slice(0, max - 20)}\n...(已截断)` : value;

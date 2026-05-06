@@ -16,12 +16,13 @@ Reasons:
 - `CodexClient`: starts `codex app-server`, performs `initialize` and `initialized`, wraps thread and turn APIs, captures notifications and server approval requests.
 - `FeishuClient`: sends Feishu text messages, replies, cards, and card updates through Feishu OpenAPI.
 - `FeishuEventParser`: parses URL verification, message events, and card action callbacks.
-- `Repository`: owns SQLite tables for projects, session bindings, events, approvals, idempotent actions, message queue, outbox, trusted subjects, device state, and ownership.
+- `FeishuLongConnectionServer`: receives Feishu message events and, when enabled, card action callbacks through the official long-connection SDK path.
+- `Repository`: owns SQLite tables for projects, session bindings, events, approvals, idempotent actions, incoming message dedupe, message queue, outbox, trusted subjects, device state, and ownership.
 - `TaskService`: maps Feishu topic replies to Codex thread operations, queues busy messages, records semantic events, and handles approval buttons.
 - `OutboxWorker`: retries Feishu notifications with dedupe keys.
 - `ProjectionBuilder`: builds Feishu task status cards from semantic events and database state.
 - `DiagnosticsService`: reports Codex availability, app-server status, database path, counts, and last error.
-- `BridgeHttpServer`: exposes `/feishu/events`, `/feishu/card`, `/healthz`, `/readyz`, `/doctor`, and `/console-card`.
+- `BridgeHttpServer`: exposes `/healthz`, `/readyz`, `/doctor`, `/console-card`, plus `/feishu/events` and `/feishu/card` when the corresponding message or card callback transport is explicitly set to HTTP fallback.
 
 ## Local Verification
 
@@ -41,13 +42,13 @@ Smoke endpoints:
 ```powershell
 Invoke-RestMethod http://127.0.0.1:8787/healthz
 Invoke-RestMethod http://127.0.0.1:8787/doctor -Headers @{ Authorization = "Bearer <token>" }
-Invoke-RestMethod http://127.0.0.1:8787/feishu/events -Method Post -ContentType "application/json" -Body '{"type":"url_verification","challenge":"ok-smoke"}'
+Invoke-WebRequest http://127.0.0.1:8787/feishu/events -Method Post -ContentType "application/json" -Body '{"type":"url_verification","challenge":"blocked"}'
 ```
 
 Observed smoke result:
 
 ```json
-{"health":true,"doctor":true,"appServer":"connected","verify":"ok-smoke"}
+{"health":true,"doctor":true,"appServer":"connected","httpFallbackDisabled":409}
 ```
 
 ## Second-Pass Acceptance Review
@@ -60,8 +61,12 @@ Reviewed against `FEISHU_CODEX_CONTROL_DESIGN.md` P0 and section 44 acceptance i
 - The next queued message is delivered automatically after the current turn completes.
 - Malformed Codex notifications are recorded as `protocol.validation_failed` semantic events instead of disappearing into logs only.
 - Completed-turn notification outbox entries use turn-level dedupe keys.
+- Incoming Feishu messages are deduped by `message_id`, so long-connection retries do not duplicate control cards or create duplicate Codex turns.
 - Project path checks block path traversal and absolute or nested secret files such as `.env`.
 - HTTP smoke coverage is part of `npm run check`, including `/healthz`, authenticated `/doctor`, and Feishu URL verification.
+- Long-connection and HTTP callback parsers both cover the v2 card action shape where `action` and `context` are nested under `event`.
+- Message events and card callbacks can now use different transports, so tenants that only fail on card callbacks do not need to move normal message handling off long connection.
+- Local-only deployments can bypass card callbacks entirely through message-command mode. Cards render explicit commands for claim, status, queue, approval, diff, retry, stop, and archive operations; the command path reuses the same `TaskService` action dispatcher as card buttons.
 
 Latest verification:
 
@@ -73,25 +78,40 @@ git diff --check
 Result:
 
 ```text
-16 tests passed
+32 tests passed
 no whitespace errors
 ```
 
 ## First Real Feishu Setup
 
 1. Create or reuse a Feishu enterprise self-built app.
-2. Grant message receive/send and card callback permissions.
-3. Configure callback URL:
+2. Enable the bot and add it to the target group.
+3. Configure Events subscription mode to long connection for message events.
+4. Subscribe to `im.message.receive_v1`.
+5. Grant message receive/send/reply permissions. Enable the permission that lets the bot receive all group messages if it should work without `@`.
+6. If you also want interactive buttons, subscribe to the callback `card.action.trigger`, configure a public HTTPS card callback URL, and use `interactionMode=hybrid` or `card_callback`.
+7. For HTTP callback fallback, configure only the URLs you actually use:
    - Event callback: `https://<public-url>/feishu/events`
    - Card callback: `https://<public-url>/feishu/card`
-4. Fill `~/.feishu-codex/config.json` from `config.example.json`.
-5. Set `allowedUserIds` and `allowedChatIds`.
-6. Start the bridge with `npm run start`.
-7. In the allowed chat, send `/codex` or `/tasks`.
+8. Fill `~/.feishu-codex/config.json` from `config.example.json`.
+9. Set `allowedUserIds` and `allowedChatIds`.
+10. Start the bridge with `npm run start`.
+11. In the allowed chat, send `/codex` or `/tasks`.
+
+## Real Feishu Verification Snapshot
+
+Verified with the bot in group `codex-ep` using long connection:
+
+- `/doctor` returned `appServerStatus=connected`, `codexAvailable=true`, `feishuConfigured=true`.
+- Posting `/codex` without `@` produced a `Codex 控制台` interactive card reply in the group.
+- `POST /feishu/events` returned `409` in long-connection mode, confirming HTTP callback fallback is disabled by default.
+- After waiting for long-connection retry windows, the latest `/codex` delivery produced one card and one `incoming_messages` row.
+- A temporary `lark-cli event +subscribe` process was confirmed to split events away from the bridge; only one long-connection consumer should run for this app in normal operation.
 
 ## Current Boundaries
 
-- HTTP callback mode is implemented first. Feishu long-connection can be added behind the same `TaskService` later.
+- Long connection is still the default for messages; card callbacks are optional because message-command mode covers the local-only case.
+- Card button callbacks require the Feishu app to subscribe to `card.action.trigger` and provide a public callback path. If the bridge never records `lastFeishuCardActionAt`, the failing path is before `TaskService`; use message commands or add a public callback/relay.
 - Desktop owner IPC routing is intentionally not implemented in P0.
 - The bridge does not mirror the Codex App GUI. It controls persisted Codex sessions through `app-server`.
 - High-risk approvals do not expose a task-wide trust button.

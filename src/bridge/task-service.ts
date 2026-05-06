@@ -11,9 +11,10 @@ import { SecurityPolicy } from "../domain/security.js";
 import type { CodexClient, CodexThreadSummary } from "../codex/client.js";
 import type { FeishuSender } from "../feishu/client.js";
 import type { Logger } from "../logger.js";
+import { DiagnosticsService } from "./diagnostics.js";
 
 export class TaskService {
-  private readonly cards = new CardRenderer();
+  private readonly cards: CardRenderer;
   private readonly projection: ProjectionBuilder;
   private readonly git = new GitInspector();
   private readonly security: SecurityPolicy;
@@ -23,8 +24,10 @@ export class TaskService {
     private readonly repo: Repository,
     private readonly codex: CodexClient,
     private readonly feishu: FeishuSender,
-    private readonly logger: Logger
+    private readonly logger: Logger,
+    private readonly diagnostics: DiagnosticsService = new DiagnosticsService(config, repo, codex)
   ) {
+    this.cards = new CardRenderer(config.feishu.interactionMode);
     this.projection = new ProjectionBuilder(repo);
     this.security = new SecurityPolicy(config);
     this.codex.on("notification", (message) => this.handleCodexNotification(message).catch((error) => this.logger.error("codex notification handling failed", { error: String(error), message })));
@@ -51,6 +54,25 @@ export class TaskService {
       try {
         const detail = await this.codex.readThread(binding.codexThreadId, false);
         const thread = normalizeThreadFromDetail(binding.codexThreadId, detail);
+        const historyStatus = this.latestStateFromHistory(binding.id);
+        if (thread.status === "idle" && historyStatus && isTerminalStatus(historyStatus)) {
+          if (binding.status !== historyStatus) {
+            this.repo.updateBindingStatus(binding.id, historyStatus, binding.lastTurnId);
+            this.repo.insertEvent({
+              sessionBindingId: binding.id,
+              codexThreadId: binding.codexThreadId,
+              eventType: "session.reconcile_restored_terminal_status",
+              eventPayload: {
+                previousStatus: binding.status,
+                restoredStatus: historyStatus
+              }
+            });
+          }
+          continue;
+        }
+        if (thread.status === "idle" && isTerminalStatus(binding.status)) {
+          continue;
+        }
         if (thread.status !== binding.status) {
           this.repo.updateBindingStatus(binding.id, thread.status);
           this.repo.insertEvent({
@@ -106,16 +128,33 @@ export class TaskService {
   async handleMessage(message: FeishuIncomingMessage): Promise<void> {
     this.security.assertFeishuMessageAllowed(message);
     const text = message.text.trim();
+    const incoming = this.repo.beginIncomingMessage({
+      messageId: message.messageId,
+      chatId: message.chatId,
+      userId: message.userId,
+      text
+    });
+    if (incoming.duplicate) {
+      this.logger.warn("duplicate feishu message ignored", {
+        messageId: message.messageId,
+        chatId: message.chatId,
+        deliveries: incoming.deliveries
+      });
+      return;
+    }
     if (text === "/codex" || text === "codex") {
       await this.showConsole(message.chatId, message.rootMessageId ?? message.messageId);
       return;
     }
     if (text === "/doctor" || text === "诊断") {
-      await this.feishu.sendText(message.chatId, "诊断请访问 /doctor 或点击控制台诊断按钮。", message.rootMessageId ?? message.messageId);
+      await this.sendDoctorCard(message.chatId, message.rootMessageId ?? message.messageId);
       return;
     }
     if (text === "/tasks" || text === "接管电脑任务") {
       await this.listClaimableSessions(message.chatId, message.rootMessageId ?? message.messageId);
+      return;
+    }
+    if (await this.tryHandleMessageCommand(message, text)) {
       return;
     }
     const rootMessageId = message.rootMessageId ?? message.messageId;
@@ -144,6 +183,41 @@ export class TaskService {
       const result = { ok: false, error: String(error) };
       this.repo.failAction(action.actionId, result);
       throw error;
+    }
+  }
+
+  async processCardActionDeferred(action: FeishuCardAction): Promise<void> {
+    try {
+      const result = await this.handleCardAction(action);
+      if (result.repeated === true) return;
+      const text = typeof result.text === "string" ? result.text.trim() : "";
+      if (!text) return;
+      const chatId = action.chatId || this.config.feishu.defaultChatId || "";
+      if (!chatId) return;
+      await this.feishu.sendText(chatId, text, action.rootMessageId);
+    } catch (error) {
+      this.logger.error("feishu card action failed", {
+        action: action.action,
+        actionId: action.actionId,
+        chatId: action.chatId,
+        error: String(error)
+      });
+      const chatId = action.chatId || this.config.feishu.defaultChatId || "";
+      if (!chatId) return;
+      try {
+        await this.feishu.sendText(
+          chatId,
+          `按钮处理失败：${error instanceof Error ? error.message : String(error)}`,
+          action.rootMessageId
+        );
+      } catch (notifyError) {
+        this.logger.error("feishu card action failure notification failed", {
+          action: action.action,
+          actionId: action.actionId,
+          chatId,
+          error: String(notifyError)
+        });
+      }
     }
   }
 
@@ -211,7 +285,6 @@ export class TaskService {
       cwd: binding.cwd,
       model: project?.defaultModel ?? this.config.codex.defaultModel
     });
-    await this.updateTaskCard(binding.id);
   }
 
   private async continueBindingFromFeishu(binding: SessionBinding, message: FeishuIncomingMessage): Promise<void> {
@@ -240,12 +313,12 @@ export class TaskService {
     });
     await this.codex.resumeThread(binding.codexThreadId);
     await this.codex.startTurn(binding.codexThreadId, message.text, { cwd: binding.cwd });
-    await this.updateTaskCard(binding.id);
   }
 
   private async dispatchCardAction(action: FeishuCardAction): Promise<Record<string, unknown>> {
     switch (action.action) {
       case "doctor":
+        await this.sendDoctorCard(action.chatId || this.config.feishu.defaultChatId || "", action.rootMessageId);
         return { ok: true, action: "doctor" };
       case "new_task":
         await this.sendNewTaskDraft(action);
@@ -319,9 +392,95 @@ export class TaskService {
     }
   }
 
+  private async tryHandleMessageCommand(message: FeishuIncomingMessage, text: string): Promise<boolean> {
+    if (!isCommandText(text)) return false;
+    const rootMessageId = message.rootMessageId ?? message.messageId;
+    try {
+      const action = this.parseMessageCommand(message, text, rootMessageId);
+      if (!action) return false;
+      const result = await this.handleCardAction(action);
+      const resultText = typeof result.text === "string" ? result.text.trim() : "";
+      if (resultText) {
+        await this.feishu.sendText(message.chatId, resultText, rootMessageId);
+      } else if (shouldAckCommand(action.action)) {
+        await this.feishu.sendText(message.chatId, "已处理。", rootMessageId);
+      }
+    } catch (error) {
+      await this.feishu.sendText(
+        message.chatId,
+        `命令处理失败：${error instanceof Error ? error.message : String(error)}`,
+        rootMessageId
+      );
+    }
+    return true;
+  }
+
+  private parseMessageCommand(message: FeishuIncomingMessage, text: string, rootMessageId: string): FeishuCardAction | null {
+    const parts = splitCommand(text);
+    const command = parts[0] ?? "";
+    if (!command) return null;
+    const currentBinding = this.repo.findBindingByTopic(message.chatId, rootMessageId);
+    const actionId = newId("cmd");
+    const base = (action: string, payload: Record<string, unknown> = {}, root = rootMessageId): FeishuCardAction => ({
+      actionId,
+      action,
+      userId: message.userId,
+      chatId: message.chatId,
+      rootMessageId: root,
+      payload
+    });
+
+    if (command === "projects") return base("project_list");
+    if (command === "status") return base("task_status", { bindingId: requireCurrentBindingId(currentBinding, command) });
+    if (command === "logs") return base("task_logs", { bindingId: requireCurrentBindingId(currentBinding, command) });
+    if (command === "diff") return base("task_diff", { bindingId: requireCurrentBindingId(currentBinding, command) });
+    if (command === "queue") {
+      if (parts[1]?.toLowerCase() === "cancel") {
+        return base("queue_cancel", {
+          bindingId: requireCurrentBindingId(currentBinding, command),
+          queueId: requireArgument(parts[2], "/queue cancel <queueId>")
+        });
+      }
+      return base("queue_view", { bindingId: requireCurrentBindingId(currentBinding, command) });
+    }
+    if (command === "claim") {
+      return base("claim_thread", { codexThreadId: requireArgument(parts[1], "/claim <codexThreadId>") });
+    }
+    if (command === "notify") {
+      const sub = parts[1] ?? "";
+      if (sub === "test") return base("send_test_notification");
+      if (sub === "history") return base("notification_history");
+      throw new Error("未知通知命令，请使用 /notify test 或 /notify history。");
+    }
+    if (command === "run-tests") return base("task_run_tests", { bindingId: requireCurrentBindingId(currentBinding, command) });
+    if (command === "stop") return base("task_stop", { bindingId: parts[1] ?? requireCurrentBindingId(currentBinding, command) });
+    if (command === "retry") return base("task_retry", { bindingId: requireCurrentBindingId(currentBinding, command) });
+    if (command === "analyze-failure") return base("task_analyze_failure", { bindingId: requireCurrentBindingId(currentBinding, command) });
+    if (command === "archive") return base("task_archive", { bindingId: requireCurrentBindingId(currentBinding, command) });
+    if (command === "approval") {
+      const sub = parts[1] ?? "";
+      if (sub === "list") {
+        return base("approval_list", { bindingId: requireCurrentBindingId(currentBinding, command) });
+      }
+      if (sub === "detail") {
+        return base("approval_detail", { approvalId: requireArgument(parts[2], "/approval detail <approvalId>") });
+      }
+      const approvalId = requireArgument(parts[2], "/approval once|task|deny <approvalId>");
+      if (sub === "once") return base("approval_once", { approvalId });
+      if (sub === "task") return base("approval_for_task", { approvalId });
+      if (sub === "deny") return base("approval_deny", { approvalId });
+      throw new Error("未知审批命令，请使用 /approval list、/approval detail <id>、/approval once <id>、/approval task <id> 或 /approval deny <id>。");
+    }
+    return null;
+  }
+
   private async sendNewTaskDraft(action: FeishuCardAction): Promise<void> {
     const chatId = action.chatId || this.config.feishu.defaultChatId || "";
     await this.feishu.sendCard(chatId, this.cards.newTaskDraftCard(), action.rootMessageId);
+  }
+
+  private async sendDoctorCard(chatId: string, rootMessageId?: string | null): Promise<void> {
+    await this.feishu.sendCard(chatId, this.cards.diagnosticCard(await this.diagnostics.snapshot()), rootMessageId);
   }
 
   private async claimThreadById(action: FeishuCardAction): Promise<void> {
@@ -590,7 +749,6 @@ export class TaskService {
         dedupeKey: `turn:${threadId}:${turnId}:completed`
       });
       await this.deliverNextQueuedMessage(binding.id);
-      await this.updateTaskCard(binding.id);
     }
     if (method === "item/agentMessage/delta") {
       const delta = asString(params.delta);
@@ -645,8 +803,30 @@ export class TaskService {
       feishuChatId: binding.feishuChatId,
       feishuTopicRootMessageId: binding.feishuTopicRootMessageId,
       payload: { card: this.cards.taskStatusCard(projection) },
-      dedupeKey: `task-status:${binding.id}:${projection.status}:${projection.updatedAt}:${projection.queuedMessages}:${projection.pendingApprovals}`
+      dedupeKey: [
+        "task-status",
+        binding.id,
+        projection.status,
+        projection.lastTurnId ?? "no-turn",
+        projection.changedFiles,
+        projection.queuedMessages,
+        projection.pendingApprovals,
+        stableSummaryKey(projection.lastSummary)
+      ].join(":")
     });
+  }
+
+  private latestStateFromHistory(bindingId: string): TaskStatus | null {
+    const events = this.repo.listEventsForBinding(bindingId, 200);
+    for (const event of [...events].reverse()) {
+      if (event.eventType === "task.completed") return "completed";
+      if (event.eventType === "task.failed") return "failed";
+      if (event.eventType === "task.interrupted" || event.eventType === "turn.interrupted_by_feishu") return "interrupted";
+      if (event.eventType === "task.archived") return "archived";
+      if (event.eventType === "approval.requested") return "waiting_for_approval";
+      if (event.eventType === "turn.started" || event.eventType === "turn.requested_from_feishu") return "running";
+    }
+    return null;
   }
 }
 
@@ -663,6 +843,79 @@ const normalizeTurnStatus = (status: unknown): TaskStatus => {
 };
 
 const truncate = (text: string, max: number): string => (text.length > max ? `${text.slice(0, max - 20)}\n...(已截断)` : text);
+
+const isTerminalStatus = (status: TaskStatus): boolean =>
+  status === "completed" || status === "failed" || status === "interrupted" || status === "archived";
+
+const isCommandText = (text: string): boolean =>
+  text.startsWith("/") ||
+  ["项目列表", "查看进度", "查看日志", "查看变更", "查看队列", "通知历史", "发送测试通知"].includes(text);
+
+const normalizeCommand = (value: string): string => {
+  const lowered = value.trim().toLowerCase().replace(/^\/+/, "");
+  const aliases: Record<string, string> = {
+    "项目列表": "projects",
+    project: "projects",
+    projects: "projects",
+    "查看进度": "status",
+    status: "status",
+    "查看日志": "logs",
+    logs: "logs",
+    log: "logs",
+    "查看变更": "diff",
+    diff: "diff",
+    changes: "diff",
+    "查看队列": "queue",
+    queue: "queue",
+    claim: "claim",
+    "通知历史": "notify history",
+    "发送测试通知": "notify test",
+    notify: "notify",
+    "run-tests": "run-tests",
+    runtests: "run-tests",
+    test: "run-tests",
+    stop: "stop",
+    retry: "retry",
+    "analyze-failure": "analyze-failure",
+    analyze: "analyze-failure",
+    archive: "archive",
+    approval: "approval",
+    approve: "approval"
+  };
+  return aliases[value.trim()] ?? aliases[lowered] ?? lowered;
+};
+
+const splitCommand = (text: string): string[] => {
+  const rawParts = text.trim().split(/\s+/).filter(Boolean);
+  if (rawParts.length === 0) return [];
+  const first = normalizeCommand(rawParts[0] ?? "");
+  const normalizedWhole = normalizeCommand(text);
+  if (rawParts.length === 1 && normalizedWhole.includes(" ")) return normalizedWhole.split(/\s+/).filter(Boolean);
+  return [first, ...rawParts.slice(1).map((part) => part.trim().toLowerCase().replace(/^\/+/, ""))];
+};
+
+const requireArgument = (value: string | undefined, usage: string): string => {
+  if (value && value.trim()) return value.trim();
+  throw new Error(`缺少参数，请使用 ${usage}`);
+};
+
+const requireCurrentBindingId = (binding: SessionBinding | null, command: string): string => {
+  if (binding) return binding.id;
+  throw new Error(`/${command} 需要在已绑定的任务话题里发送。`);
+};
+
+const shouldAckCommand = (action: string): boolean =>
+  new Set(["queue_cancel", "task_stop", "task_archive", "approval_once", "approval_for_task", "approval_deny"]).has(action);
+
+const stableSummaryKey = (text: string | null): string => {
+  if (!text) return "none";
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+};
 
 const normalizeThreadFromDetail = (threadId: string, detail: Record<string, unknown>): CodexThreadSummary => {
   const rawThread = detail.thread && typeof detail.thread === "object" ? (detail.thread as Record<string, unknown>) : detail;

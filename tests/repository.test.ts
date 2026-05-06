@@ -63,6 +63,30 @@ test("event seq is monotonic for projection recovery", () => {
   }
 });
 
+test("repository deduplicates repeated Feishu message deliveries", () => {
+  const { repo, cleanup } = makeTempRepo();
+  try {
+    const first = repo.beginIncomingMessage({
+      messageId: "om_1",
+      chatId: "chat_1",
+      userId: "user_1",
+      text: "/codex"
+    });
+    const second = repo.beginIncomingMessage({
+      messageId: "om_1",
+      chatId: "chat_1",
+      userId: "user_1",
+      text: "/codex"
+    });
+    assert.equal(first.duplicate, false);
+    assert.equal(second.duplicate, true);
+    assert.equal(second.deliveries, 2);
+    assert.equal(repo.count("incoming_messages"), 1);
+  } finally {
+    cleanup();
+  }
+});
+
 test("notification outbox deduplicates completed turn notifications", () => {
   const { repo, cleanup } = makeTempRepo();
   try {

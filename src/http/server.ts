@@ -78,6 +78,10 @@ export class BridgeHttpServer {
       return;
     }
     if (req.method === "POST" && url.pathname === "/feishu/events") {
+      if (this.config.feishu.messageTransport !== "http_callback") {
+        writeJson(res, 409, { ok: false, error: "Feishu HTTP callback transport is disabled." });
+        return;
+      }
       const body = await readJson(req);
       const parsed = this.parser.parse(body);
       if (parsed.type === "url_verification") {
@@ -85,6 +89,7 @@ export class BridgeHttpServer {
         return;
       }
       if (parsed.type === "message") {
+        this.diagnostics.recordFeishuMessage(parsed.message.messageId);
         await this.taskService.handleMessage(parsed.message);
         writeJson(res, 200, { ok: true });
         return;
@@ -93,17 +98,22 @@ export class BridgeHttpServer {
       return;
     }
     if (req.method === "POST" && url.pathname === "/feishu/card") {
+      if (this.config.feishu.cardActionTransport !== "http_callback") {
+        writeJson(res, 409, { ok: false, error: "Feishu HTTP callback transport is disabled." });
+        return;
+      }
       const body = await readJson(req);
       const parsed = this.parser.parse(body);
       if (parsed.type !== "card_action") {
         writeJson(res, 200, { ok: true, ignored: parsed.type });
         return;
       }
-      const result = await this.taskService.handleCardAction(parsed.action);
+      this.diagnostics.recordFeishuCardAction(parsed.action.action, parsed.action.actionId);
+      void this.taskService.processCardActionDeferred(parsed.action);
       writeJson(res, 200, {
         toast: {
           type: "success",
-          content: typeof result.text === "string" ? result.text : "已处理"
+          content: "已收到，正在处理"
         }
       });
       return;

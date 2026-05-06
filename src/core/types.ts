@@ -161,12 +161,20 @@ export interface DiagnosticSnapshot {
   codexAvailable: boolean;
   appServerStatus: "connected" | "disconnected" | "not_started" | "error";
   feishuConfigured: boolean;
+  feishuMessageTransport: "long_connection" | "http_callback";
+  feishuCardActionTransport: "long_connection" | "http_callback";
+  feishuInteractionMode: "message_command" | "hybrid" | "card_callback";
   databasePath: string;
   projectsCount: number;
   sessionBindingsCount: number;
   runningTasksCount: number;
   pendingOutboxCount: number;
   pendingApprovalsCount: number;
+  lastFeishuMessageAt: string | null;
+  lastFeishuMessageId: string | null;
+  lastFeishuCardActionAt: string | null;
+  lastFeishuCardAction: string | null;
+  lastFeishuCardActionId: string | null;
   lastError: string | null;
 }
 

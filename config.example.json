@@ -21,6 +21,10 @@
     "appSecret": "${FEISHU_APP_SECRET}",
     "defaultChatId": "${FEISHU_DEFAULT_CHAT_ID}",
     "verificationToken": "${FEISHU_VERIFICATION_TOKEN}",
+    "transport": "long_connection",
+    "messageTransport": "long_connection",
+    "cardActionTransport": "http_callback",
+    "interactionMode": "message_command",
     "allowedUserIds": ["${FEISHU_ALLOWED_USER_IDS}"],
     "allowedChatIds": ["${FEISHU_ALLOWED_CHAT_IDS}"]
   },

@@ -47,20 +47,28 @@ export class FeishuEventParser {
   }
 
   private parseCardAction(payload: Record<string, unknown>): FeishuCardAction | null {
-    const action =
-      payload.action && typeof payload.action === "object" ? (payload.action as Record<string, unknown>) : null;
     const event = payload.event && typeof payload.event === "object" ? (payload.event as Record<string, unknown>) : null;
-    const container = action ?? event;
-    if (!container) return null;
-    const value = container.value && typeof container.value === "object" ? (container.value as Record<string, unknown>) : {};
+    const action =
+      payload.action && typeof payload.action === "object"
+        ? (payload.action as Record<string, unknown>)
+        : event?.action && typeof event.action === "object"
+          ? (event.action as Record<string, unknown>)
+          : null;
+    if (!action) return null;
+    const value = action.value && typeof action.value === "object" ? (action.value as Record<string, unknown>) : {};
     const user = payload.user && typeof payload.user === "object" ? (payload.user as Record<string, unknown>) : {};
     const operator = event?.operator && typeof event.operator === "object" ? (event.operator as Record<string, unknown>) : {};
     const openId = asString(user.open_id) ?? asString(operator.open_id) ?? asString(operator.user_id) ?? "";
-    const context = payload.context && typeof payload.context === "object" ? (payload.context as Record<string, unknown>) : {};
+    const context =
+      payload.context && typeof payload.context === "object"
+        ? (payload.context as Record<string, unknown>)
+        : event?.context && typeof event.context === "object"
+          ? (event.context as Record<string, unknown>)
+          : {};
     const openMessageId = asString(context.open_message_id) ?? asString(event?.open_message_id);
     return {
       actionId: String(value.actionId ?? value.action_id ?? openMessageId ?? `act_${Date.now()}`),
-      action: String(value.action ?? container.tag ?? ""),
+      action: String(value.action ?? action.name ?? action.tag ?? ""),
       userId: openId,
       chatId: String(value.chatId ?? value.chat_id ?? context.open_chat_id ?? ""),
       rootMessageId: asString(value.rootMessageId) ?? openMessageId,

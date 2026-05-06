@@ -9,6 +9,7 @@ import { OutboxWorker } from "./bridge/outbox.js";
 import { DiagnosticsService } from "./bridge/diagnostics.js";
 import { BridgeHttpServer } from "./http/server.js";
 import { CardRenderer } from "./domain/cards.js";
+import { FeishuLongConnectionServer } from "./feishu/long-connection.js";
 
 export class BridgeApp {
   readonly database: BridgeDatabase;
@@ -20,6 +21,7 @@ export class BridgeApp {
   readonly outbox: OutboxWorker;
   readonly diagnostics: DiagnosticsService;
   readonly http: BridgeHttpServer;
+  readonly longConnection: FeishuLongConnectionServer;
 
   constructor(readonly config: BridgeConfig) {
     this.database = new BridgeDatabase(config.storage.databasePath);
@@ -28,10 +30,11 @@ export class BridgeApp {
     this.logger = new Logger(config.storage.logPath);
     this.codex = new CodexClient(config, this.logger);
     this.feishu = new FeishuClient(config, this.logger);
-    this.tasks = new TaskService(config, this.repo, this.codex, this.feishu, this.logger);
-    this.outbox = new OutboxWorker(config, this.repo, this.feishu, this.logger);
     this.diagnostics = new DiagnosticsService(config, this.repo, this.codex);
-    this.http = new BridgeHttpServer(config, this.tasks, this.diagnostics, new CardRenderer(), this.logger);
+    this.tasks = new TaskService(config, this.repo, this.codex, this.feishu, this.logger, this.diagnostics);
+    this.outbox = new OutboxWorker(config, this.repo, this.feishu, this.logger);
+    this.http = new BridgeHttpServer(config, this.tasks, this.diagnostics, new CardRenderer(config.feishu.interactionMode), this.logger);
+    this.longConnection = new FeishuLongConnectionServer(config, this.tasks, this.diagnostics, this.logger);
   }
 
   async start(): Promise<void> {
@@ -39,9 +42,11 @@ export class BridgeApp {
     await this.codex.start();
     this.outbox.start();
     await this.http.start();
+    await this.longConnection.start();
   }
 
   async stop(): Promise<void> {
+    await this.longConnection.stop();
     this.outbox.stop();
     await this.http.stop();
     await this.codex.stop();

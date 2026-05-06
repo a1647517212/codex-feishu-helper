@@ -222,6 +222,34 @@ export class Repository {
       .map((row) => mapEvent(row as DbRow));
   }
 
+  beginIncomingMessage(input: {
+    messageId: string;
+    chatId: string;
+    userId?: string | null;
+    text: string;
+  }): { duplicate: boolean; deliveries: number } {
+    const now = nowIso();
+    const existing = this.database.db
+      .prepare("SELECT deliveries FROM incoming_messages WHERE feishu_message_id = ?")
+      .get(input.messageId) as { deliveries?: number } | undefined;
+    if (existing) {
+      const deliveries = Number(existing.deliveries ?? 1) + 1;
+      this.database.db
+        .prepare("UPDATE incoming_messages SET last_seen_at = ?, deliveries = ? WHERE feishu_message_id = ?")
+        .run(now, deliveries, input.messageId);
+      return { duplicate: true, deliveries };
+    }
+    this.database.db
+      .prepare(
+        `INSERT INTO incoming_messages (
+          feishu_message_id, feishu_chat_id, feishu_user_id, text_hash,
+          first_seen_at, last_seen_at, deliveries
+        ) VALUES (?, ?, ?, ?, ?, ?, 1)`
+      )
+      .run(input.messageId, input.chatId, input.userId ?? null, hashText(input.text), now, now);
+    return { duplicate: false, deliveries: 1 };
+  }
+
   beginAction(input: {
     actionId: string;
     actionType: string;
@@ -467,7 +495,8 @@ export class Repository {
       "session_bindings",
       "notification_outbox",
       "pending_approvals",
-      "message_queue"
+      "message_queue",
+      "incoming_messages"
     ]);
     if (!allowed.has(table)) throw new Error(`Unsupported count table: ${table}`);
     const row = this.database.db.prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${where}`).get() as {
@@ -593,3 +622,12 @@ const mapOutbox = (row: DbRow): NotificationOutboxItem => ({
   lastError: asString(row.last_error),
   createdAt: String(row.created_at)
 });
+
+const hashText = (text: string): string => {
+  let hash = 2166136261;
+  for (let index = 0; index < text.length; index += 1) {
+    hash ^= text.charCodeAt(index);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+};

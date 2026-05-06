@@ -87,6 +87,18 @@ CREATE TABLE IF NOT EXISTS task_events (
 CREATE INDEX IF NOT EXISTS idx_task_events_binding_seq ON task_events(session_binding_id, seq);
 CREATE INDEX IF NOT EXISTS idx_task_events_thread ON task_events(codex_thread_id);
 
+CREATE TABLE IF NOT EXISTS incoming_messages (
+  feishu_message_id TEXT PRIMARY KEY,
+  feishu_chat_id TEXT NOT NULL,
+  feishu_user_id TEXT,
+  text_hash TEXT NOT NULL,
+  first_seen_at TEXT NOT NULL,
+  last_seen_at TEXT NOT NULL,
+  deliveries INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_incoming_messages_chat_seen ON incoming_messages(feishu_chat_id, last_seen_at);
+
 CREATE TABLE IF NOT EXISTS pending_approvals (
   id TEXT PRIMARY KEY,
   session_binding_id TEXT NOT NULL,

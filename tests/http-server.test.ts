@@ -10,8 +10,12 @@ test("http server exposes health, guarded doctor, and Feishu URL verification", 
   config.server.port = 0;
   config.server.adminToken = "smoke-token";
   config.feishu.verificationToken = "verify-token";
+  config.feishu.messageTransport = "http_callback";
+  config.feishu.cardActionTransport = "http_callback";
   const diagnostics = {
     recordError(): void {},
+    recordFeishuMessage(): void {},
+    recordFeishuCardAction(): void {},
     async snapshot() {
       return {
         uptimeSeconds: 1,
@@ -22,21 +26,26 @@ test("http server exposes health, guarded doctor, and Feishu URL verification", 
         codexAvailable: true,
         appServerStatus: "connected" as const,
         feishuConfigured: true,
+        feishuMessageTransport: config.feishu.messageTransport,
+        feishuCardActionTransport: config.feishu.cardActionTransport,
         databasePath: config.storage.databasePath,
         projectsCount: 0,
         sessionBindingsCount: repo.count("session_bindings"),
         runningTasksCount: 0,
         pendingOutboxCount: 0,
         pendingApprovalsCount: 0,
+        lastFeishuMessageAt: null,
+        lastFeishuMessageId: null,
+        lastFeishuCardActionAt: null,
+        lastFeishuCardAction: null,
+        lastFeishuCardActionId: null,
         lastError: null
       };
     }
   };
   const tasks = {
     async handleMessage(): Promise<void> {},
-    async handleCardAction(): Promise<{ ok: boolean }> {
-      return { ok: true };
-    }
+    async processCardActionDeferred(): Promise<void> {}
   };
   const server = new BridgeHttpServer(config, tasks as any, diagnostics as any, new CardRenderer(), makeLogger(dir));
   try {
@@ -60,6 +69,130 @@ test("http server exposes health, guarded doctor, and Feishu URL verification", 
       challenge: "ok-smoke"
     });
     assert.deepEqual(verification, { challenge: "ok-smoke" });
+  } finally {
+    await server.stop();
+    cleanup();
+  }
+});
+
+test("http callback endpoints are disabled when long connection transport is active", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  const config = makeConfig(dir);
+  config.server.port = 0;
+  config.feishu.messageTransport = "long_connection";
+  config.feishu.cardActionTransport = "long_connection";
+  const diagnostics = {
+    recordError(): void {},
+    recordFeishuMessage(): void {},
+    recordFeishuCardAction(): void {},
+    async snapshot() {
+      return {
+        uptimeSeconds: 1,
+        machineName: "test-machine",
+        platform: "win32",
+        nodeVersion: process.version,
+        codexCommand: "codex",
+        codexAvailable: true,
+        appServerStatus: "connected" as const,
+        feishuConfigured: true,
+        feishuMessageTransport: config.feishu.messageTransport,
+        feishuCardActionTransport: config.feishu.cardActionTransport,
+        databasePath: config.storage.databasePath,
+        projectsCount: 0,
+        sessionBindingsCount: repo.count("session_bindings"),
+        runningTasksCount: 0,
+        pendingOutboxCount: 0,
+        pendingApprovalsCount: 0,
+        lastFeishuMessageAt: null,
+        lastFeishuMessageId: null,
+        lastFeishuCardActionAt: null,
+        lastFeishuCardAction: null,
+        lastFeishuCardActionId: null,
+        lastError: null
+      };
+    }
+  };
+  const tasks = {
+    async handleMessage(): Promise<void> {},
+    async processCardActionDeferred(): Promise<void> {}
+  };
+  const server = new BridgeHttpServer(config, tasks as any, diagnostics as any, new CardRenderer(), makeLogger(dir));
+  try {
+    await server.start();
+    const response = await fetch(`${server.localUrl()}/feishu/events`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "url_verification", challenge: "blocked" })
+    });
+    assert.equal(response.status, 409);
+  } finally {
+    await server.stop();
+    cleanup();
+  }
+});
+
+test("http callback card parser accepts v2 card action context nested under event", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  const config = makeConfig(dir);
+  config.server.port = 0;
+  config.feishu.messageTransport = "long_connection";
+  config.feishu.cardActionTransport = "http_callback";
+  const actions: any[] = [];
+  const diagnostics = {
+    recordError(): void {},
+    recordFeishuMessage(): void {},
+    recordFeishuCardAction(): void {},
+    async snapshot() {
+      return {
+        uptimeSeconds: 1,
+        machineName: "test-machine",
+        platform: "win32",
+        nodeVersion: process.version,
+        codexCommand: "codex",
+        codexAvailable: true,
+        appServerStatus: "connected" as const,
+        feishuConfigured: true,
+        feishuMessageTransport: config.feishu.messageTransport,
+        feishuCardActionTransport: config.feishu.cardActionTransport,
+        databasePath: config.storage.databasePath,
+        projectsCount: 0,
+        sessionBindingsCount: repo.count("session_bindings"),
+        runningTasksCount: 0,
+        pendingOutboxCount: 0,
+        pendingApprovalsCount: 0,
+        lastFeishuMessageAt: null,
+        lastFeishuMessageId: null,
+        lastFeishuCardActionAt: null,
+        lastFeishuCardAction: null,
+        lastFeishuCardActionId: null,
+        lastError: null
+      };
+    }
+  };
+  const tasks = {
+    async handleMessage(): Promise<void> {},
+    async processCardActionDeferred(action: any): Promise<void> {
+      actions.push(action);
+    }
+  };
+  const server = new BridgeHttpServer(config, tasks as any, diagnostics as any, new CardRenderer(), makeLogger(dir));
+  try {
+    await server.start();
+    const response = await postJson(`${server.localUrl()}/feishu/card`, {
+      schema: "2.0",
+      header: { event_type: "card.action.trigger" },
+      event: {
+        context: { open_message_id: "om_root", open_chat_id: "oc_1" },
+        operator: { open_id: "ou_1" },
+        action: { tag: "button", value: { action: "doctor", actionId: "act_v2" } }
+      }
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(response.toast.type, "success");
+    assert.equal(response.toast.content, "已收到，正在处理");
+    assert.equal(actions[0].action, "doctor");
+    assert.equal(actions[0].chatId, "oc_1");
+    assert.equal(actions[0].rootMessageId, "om_root");
   } finally {
     await server.stop();
     cleanup();

@@ -33,6 +33,100 @@ test("running topic replies are queued instead of dropped", async () => {
   }
 });
 
+test("repeated Feishu command delivery is ignored after first handling", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const message = {
+      messageId: "msg_repeat",
+      chatId: "chat_1",
+      rootMessageId: "msg_repeat",
+      threadId: null,
+      userId: "user_1",
+      text: "/codex"
+    };
+    await service.handleMessage(message);
+    await service.handleMessage(message);
+    assert.equal(feishu.sent.length, 1);
+    assert.equal(repo.count("incoming_messages"), 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("repeated new-task delivery starts only one Codex turn", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const message = {
+      messageId: "msg_new_task_repeat",
+      chatId: "chat_1",
+      rootMessageId: "msg_new_task_repeat",
+      threadId: null,
+      userId: "user_1",
+      text: "帮我检查项目状态"
+    };
+    await service.handleMessage(message);
+    await service.handleMessage(message);
+    assert.equal(codex.turns.length, 1);
+    assert.equal(repo.count("session_bindings"), 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("new task emits one running status and one completion notification", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    await service.handleMessage({
+      messageId: "msg_status_dedupe",
+      chatId: "chat_1",
+      rootMessageId: "msg_status_dedupe",
+      threadId: null,
+      userId: "user_1",
+      text: "只回复 ok"
+    });
+    const binding = repo.findBindingByThreadId("thr_new");
+    assert.ok(binding);
+    const turnStarted = {
+      method: "turn/started",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: {
+          id: "turn_status_dedupe",
+          status: "inProgress"
+        }
+      }
+    };
+    await codex.notifications.notification![0]!(turnStarted);
+    await codex.notifications.notification![0]!(turnStarted);
+    await codex.notifications.notification![0]!({
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: {
+          id: "turn_status_dedupe",
+          status: "completed"
+        }
+      }
+    });
+    const outbox = repo.listDueOutbox(10);
+    assert.equal(outbox.filter((item) => item.notificationType === "task_status").length, 1);
+    assert.equal(outbox.filter((item) => item.notificationType === "task_completed").length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
 test("three running topic replies stay queued and can be cancelled", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
@@ -147,6 +241,36 @@ test("console new task action sends a draft topic card", async () => {
   }
 });
 
+test("doctor command and button render diagnostic cards in Feishu", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    await service.handleMessage({
+      messageId: "msg_doctor",
+      chatId: "chat_1",
+      rootMessageId: "msg_doctor",
+      threadId: null,
+      userId: "user_1",
+      text: "/doctor"
+    });
+    await service.handleCardAction({
+      actionId: "act_doctor",
+      action: "doctor",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_console",
+      payload: {}
+    });
+    assert.equal(feishu.sent.length, 2);
+    assert.equal(feishu.sent.every((entry) => entry.type === "card"), true);
+  } finally {
+    cleanup();
+  }
+});
+
 test("claim sessions card can bind an existing Codex thread", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
@@ -176,6 +300,240 @@ test("claim sessions card can bind an existing Codex thread", async () => {
     assert.ok(binding);
     assert.equal(binding.feishuTopicRootMessageId, "root_existing");
     assert.equal(binding.createdFrom, "codex_app_claimed");
+  } finally {
+    cleanup();
+  }
+});
+
+test("message command can claim an existing Codex thread without card callback", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.threads = [
+      {
+        id: "thr_command_claim",
+        name: "Command claimed task",
+        preview: "Command claimed task",
+        cwd: dir,
+        status: { type: "idle" },
+        updatedAt: Date.now()
+      }
+    ];
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    await service.handleMessage({
+      messageId: "msg_claim_command",
+      chatId: "chat_1",
+      rootMessageId: "root_claim_command",
+      threadId: null,
+      userId: "user_1",
+      text: "/claim thr_command_claim"
+    });
+    const binding = repo.findBindingByThreadId("thr_command_claim");
+    assert.ok(binding);
+    assert.equal(binding.feishuTopicRootMessageId, "root_claim_command");
+    assert.equal(binding.createdFrom, "codex_app_claimed");
+  } finally {
+    cleanup();
+  }
+});
+
+test("message commands cover project, notification, status, logs and diff actions", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    repo.createOrUpdateBinding({
+      codexThreadId: "thr_commands",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_commands",
+      title: "Command task",
+      cwd: dir,
+      status: "completed",
+      createdFrom: "manual_import"
+    });
+    for (const [index, text] of ["/projects", "/notify test", "/notify history", "/status", "/logs", "/diff"].entries()) {
+      await service.handleMessage({
+        messageId: `msg_command_${index}`,
+        chatId: "chat_1",
+        rootMessageId: index < 3 ? `root_command_${index}` : "root_commands",
+        threadId: null,
+        userId: "user_1",
+        text
+      });
+    }
+    assert.equal(feishu.sent.some((entry) => entry.type === "text" && String(entry.payload).includes("测试通知")), true);
+    assert.equal(feishu.sent.filter((entry) => entry.type === "card").length >= 4, true);
+    assert.equal(
+      feishu.sent.some(
+        (entry) =>
+          entry.type === "text" &&
+          (String(entry.payload).includes("Git 变更摘要") || String(entry.payload).includes("不是 Git 仓库"))
+      ),
+      true
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("queue commands can view and cancel queued messages without card callback", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_queue_command",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_queue_command",
+      title: "Queue command task",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    const queued = repo.enqueueMessage({
+      sessionBindingId: binding.id,
+      feishuMessageId: "msg_queued_command",
+      text: "queued work",
+      createdByFeishuUserId: "user_1"
+    });
+    await service.handleMessage({
+      messageId: "msg_queue_view_command",
+      chatId: "chat_1",
+      rootMessageId: "root_queue_command",
+      threadId: null,
+      userId: "user_1",
+      text: "/queue"
+    });
+    await service.handleMessage({
+      messageId: "msg_queue_cancel_command",
+      chatId: "chat_1",
+      rootMessageId: "root_queue_command",
+      threadId: null,
+      userId: "user_1",
+      text: `/queue cancel ${queued.id}`
+    });
+    assert.equal(repo.getQueuedMessage(queued.id)?.status, "cancelled");
+    assert.equal(feishu.sent.some((entry) => entry.type === "card"), true);
+    assert.equal(feishu.sent.some((entry) => entry.type === "text" && String(entry.payload).includes("已处理")), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("approval commands resolve approvals without card callback", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_approval_command",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_approval_command",
+      title: "Approval command task",
+      status: "waiting_for_approval",
+      createdFrom: "manual_import"
+    });
+    const approval = repo.upsertPendingApproval({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      requestId: "req_approval_command",
+      approvalType: "command_execution",
+      command: "npm test",
+      riskLevel: "low"
+    });
+    await service.handleMessage({
+      messageId: "msg_approval_detail_command",
+      chatId: "chat_1",
+      rootMessageId: "root_approval_command",
+      threadId: null,
+      userId: "user_1",
+      text: `/approval detail ${approval.id}`
+    });
+    await service.handleMessage({
+      messageId: "msg_approval_once_command",
+      chatId: "chat_1",
+      rootMessageId: "root_approval_command",
+      threadId: null,
+      userId: "user_1",
+      text: `/approval once ${approval.id}`
+    });
+    assert.equal(repo.findApprovalById(approval.id)?.status, "approved_once");
+    assert.equal(codex.responses.length, 1);
+    assert.equal(feishu.sent.some((entry) => entry.type === "card"), true);
+    assert.equal(feishu.sent.some((entry) => entry.type === "text" && String(entry.payload).includes("已处理")), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("task control commands require a bound topic and can stop, retry, run tests and archive", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_control_command",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_control_command",
+      title: "Control command task",
+      cwd: dir,
+      status: "failed",
+      createdFrom: "manual_import"
+    });
+    await service.handleMessage({
+      messageId: "msg_orphan_status_command",
+      chatId: "chat_1",
+      rootMessageId: "root_orphan_command",
+      threadId: null,
+      userId: "user_1",
+      text: "/status"
+    });
+    await service.handleMessage({
+      messageId: "msg_retry_command",
+      chatId: "chat_1",
+      rootMessageId: "root_control_command",
+      threadId: null,
+      userId: "user_1",
+      text: "/retry"
+    });
+    repo.updateBindingStatus(binding.id, "idle");
+    await service.handleMessage({
+      messageId: "msg_run_tests_command",
+      chatId: "chat_1",
+      rootMessageId: "root_control_command",
+      threadId: null,
+      userId: "user_1",
+      text: "/run-tests"
+    });
+    await service.handleMessage({
+      messageId: "msg_stop_command",
+      chatId: "chat_1",
+      rootMessageId: "root_control_command",
+      threadId: null,
+      userId: "user_1",
+      text: "/stop"
+    });
+    await service.handleMessage({
+      messageId: "msg_archive_command",
+      chatId: "chat_1",
+      rootMessageId: "root_control_command",
+      threadId: null,
+      userId: "user_1",
+      text: "/archive"
+    });
+    assert.equal(feishu.sent.some((entry) => String(entry.payload).includes("需要在已绑定的任务话题里发送")), true);
+    assert.equal(codex.turns.length >= 2, true);
+    assert.deepEqual(codex.interrupted, ["thr_control_command"]);
+    assert.equal(repo.findBindingById(binding.id)?.status, "archived");
   } finally {
     cleanup();
   }
@@ -238,6 +596,80 @@ test("bootstrap reconciles persisted running binding to current thread status", 
     await service.bootstrapProjectsFromConfig();
     assert.equal(repo.findBindingById(binding.id)?.status, "idle");
     assert.equal(repo.listEventsForBinding(binding.id).some((event) => event.eventType === "session.reconciled"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("bootstrap keeps terminal bindings when thread read reports idle", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    codex.threads = [
+      {
+        id: "thr_terminal",
+        name: "Terminal task",
+        preview: "Terminal task",
+        cwd: dir,
+        status: { type: "idle" },
+        updatedAt: Date.now()
+      }
+    ];
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_terminal",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_terminal",
+      title: "Terminal task",
+      status: "completed",
+      createdFrom: "manual_import"
+    });
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    await service.bootstrapProjectsFromConfig();
+    assert.equal(repo.findBindingById(binding.id)?.status, "completed");
+    assert.equal(repo.listDueOutbox(10).filter((item) => item.notificationType === "task_status").length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("bootstrap restores terminal status from event history after stale idle reconcile", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    codex.threads = [
+      {
+        id: "thr_restore_terminal",
+        name: "Restore terminal task",
+        preview: "Restore terminal task",
+        cwd: dir,
+        status: { type: "idle" },
+        updatedAt: Date.now()
+      }
+    ];
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_restore_terminal",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_restore_terminal",
+      title: "Restore terminal task",
+      status: "idle",
+      createdFrom: "manual_import"
+    });
+    repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      codexTurnId: "turn_restore_terminal",
+      eventType: "task.completed",
+      eventPayload: { text: "任务完成" }
+    });
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    await service.bootstrapProjectsFromConfig();
+    assert.equal(repo.findBindingById(binding.id)?.status, "completed");
+    assert.equal(
+      repo.listEventsForBinding(binding.id).some((event) => event.eventType === "session.reconcile_restored_terminal_status"),
+      true
+    );
   } finally {
     cleanup();
   }

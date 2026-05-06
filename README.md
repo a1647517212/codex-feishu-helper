@@ -8,10 +8,13 @@ Design coverage is tracked in [docs/FULL_DESIGN_COVERAGE.md](docs/FULL_DESIGN_CO
 
 ## P0 Scope
 
-- Feishu HTTP event callback and card action callback.
+- Feishu long-connection message transport by default.
+- Message-command interaction mode by default, so local-only deployments do not need a public callback URL for core controls.
+- Card actions can use HTTP callback as an optional fallback/enhancement when a public callback endpoint is available.
 - Local Codex `app-server` JSONL transport over stdio.
 - `thread/list`, `thread/read`, `thread/start`, `thread/resume`, `turn/start`, `turn/steer`, and `turn/interrupt` wrappers.
-- SQLite tables for projects, session bindings, semantic events, pending approvals, idempotent actions, message queue, notification outbox, trusted Feishu subjects, and device state.
+- SQLite tables for projects, session bindings, semantic events, pending approvals, idempotent actions, incoming message dedupe, message queue, notification outbox, trusted Feishu subjects, and device state.
+- SQLite-backed incoming message dedupe for Feishu long-connection retries.
 - Semantic event store and projection builder so Feishu cards are based on bridge events instead of raw Codex payloads.
 - Busy message queue so topic replies are not lost while a task is running.
 - Approval request capture and Feishu approval card generation.
@@ -42,7 +45,11 @@ Start the bridge:
 npm run start
 ```
 
-Expose these local endpoints to Feishu Enterprise App callbacks:
+The default Feishu control path is long-connection group messages plus text commands. Keep the local HTTP server on `127.0.0.1`; it is used for health, diagnostics, and optional HTTP fallback, not as the primary Feishu entry point.
+
+Card button callbacks are not required for local-only deployments. If your tenant or app version needs card callbacks, Feishu must be able to call a public HTTPS callback URL. Without a public URL, keep `feishu.interactionMode` as `message_command`; cards will show equivalent commands instead of callback buttons.
+
+Expose these endpoints only when the matching transport is `http_callback`:
 
 - `POST /feishu/events`
 - `POST /feishu/card`
@@ -55,6 +62,24 @@ For local testing, use `FEISHU_CODEX_ADMIN_TOKEN` and call:
 curl http://127.0.0.1:8787/doctor -H "authorization: Bearer <token>"
 ```
 
+## Feishu App Setup
+
+In the Feishu developer console:
+
+- Enable the bot and add it to the target group.
+- Set Events and Callbacks subscription mode to long connection if both messages and callbacks should enter by WebSocket.
+- Subscribe to `im.message.receive_v1`.
+- Subscribe to the card callback `card.action.trigger` only if you will expose a public HTTPS callback URL for interactive card buttons.
+- Enable the permission to receive all group messages, so the bot can read group messages without `@`.
+- Grant message send/reply/card scopes needed by `im/v1/messages` APIs.
+- Grant `im:chat:readonly` or equivalent chat read scope if you want to search or verify group information by API.
+- If card clicks show a Feishu-side error and `/doctor` never records `lastFeishuCardActionAt`, leave `feishu.interactionMode` as `message_command` and use the commands below. To restore buttons, configure the bot card callback request URL to `https://<public-url>/feishu/card`, set `feishu.cardActionTransport` to `http_callback`, and set `feishu.interactionMode` to `hybrid` or `card_callback`.
+
+Operational notes:
+
+- Do not run another `lark-cli event +subscribe` or a second bridge instance for the same app unless you are intentionally load-balancing. Feishu can split long-connection events between consumers, which makes one process appear to miss messages.
+- In mixed mode, `/feishu/events` or `/feishu/card` return `409` only for the transport that is still set to long connection.
+
 ## Feishu Commands
 
 Inside the allowed Feishu chat:
@@ -62,7 +87,22 @@ Inside the allowed Feishu chat:
 - `/codex` shows the control console.
 - `/doctor` returns bridge diagnostics.
 - `/tasks` lists recent local Codex sessions that can be claimed.
+- `/claim <codexThreadId>` binds an existing local Codex thread to the current Feishu topic.
+- `/projects` shows configured projects.
+- `/notify test` sends a test notification; `/notify history` shows notification history.
 - Any reply inside a bound task topic continues that Codex task.
+- Inside a bound task topic, `/status`, `/logs`, `/diff`, `/queue`, `/queue cancel <queueId>`, `/run-tests`, `/retry`, `/analyze-failure`, `/stop`, and `/archive` map to the same operations as the old card buttons.
+- Approval cards include explicit commands: `/approval list`, `/approval detail <approvalId>`, `/approval once <approvalId>`, `/approval task <approvalId>`, and `/approval deny <approvalId>`.
+
+## Local-Only Callback Workarounds
+
+When the bridge must run on a private local IP with no domain, use one of these patterns:
+
+- Message-command mode, recommended: Feishu messages arrive through the bot long connection, and every card action has an equivalent text command. This is the current default.
+- Hybrid callback mode: keep message commands, but expose only `/feishu/card` through a public HTTPS endpoint or tunnel for better button UX.
+- Cloud relay: deploy a tiny public relay that accepts Feishu callbacks while the local bridge maintains an outbound WebSocket or polling connection to it. This avoids exposing the local machine, but adds a small hosted component.
+- Local custom protocol: use URL buttons such as `codex-feishu://...` on Feishu Desktop. This is Windows-desktop-only and less reliable across web/mobile clients.
+- Polling/search fallback: have the local bridge poll message history through OpenAPI. This avoids event delivery but needs extra message-history permissions and is slower than long connection.
 
 ## Security Notes
 

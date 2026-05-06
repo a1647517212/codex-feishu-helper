@@ -50,6 +50,10 @@ export const makeConfig = (dir: string): BridgeConfig => ({
     appSecret: "secret",
     defaultChatId: "chat_1",
     verificationToken: undefined,
+    transport: "long_connection",
+    messageTransport: "long_connection",
+    cardActionTransport: "long_connection",
+    interactionMode: "message_command",
     allowedUserIds: ["user_1"],
     allowedChatIds: ["chat_1"]
   },
@@ -99,6 +103,7 @@ export class MockCodex {
   requests: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
   turns: Array<{ threadId: string; text: string }> = [];
   responses: Array<{ requestId: string | number; result: Record<string, unknown> }> = [];
+  interrupted: string[] = [];
   threads: any[] = [];
   listCalls: Array<{ limit?: number; pageSize?: number; maxPages?: number }> = [];
   readFailures = new Map<string, Error>();
@@ -150,7 +155,8 @@ export class MockCodex {
     return { turnId: `turn_${this.turns.length}` };
   }
 
-  async interruptTurn(): Promise<Record<string, unknown>> {
+  async interruptTurn(threadId: string): Promise<Record<string, unknown>> {
+    this.interrupted.push(threadId);
     return {};
   }
 

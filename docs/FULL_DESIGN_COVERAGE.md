@@ -11,7 +11,7 @@ Legend:
 
 ## Executive Status
 
-The project currently implements the main P0 bridge kernel: Feishu HTTP callbacks, Codex app-server stdio transport, SQLite persistence, session binding, semantic events, projections, queueing, approvals, outbox retry, diagnostics, and basic safety controls.
+The project currently implements the main P0 bridge kernel: Feishu long-connection message transport by default, message-command interaction for local-only deployments, optional HTTP callback fallback, Codex app-server stdio transport, SQLite persistence, session binding, semantic events, projections, queueing, approvals, outbox retry, diagnostics, incoming-message dedupe, and basic safety controls.
 
 It does not yet implement the full product described by the design. The biggest remaining gaps are real Feishu topic creation semantics, full project discovery and unclassified-task management, notification preferences, local detail pages, checkpointing, Desktop owner routing, live mirror/import, deep links, multi-machine support, team permissions, and commit/push/PR workflows.
 
@@ -29,40 +29,40 @@ Approximate coverage by layer:
 
 | Design section | Status | Evidence | Remaining work |
 | --- | --- | --- | --- |
-| 1 Background and goal | Partial | Bridge controls Codex app-server threads from Feishu messages/cards. | Full goal says continuing tasks from phone with mature notifications; real Feishu end-to-end still not verified. |
+| 1 Background and goal | Partial | Bridge controls Codex app-server threads from Feishu messages/cards. Real long-connection `/codex` in group was verified without `@`. | Full goal says mature notifications and richer task lifecycle; advanced pieces remain incomplete. |
 | 2 Core conclusion | Partial | One Codex thread maps to one Feishu root/topic binding in `session_bindings`. | Explicit Feishu topic API creation is not implemented. |
 | 3 Design boundary | Partial | Uses app-server and accepts eventual sync. | Desktop GUI mirror, owner routing, and true active-turn semantics are not implemented. |
 | 4 Terminology and wording | Partial | Cards use Chinese task/control wording. | Wording is not fully audited against every suggested/forbidden phrase. |
 | 5 Product information architecture | Partial | Console card, project list card, task status card, approval card exist. | Full hierarchy and topic lifecycle are simplified. |
 | 6.1 New task from Feishu | Partial | New free-text message starts a Codex thread and turn. | New-task button sends a draft card, but does not create a true Feishu topic via topic API. |
-| 6.2 Claim existing Codex App task | Partial | `/tasks` and `[在飞书继续]` list/read/bind existing app-server threads. | Grouping by project and real Codex Desktop session fidelity are limited to app-server visibility. |
+| 6.2 Claim existing Codex App task | Partial | `/tasks`, `/claim <threadId>`, and optional `[在飞书继续]` list/read/bind existing app-server threads. | Grouping by project and real Codex Desktop session fidelity are limited to app-server visibility. |
 | 6.3 Continue in task topic | Done | `findBindingByTopic`, `resumeThread`, `startTurn`, busy queue. | More nuanced `turn/steer` during active turns is not exposed separately. |
 | 6.4 Completion notification | Done | `turn/completed` inserts events and enqueues outbox card. | Notification preferences are not applied yet. |
 | 6.5 Approval handling | Partial | Server approval request is persisted, carded, and resolved idempotently. | Expired approval UX and rich details are still basic. |
 | 7 Card and copy design | Partial | Console, new task, claim list, task status, approval, queue, diagnostics, history cards exist. | Failure card, unclassified card, checkpoint card, and full visual polish are not complete. |
-| 8 Button behavior | Partial | Button actions are idempotent through `action_requests`; visible buttons now have handlers. | Button danger levels are simple; some actions are helper replies rather than full flows. |
+| 8 Button behavior | Partial | Button actions are idempotent through `action_requests`; visible buttons have handlers; every exposed action now has a message-command fallback; v2 card action parsing is covered for HTTP fallback. | Button danger levels are simple; some actions are helper replies rather than full flows. Real card click still depends on `card.action.trigger` callback setup and public reachability. |
 | 9 Project abstraction and mapping | Partial | Configured projects are stored; cwd prefix maps to project. | Auto discovery, Git root matching details, unclassified assignment, and create-project-from-Feishu are missing. |
-| 10 Data model | Partial | Tables exist for projects, bindings, events, approvals, actions, queue, outbox, prefs, devices, trusted subjects, ownership. | Some tables are schema-only and not yet used by workflows. |
+| 10 Data model | Partial | Tables exist for projects, bindings, events, approvals, actions, incoming messages, queue, outbox, prefs, devices, trusted subjects, ownership. | Some tables are schema-only and not yet used by workflows. |
 | 11 State machine | Partial | Core statuses are modeled and updated. | Full status/button matrix and expired/archived semantics are simplified. |
 | 12 Backend architecture | Done | App composition includes config, DB, repo, Codex client, Feishu client, task service, outbox, diagnostics, HTTP server. | Production packaging/service install is not included. |
 | 13 Codex app-server integration | Partial | Stdio JSONL client, initialize, thread/turn methods, notifications, server requests. | Full official runtime schema validation and all event types are not wired. |
-| 14 Feishu integration | Partial | HTTP callbacks, message parsing, card action parsing, send/reply/update APIs. | Long connection and explicit Feishu topic creation remain missing. |
+| 14 Feishu integration | Partial | Long connection is default for messages; message commands cover local-only controls; HTTP callback is optional fallback for cards; message parsing, card action parsing, send/reply/update APIs exist. | Explicit Feishu topic creation remains missing; card button runtime requires app-side `card.action.trigger` subscription and public HTTPS reachability. |
 | 15 Notification strategy | Partial | Completion/failure/approval/status outbox and retry exist. | @ user policy and notification preference execution are missing. |
 | 16 Change and log display | Partial | Git status summary, event/log cards, task status cards. | Full diff view, large output paging, command logs, and file details are missing. |
 | 17 Security and permissions | Partial | Allowed users/chats, path escape block, secret file block, no high-risk task-wide approval. | Pairing, trusted-device workflow, and per-role permissions are not active. |
 | 18 Error handling | Partial | HTTP errors, app-server diagnostic status, protocol validation event, idempotent actions. | Expired approval and unavailable app-server recovery cards are basic. |
-| 19 MVP phase 1 | Partial | Main loop works in code and tests. | Real Feishu topic creation and full end-to-end enterprise app test are not complete. |
+| 19 MVP phase 1 | Partial | Main loop works in code/tests and real Feishu long-connection `/codex` group flow was verified. | Real Feishu topic creation and deeper Codex task execution flows remain incomplete. |
 | 19 MVP phase 2 | Partial | Queue view/cancel, task diff/status/log helpers exist. | Notification preferences, richer diff, and completion impact are incomplete. |
 | 19 MVP phase 3 | Not started | No team workflow implementation beyond schema placeholders. | Team permissions, multi-user operations, advanced controls. |
 | 20 Development task split | Partial | Infrastructure, Codex, Feishu, flows, security are partially implemented. | Remaining split tasks map to gaps above. |
 | 21 API pseudocode | Partial | Claim, continue, and new-task flows map to `TaskService`. | Topic creation and richer API boundaries are simplified. |
 | 22 Config example | Done | `config.example.json`, `.env.example`, `loadConfig`. | Installer/setup wizard not included. |
-| 23.1 New task acceptance | Partial | Feishu text can start Codex and update card. | True topic creation and real file/Git verification are not automated end-to-end. |
+| 23.1 New task acceptance | Partial | Feishu text can start Codex and update card; incoming message dedupe prevents duplicate turns on retry. | True topic creation and real file/Git verification are not automated end-to-end. |
 | 23.2 Claim acceptance | Partial | Claim existing thread and continue same thread are covered by tests. | Project-grouped list and true topic creation remain. |
 | 23.3 Project mapping acceptance | Partial | Config path prefix mapping exists. | Git root matching, unclassified list, assign/create project buttons missing. |
 | 23.4 Notification acceptance | Partial | Completion/failure/approval outbox exists; progress is not spammed. | @ creator and preference logic missing. |
-| 23.5 Idempotency acceptance | Done | Action request idempotency, approval idempotency, outbox dedupe. | User-facing old-button text can be improved. |
-| 24 Risks and open questions | Partial | Major risks documented as current boundaries. | No live Feishu/Desktop validation yet. |
+| 23.5 Idempotency acceptance | Done | Action request idempotency, approval idempotency, outbox dedupe, and incoming Feishu message dedupe. | User-facing old-button text can be improved. |
+| 24 Risks and open questions | Partial | Major risks documented as current boundaries; live Feishu long-connection message flow was verified; card-callback risk is bypassed by message-command mode. | Desktop validation and advanced Feishu topic/card-click flows still need more live coverage. |
 | 25 Recommended tech route | Done | TypeScript + Node 22 + SQLite + app-server. | Windows service packaging still absent. |
 | 26 Development order | Partial | P0 core completed first. | Later-order items remain open. |
 | 27 References | Partial | Design-driven implementation; generated schema present. | Reference licenses and upstream detail review not bundled in repo docs. |
@@ -92,8 +92,8 @@ Approximate coverage by layer:
 | 39.2 Feishu pairing | Not started | No pairing code. | Needs QR/code flow and trusted subject writes. |
 | 39.3 Health card | Done | `/doctor`, diagnostics snapshot, diagnostic card. | Auto recovery suggestions can improve. |
 | 40 Local detail page | Not started | No local detail page. | Needed for large output/diff. |
-| 41 Buttons and copy | Partial | Most exposed buttons have handlers after this pass. | Checkpoint and some project buttons missing. |
-| 42.1 P0 required | Partial | Most engineering P0 items implemented. | Runtime schema validation, preferences, true topic creation still incomplete. |
+| 41 Buttons and copy | Partial | Exposed buttons have handlers and cards show equivalent text commands for local-only operation. | Checkpoint and some project buttons missing. |
+| 42.1 P0 required | Partial | Most engineering P0 items implemented, including long connection, diagnostics, queue, outbox, approvals, and incoming dedupe. | Runtime schema validation, preferences, true topic creation still incomplete. |
 | 42.2 P1 enhancements | Partial | Queue view/cancel and basic diff/history exist. | Most P1 items remain incomplete. |
 | 42.3 P2 advanced | Mostly not started | P2 boundaries documented. | Desktop owner, deep link, multi-machine, PR workflows, teams. |
 | 43 Updated development order | Partial | Current branch follows P0-first order. | Next phases need planned execution. |
@@ -101,7 +101,7 @@ Approximate coverage by layer:
 | 44.2 Event recovery | Done | SQLite recovery, reconcile, monotonic seq tests. | Completed status detection from `thread/read` can be richer. |
 | 44.3 Queue | Done | Three-message queue, view/cancel, auto-deliver next. | Confirm-before-delivery option absent. |
 | 44.4 Approval | Partial | Idempotent approval, no high-risk task-wide button. | Old resolved button UX returns generic idempotent result. |
-| 44.5 Notification | Partial | Retry and dedupe implemented. | Silent task preference not enforced. |
+| 44.5 Notification | Partial | Retry and dedupe implemented; real group card response verified. | Silent task preference not enforced. |
 | 44.6 Project safety | Done | Path escape and secret files blocked; Git diff helper does not read outside cwd. | Full file browser not implemented. |
 | 44.7 Codex App interop | Partial | Existing idle app-server sessions can be discovered and resumed. | Rollout import and Desktop GUI visibility not implemented. |
 | 45 New references | Partial | Architecture reflects selected references. | No separate reference appendix in repo. |
@@ -110,31 +110,31 @@ Approximate coverage by layer:
 
 | Button/action | Status |
 | --- | --- |
-| `new_task` | Done |
-| `claim_sessions` | Done |
-| `project_list` | Done |
-| `doctor` | Done |
-| `claim_thread` | Done |
-| `task_status` | Done |
-| `task_diff` | Done, basic Git status summary |
-| `task_logs` | Done, event list |
-| `task_continue` | Done, returns prompt to reply in topic |
-| `task_append_hint` | Done |
-| `task_run_tests` | Done, synthetic instruction |
-| `queue_view` | Done |
-| `queue_cancel` | Done |
-| `task_stop` | Done |
-| `task_retry` | Done, synthetic instruction |
-| `task_analyze_failure` | Done, synthetic instruction |
-| `task_archive` | Done |
-| `new_related_task` | Partial, sends new-task draft |
-| `approval_list` | Done |
-| `approval_detail` | Done |
-| `approval_once` | Done |
-| `approval_for_task` | Done only for low-risk cards |
-| `approval_deny` | Done |
-| `send_test_notification` | Done |
-| `notification_history` | Done |
+| `new_task` | Done; free text in a new root message is the message-command fallback |
+| `claim_sessions` | Done; `/tasks` |
+| `project_list` | Done; `/projects` |
+| `doctor` | Done; `/doctor` |
+| `claim_thread` | Done; `/claim <codexThreadId>` |
+| `task_status` | Done; `/status` in a bound topic |
+| `task_diff` | Done, basic Git status summary; `/diff` |
+| `task_logs` | Done, event list; `/logs` |
+| `task_continue` | Done; reply directly in a bound topic |
+| `task_append_hint` | Done; reply directly in a running bound topic |
+| `task_run_tests` | Done, synthetic instruction; `/run-tests` |
+| `queue_view` | Done; `/queue` |
+| `queue_cancel` | Done; `/queue cancel <queueId>` |
+| `task_stop` | Done; `/stop` in a bound topic |
+| `task_retry` | Done, synthetic instruction; `/retry` |
+| `task_analyze_failure` | Done, synthetic instruction; `/analyze-failure` |
+| `task_archive` | Done; `/archive` |
+| `new_related_task` | Partial, sends new-task draft; free text creates a new task |
+| `approval_list` | Done; `/approval list` |
+| `approval_detail` | Done; `/approval detail <approvalId>` |
+| `approval_once` | Done; `/approval once <approvalId>` |
+| `approval_for_task` | Done only for low-risk approvals; `/approval task <approvalId>` |
+| `approval_deny` | Done; `/approval deny <approvalId>` |
+| `send_test_notification` | Done; `/notify test` |
+| `notification_history` | Done; `/notify history` |
 
 ## Verification Snapshot
 
@@ -148,9 +148,21 @@ git diff --check
 Result:
 
 ```text
-16 tests passed
+32 tests passed
 no whitespace errors
 ```
+
+Latest real Feishu verification:
+
+```text
+long connection ready
+/doctor ok: appServerStatus=connected, codexAvailable=true, feishuConfigured=true
+HTTP callback endpoint under long_connection: 409 disabled
+group /codex without @ -> one Codex 控制台 interactive card reply
+incoming_messages row recorded for the latest message with deliveries=1
+```
+
+Operational caveat: do not run `lark-cli event +subscribe` alongside the bridge for the same app during normal operation, because Feishu can split long-connection events between consumers.
 
 ## Next Implementation Priorities
 

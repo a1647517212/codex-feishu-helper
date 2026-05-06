@@ -4,6 +4,9 @@ import { dirname, resolve } from "node:path";
 import { z } from "zod";
 import { newToken } from "./core/ids.js";
 
+const TransportModeSchema = z.enum(["long_connection", "http_callback"]);
+const InteractionModeSchema = z.enum(["message_command", "hybrid", "card_callback"]);
+
 const stringArrayFromEnv = z
   .union([z.array(z.string()), z.string()])
   .optional()
@@ -54,10 +57,14 @@ const ConfigSchema = z.object({
       appSecret: z.string().optional(),
       defaultChatId: z.string().optional(),
       verificationToken: z.string().optional(),
+      transport: TransportModeSchema.optional(),
+      messageTransport: TransportModeSchema.optional(),
+      cardActionTransport: TransportModeSchema.optional(),
+      interactionMode: InteractionModeSchema.optional(),
       allowedUserIds: stringArrayFromEnv,
       allowedChatIds: stringArrayFromEnv
     })
-    .default({ allowedUserIds: [], allowedChatIds: [] }),
+    .default({ transport: "long_connection", allowedUserIds: [], allowedChatIds: [] }),
   storage: z
     .object({
       homeDir: z.string().default("~/.feishu-codex"),
@@ -99,14 +106,23 @@ const ConfigSchema = z.object({
     .default([])
 });
 
-export type BridgeConfig = z.infer<typeof ConfigSchema> & {
+type ParsedConfig = z.infer<typeof ConfigSchema>;
+export type TransportMode = z.infer<typeof TransportModeSchema>;
+export type InteractionMode = z.infer<typeof InteractionModeSchema>;
+
+export type BridgeConfig = Omit<ParsedConfig, "feishu" | "storage" | "server"> & {
+  feishu: ParsedConfig["feishu"] & {
+    messageTransport: TransportMode;
+    cardActionTransport: TransportMode;
+    interactionMode: InteractionMode;
+  };
   configPath: string;
-  storage: z.infer<typeof ConfigSchema>["storage"] & {
+  storage: ParsedConfig["storage"] & {
     homeDir: string;
     databasePath: string;
     logPath: string;
   };
-  server: z.infer<typeof ConfigSchema>["server"] & {
+  server: ParsedConfig["server"] & {
     adminToken: string;
   };
 };
@@ -145,6 +161,12 @@ export const loadConfig = (override?: string): BridgeConfig => {
   mkdirSync(dirname(logPath), { recursive: true });
   return {
     ...parsed,
+    feishu: {
+      ...parsed.feishu,
+      messageTransport: parsed.feishu.messageTransport ?? parsed.feishu.transport ?? "long_connection",
+      cardActionTransport: parsed.feishu.cardActionTransport ?? parsed.feishu.transport ?? "long_connection",
+      interactionMode: parsed.feishu.interactionMode ?? "message_command"
+    },
     configPath,
     storage: { ...parsed.storage, homeDir, databasePath, logPath },
     server: {
