@@ -41,3 +41,37 @@ test("listThreads scans paginated app-server results with a bounded max page cou
     cleanup();
   }
 });
+
+test("startThread and startTurn pass personal default model, reasoning and full access", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  try {
+    const client = new CodexClient(makeConfig(dir), makeLogger(dir));
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    (client as unknown as { request: (method: string, params: unknown) => Promise<unknown> }).request = async (
+      method,
+      params
+    ) => {
+      calls.push({ method, params: params as Record<string, unknown> });
+      if (method === "thread/start") {
+        return { thread: { id: "thr_new", status: { type: "idle" } } };
+      }
+      return { turn: { id: "turn_1" } };
+    };
+
+    await client.startThread({ cwd: dir });
+    await client.startTurn("thr_new", "do it", { cwd: dir });
+
+    const threadStart = calls.find((call) => call.method === "thread/start")?.params;
+    const turnStart = calls.find((call) => call.method === "turn/start")?.params;
+    assert.equal(threadStart?.model, "gpt-5.4");
+    assert.equal(threadStart?.approvalPolicy, "never");
+    assert.equal(threadStart?.sandbox, "danger-full-access");
+    assert.deepEqual(threadStart?.config, { model_reasoning_effort: "xhigh" });
+    assert.equal(turnStart?.model, undefined);
+    assert.equal(turnStart?.effort, "xhigh");
+    assert.equal(turnStart?.approvalPolicy, "never");
+    assert.deepEqual(turnStart?.sandboxPolicy, { type: "dangerFullAccess" });
+  } finally {
+    cleanup();
+  }
+});

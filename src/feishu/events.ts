@@ -38,6 +38,7 @@ export class FeishuEventParser {
         messageId: String(message.message_id ?? ""),
         chatId: String(message.chat_id ?? ""),
         rootMessageId: asString(message.root_id) ?? asString(message.parent_id),
+        parentMessageId: asString(message.parent_id),
         threadId: asString(message.thread_id),
         userId: String(senderId.open_id ?? senderId.user_id ?? senderId.union_id ?? ""),
         text,

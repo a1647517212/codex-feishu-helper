@@ -21,12 +21,28 @@ export interface FeishuChatInfo {
   raw: Record<string, unknown>;
 }
 
+export interface FeishuCreatedChat {
+  chatId: string;
+  name: string | null;
+  raw: Record<string, unknown>;
+}
+
 export interface FeishuSender {
   sendText(chatId: string, text: string, rootMessageId?: string | null): Promise<SentMessage>;
   sendCard(chatId: string, card: FeishuCard, rootMessageId?: string | null): Promise<SentMessage>;
   replyTextInThread(messageId: string, text: string): Promise<SentMessage>;
   replyCardInThread(messageId: string, card: FeishuCard): Promise<SentMessage>;
+  updateText(messageId: string, text: string): Promise<void>;
   updateCard(messageId: string, card: FeishuCard): Promise<void>;
+  createTaskChat(input: {
+    name: string;
+    ownerId?: string | null;
+    userIds?: string[];
+    chatType?: "private" | "public";
+    description?: string | null;
+    setBotManager?: boolean;
+  }): Promise<FeishuCreatedChat>;
+  updateChatName(chatId: string, name: string, description?: string | null): Promise<void>;
 }
 
 export interface FeishuChatInfoProvider {
@@ -63,6 +79,22 @@ export class FeishuClient implements FeishuSender {
     return this.replyMessage(messageId, "interactive", card, true);
   }
 
+  async updateText(messageId: string, text: string): Promise<void> {
+    const token = await this.getTenantAccessToken();
+    const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
+      method: "PUT",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json; charset=utf-8"
+      },
+      body: JSON.stringify({
+        msg_type: "text",
+        content: JSON.stringify({ text })
+      })
+    });
+    await this.assertOk(response, "update text");
+  }
+
   async updateCard(messageId: string, card: FeishuCard): Promise<void> {
     const token = await this.getTenantAccessToken();
     const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
@@ -77,6 +109,70 @@ export class FeishuClient implements FeishuSender {
       })
     });
     await this.assertOk(response, "update card");
+  }
+
+  async createTaskChat(input: {
+    name: string;
+    ownerId?: string | null;
+    userIds?: string[];
+    chatType?: "private" | "public";
+    description?: string | null;
+    setBotManager?: boolean;
+  }): Promise<FeishuCreatedChat> {
+    const token = await this.getTenantAccessToken();
+    const params = new URLSearchParams({
+      user_id_type: "open_id",
+      uuid: `feishu-codex-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+    });
+    if (input.setBotManager) params.set("set_bot_manager", "true");
+    const body: Record<string, unknown> = {
+      name: truncateChatName(input.name),
+      chat_mode: "group",
+      chat_type: input.chatType ?? "private",
+      group_message_type: "chat",
+      edit_permission: "only_owner",
+      add_member_permission: "only_owner",
+      share_card_permission: "not_allowed",
+      membership_approval: "no_approval_required",
+      join_message_visibility: "not_anyone",
+      leave_message_visibility: "not_anyone",
+      description: input.description ?? "Codex task chat"
+    };
+    if (input.ownerId) body.owner_id = input.ownerId;
+    if (input.userIds && input.userIds.length > 0) body.user_id_list = [...new Set(input.userIds)].slice(0, 50);
+    const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/chats?${params.toString()}`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json; charset=utf-8"
+      },
+      body: JSON.stringify(body)
+    });
+    const result = await this.assertOk(response, "create task chat");
+    const data = getObject(result.data);
+    return {
+      chatId: String(data.chat_id ?? ""),
+      name: asOptionalString(data.name),
+      raw: result
+    };
+  }
+
+  async updateChatName(chatId: string, name: string, description?: string | null): Promise<void> {
+    const token = await this.getTenantAccessToken();
+    const body: Record<string, unknown> = { name: truncateChatName(name) };
+    if (description != null) body.description = description;
+    const response = await fetch(
+      `https://open.feishu.cn/open-apis/im/v1/chats/${encodeURIComponent(chatId)}?user_id_type=open_id`,
+      {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json; charset=utf-8"
+        },
+        body: JSON.stringify(body)
+      }
+    );
+    await this.assertOk(response, "update chat name");
   }
 
   async getChatInfo(chatId: string): Promise<FeishuChatInfo> {
@@ -210,3 +306,9 @@ const getObject = (value: unknown): Record<string, unknown> =>
 
 const asOptionalString = (value: unknown): string | null =>
   typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
+
+const truncateChatName = (value: string): string => {
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (compact.length <= 60) return compact || "Codex 任务";
+  return compact.slice(0, 57).trimEnd() + "...";
+};

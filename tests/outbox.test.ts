@@ -48,3 +48,38 @@ test("outbox prefers replying inside Feishu thread when binding has thread id", 
     cleanup();
   }
 });
+
+test("outbox sends dedicated task chat notifications as normal chat messages", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const worker = new OutboxWorker(config, repo, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_dedicated_outbox",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuThreadId: "omt_should_not_reply",
+      feishuContainerKind: "dedicated_chat",
+      title: "Dedicated outbox",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    repo.enqueueOutbox({
+      sessionBindingId: binding.id,
+      notificationType: "console",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuThreadId: "omt_should_not_reply",
+      payload: { text: "hello dedicated" },
+      dedupeKey: "dedicated-hello"
+    });
+    await worker.flush();
+    assert.equal(feishu.sent.length, 1);
+    assert.equal(feishu.sent[0]?.mode, undefined);
+    assert.equal(feishu.sent[0]?.chatId, "task_chat_1");
+    assert.equal(feishu.sent[0]?.root, null);
+  } finally {
+    cleanup();
+  }
+});

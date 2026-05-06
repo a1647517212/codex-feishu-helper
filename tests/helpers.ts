@@ -42,7 +42,10 @@ export const makeConfig = (dir: string): BridgeConfig => ({
     args: ["app-server"],
     experimentalApi: true,
     defaultModel: "gpt-5.4",
-    defaultReasoningEffort: "medium",
+    defaultReasoningEffort: "xhigh",
+    defaultSandboxMode: "danger-full-access",
+    defaultApprovalPolicy: "never",
+    autoArchiveOnCompletion: true,
     serviceName: "feishu_codex_bridge_test"
   },
   feishu: {
@@ -55,6 +58,11 @@ export const makeConfig = (dir: string): BridgeConfig => ({
     messageTransport: "long_connection",
     cardActionTransport: "long_connection",
     interactionMode: "message_command",
+    taskContainerMode: "dedicated_chat",
+    taskChatNamePrefix: "C",
+    taskChatType: "private",
+    taskChatFallbackToTopic: true,
+    taskChatSetBotManager: true,
     allowedUserIds: ["user_1"],
     allowedChatIds: ["chat_1"]
   },
@@ -81,6 +89,8 @@ export class MockFeishu implements FeishuSender {
     root?: string | null;
     payload: unknown;
   }> = [];
+  createdChats: Array<{ chatId: string; name: string; input: Record<string, unknown> }> = [];
+  updatedChatNames: Array<{ chatId: string; name: string }> = [];
   failNext = false;
 
   async sendText(chatId: string, text: string, rootMessageId?: string | null): Promise<SentMessage> {
@@ -133,7 +143,26 @@ export class MockFeishu implements FeishuSender {
     };
   }
 
+  async updateText(messageId: string, text: string): Promise<void> {
+    this.sent.push({ type: "text", chatId: "update", root: messageId, payload: text });
+  }
+
   async updateCard(): Promise<void> {}
+
+  async createTaskChat(input: Record<string, unknown>) {
+    if (this.failNext) {
+      this.failNext = false;
+      throw new Error("mock create chat failure");
+    }
+    const chatId = `task_chat_${this.createdChats.length + 1}`;
+    const name = String(input.name ?? chatId);
+    this.createdChats.push({ chatId, name, input });
+    return { chatId, name, raw: {} };
+  }
+
+  async updateChatName(chatId: string, name: string): Promise<void> {
+    this.updatedChatNames.push({ chatId, name });
+  }
 
   async getChatInfo() {
     return {
@@ -154,9 +183,12 @@ export class MockCodex {
   notifications: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
   requests: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
   turns: Array<{ threadId: string; text: string }> = [];
+  startedThreads: Array<Record<string, unknown>> = [];
+  startedTurns: Array<Record<string, unknown>> = [];
   steerRequests: Array<{ threadId: string; text: string }> = [];
   responses: Array<{ requestId: string | number; result: Record<string, unknown> }> = [];
   interrupted: string[] = [];
+  archived: string[] = [];
   threads: any[] = [];
   listCalls: Array<{ limit?: number; pageSize?: number; maxPages?: number }> = [];
   readFailures = new Map<string, Error>();
@@ -191,16 +223,18 @@ export class MockCodex {
     return { thread };
   }
 
-  async startThread(): Promise<any> {
-    return { id: "thr_new", title: null, preview: null, cwd: null, status: "idle", updatedAt: null, raw: {} };
+  async startThread(params: Record<string, unknown> = {}): Promise<any> {
+    this.startedThreads.push(params);
+    return { id: "thr_new", title: null, preview: null, cwd: (params.cwd as string | null | undefined) ?? null, status: "idle", updatedAt: null, raw: {} };
   }
 
   async resumeThread(threadId: string): Promise<any> {
     return { id: threadId, title: null, preview: null, cwd: null, status: "idle", updatedAt: null, raw: {} };
   }
 
-  async startTurn(threadId: string, text: string): Promise<Record<string, unknown>> {
+  async startTurn(threadId: string, text: string, options: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
     this.turns.push({ threadId, text });
+    this.startedTurns.push({ threadId, text, ...options });
     return { turn: { id: `turn_${this.turns.length}` } };
   }
 
@@ -210,8 +244,13 @@ export class MockCodex {
     return { turnId: `turn_${this.turns.length}` };
   }
 
-  async interruptTurn(threadId: string): Promise<Record<string, unknown>> {
+  async interruptTurn(threadId: string, _turnId: string): Promise<Record<string, unknown>> {
     this.interrupted.push(threadId);
+    return {};
+  }
+
+  async archiveThread(threadId: string): Promise<Record<string, unknown>> {
+    this.archived.push(threadId);
     return {};
   }
 

@@ -6,6 +6,10 @@ import { newToken } from "./core/ids.js";
 
 const TransportModeSchema = z.enum(["long_connection", "http_callback"]);
 const InteractionModeSchema = z.enum(["message_command", "hybrid", "card_callback"]);
+const TaskContainerModeSchema = z.enum(["dedicated_chat", "topic"]);
+const TaskChatTypeSchema = z.enum(["private", "public"]);
+const SandboxModeSchema = z.enum(["read-only", "workspace-write", "danger-full-access"]);
+const ApprovalPolicySchema = z.enum(["untrusted", "on-failure", "on-request", "never"]);
 
 const stringArrayFromEnv = z
   .union([z.array(z.string()), z.string()])
@@ -40,7 +44,10 @@ const ConfigSchema = z.object({
       args: z.array(z.string()).default(["app-server"]),
       experimentalApi: z.boolean().default(true),
       defaultModel: z.string().default("gpt-5.4"),
-      defaultReasoningEffort: z.string().default("medium"),
+      defaultReasoningEffort: z.string().default("xhigh"),
+      defaultSandboxMode: SandboxModeSchema.default("danger-full-access"),
+      defaultApprovalPolicy: ApprovalPolicySchema.default("never"),
+      autoArchiveOnCompletion: z.boolean().default(true),
       serviceName: z.string().default("feishu_codex_bridge")
     })
     .default({
@@ -48,7 +55,10 @@ const ConfigSchema = z.object({
       args: ["app-server"],
       experimentalApi: true,
       defaultModel: "gpt-5.4",
-      defaultReasoningEffort: "medium",
+      defaultReasoningEffort: "xhigh",
+      defaultSandboxMode: "danger-full-access",
+      defaultApprovalPolicy: "never",
+      autoArchiveOnCompletion: true,
       serviceName: "feishu_codex_bridge"
     }),
   feishu: z
@@ -62,10 +72,24 @@ const ConfigSchema = z.object({
       messageTransport: TransportModeSchema.optional(),
       cardActionTransport: TransportModeSchema.optional(),
       interactionMode: InteractionModeSchema.optional(),
+      taskContainerMode: TaskContainerModeSchema.default("dedicated_chat"),
+      taskChatNamePrefix: z.string().default("C"),
+      taskChatType: TaskChatTypeSchema.default("private"),
+      taskChatFallbackToTopic: z.boolean().default(true),
+      taskChatSetBotManager: z.boolean().default(true),
       allowedUserIds: stringArrayFromEnv,
       allowedChatIds: stringArrayFromEnv
     })
-    .default({ transport: "long_connection", allowedUserIds: [], allowedChatIds: [] }),
+    .default({
+      transport: "long_connection",
+      taskContainerMode: "dedicated_chat",
+      taskChatNamePrefix: "C",
+      taskChatType: "private",
+      taskChatFallbackToTopic: true,
+      taskChatSetBotManager: true,
+      allowedUserIds: [],
+      allowedChatIds: []
+    }),
   storage: z
     .object({
       homeDir: z.string().default("~/.feishu-codex"),
@@ -100,6 +124,7 @@ const ConfigSchema = z.object({
         rootPath: z.string(),
         feishuChatId: z.string().optional(),
         defaultModel: z.string().optional(),
+        defaultReasoningEffort: z.string().optional(),
         approvalPolicy: z.string().optional(),
         sandboxPolicy: z.string().optional()
       })

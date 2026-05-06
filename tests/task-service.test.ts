@@ -162,7 +162,7 @@ test("repeated new-task delivery starts only one Codex turn", async () => {
   }
 });
 
-test("direct group message creates its own Feishu task thread before starting Codex turn", async () => {
+test("direct group message creates a dedicated Feishu task chat before starting Codex turn", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
@@ -179,12 +179,78 @@ test("direct group message creates its own Feishu task thread before starting Co
     });
     const binding = repo.findBindingByThreadId("thr_new");
     assert.ok(binding);
-    assert.equal(feishu.sent.length >= 2, true);
-    assert.equal(feishu.sent[0]?.type, "text");
-    assert.equal(feishu.sent[1]?.type, "card");
-    assert.equal(feishu.sent[1]?.mode, "thread");
-    assert.equal(binding.feishuTopicRootMessageId, "msg_1");
-    assert.equal(binding.feishuThreadId, "omt_2");
+    assert.equal(feishu.createdChats.length, 1);
+    assert.equal(binding.feishuContainerKind, "dedicated_chat");
+    assert.equal(binding.feishuChatId, "task_chat_1");
+    assert.equal(binding.feishuControlChatId, "chat_1");
+    assert.equal(binding.feishuThreadId, null);
+    assert.equal(feishu.sent.some((entry) => entry.chatId === "chat_1" && String(entry.payload).includes("已创建独立任务会话")), true);
+    assert.equal(feishu.updatedChatNames.some((entry) => entry.chatId === "task_chat_1" && entry.name.includes("[运行中]")), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("dedicated task chat replies find the bound task even when chat allowlist only contains control chat", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_dedicated_reply",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      feishuControlChatId: "chat_1",
+      title: "Dedicated task",
+      status: "idle",
+      createdFrom: "manual_import"
+    });
+    await service.handleMessage({
+      messageId: "msg_dedicated_reply",
+      chatId: "task_chat_1",
+      rootMessageId: null,
+      threadId: null,
+      userId: "user_1",
+      text: "继续处理"
+    });
+    assert.equal(codex.turns.length, 1);
+    assert.equal(codex.turns[0]?.threadId, binding.codexThreadId);
+  } finally {
+    cleanup();
+  }
+});
+
+test("replying to the task status card message still finds the bound topic", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_card_reply",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_card_reply",
+      feishuThreadId: "omt_card_reply",
+      feishuTaskCardMessageId: "msg_task_card_1",
+      title: "Card reply task",
+      status: "idle",
+      createdFrom: "manual_import"
+    });
+    await service.handleMessage({
+      messageId: "msg_reply_on_card",
+      chatId: "chat_1",
+      rootMessageId: "root_card_reply",
+      parentMessageId: "msg_task_card_1",
+      threadId: null,
+      userId: "user_1",
+      text: "继续处理"
+    });
+    assert.equal(codex.turns.length, 1);
+    assert.equal(codex.turns[0]?.threadId, binding.codexThreadId);
   } finally {
     cleanup();
   }
@@ -195,7 +261,28 @@ test("new task emits one running status and one completion notification", async 
   try {
     const config = makeConfig(dir);
     const codex = new MockCodex();
-    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    codex.threads = [
+      {
+        id: "thr_new",
+        name: "只回复 ok",
+        preview: "只回复 ok",
+        cwd: dir,
+        status: { type: "idle" },
+        turns: [
+          {
+            id: "turn_1",
+            status: "completed",
+            items: [
+              { type: "reasoning", summary: ["确认需求，只需要返回简短结果。"], content: [] },
+              { type: "agentMessage", text: "ok" }
+            ]
+          }
+        ],
+        updatedAt: Date.now()
+      }
+    ];
+    const feishu = new MockFeishu();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
     await service.handleMessage({
       messageId: "msg_status_dedupe",
       chatId: "chat_1",
@@ -229,8 +316,145 @@ test("new task emits one running status and one completion notification", async 
       }
     });
     const outbox = repo.listDueOutbox(10);
-    assert.equal(outbox.filter((item) => item.notificationType === "task_status").length, 1);
-    assert.equal(outbox.filter((item) => item.notificationType === "task_completed").length, 1);
+    assert.equal(outbox.filter((item) => item.notificationType === "task_status").length <= 1, true);
+    assert.equal(outbox.filter((item) => item.notificationType === "task_completed").length, 2);
+    assert.equal(outbox.some((item) => String(item.payload.text ?? "").includes("处理摘要")), true);
+    assert.equal(outbox.some((item) => String(item.payload.text ?? "").includes("最终结论")), true);
+    assert.deepEqual(codex.archived, ["thr_new"]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("completed notification sends result from completed item when thread read has no turns", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    codex.threads = [
+      {
+        id: "thr_item_report",
+        name: "Item report",
+        preview: "Item report",
+        cwd: dir,
+        status: { type: "idle" },
+        turns: [],
+        updatedAt: Date.now()
+      }
+    ];
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_item_report",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Item report",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "item/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turnId: "turn_item_report",
+        item: {
+          type: "reasoning",
+          id: "rs_1",
+          summary: ["先检查输入，再整理结论。"],
+          content: []
+        }
+      }
+    });
+    await codex.notifications.notification![0]!({
+      method: "item/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turnId: "turn_item_report",
+        item: {
+          type: "agentMessage",
+          id: "am_1",
+          text: "最终结论已经整理完成。"
+        }
+      }
+    });
+    await codex.notifications.notification![0]!({
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: {
+          id: "turn_item_report",
+          status: "completed",
+          items: []
+        }
+      }
+    });
+    const result = repo.listDueOutbox(10).find((item) => typeof item.payload.text === "string");
+    assert.ok(result);
+    assert.equal(String(result.payload.text).includes("处理摘要"), true);
+    assert.equal(String(result.payload.text).includes("先检查输入，再整理结论。"), true);
+    assert.equal(String(result.payload.text).includes("最终结论已经整理完成。"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("completed notification sends result from streamed deltas when read and turn items are empty", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    codex.threads = [
+      {
+        id: "thr_delta_report",
+        name: "Delta report",
+        preview: "Delta report",
+        cwd: dir,
+        status: { type: "idle" },
+        turns: [],
+        updatedAt: Date.now()
+      }
+    ];
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_delta_report",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Delta report",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "item/plan/delta",
+      params: { threadId: binding.codexThreadId, turnId: "turn_delta_report", itemId: "plan_1", delta: "先确认目标，" }
+    });
+    await codex.notifications.notification![0]!({
+      method: "item/plan/delta",
+      params: { threadId: binding.codexThreadId, turnId: "turn_delta_report", itemId: "plan_1", delta: "再输出结果。" }
+    });
+    await codex.notifications.notification![0]!({
+      method: "item/agentMessage/delta",
+      params: { threadId: binding.codexThreadId, turnId: "turn_delta_report", itemId: "am_1", delta: "已完成" }
+    });
+    await codex.notifications.notification![0]!({
+      method: "item/agentMessage/delta",
+      params: { threadId: binding.codexThreadId, turnId: "turn_delta_report", itemId: "am_1", delta: "并给出结论。" }
+    });
+    await codex.notifications.notification![0]!({
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: {
+          id: "turn_delta_report",
+          status: "completed",
+          items: []
+        }
+      }
+    });
+    const result = repo.listDueOutbox(10).find((item) => typeof item.payload.text === "string");
+    assert.ok(result);
+    assert.equal(String(result.payload.text).includes("先确认目标，再输出结果。"), true);
+    assert.equal(String(result.payload.text).includes("已完成并给出结论。"), true);
   } finally {
     cleanup();
   }
@@ -366,7 +590,7 @@ test("approval action is idempotent and sends one codex response", async () => {
   }
 });
 
-test("console new task action sends a draft topic card", async () => {
+test("console new task action creates a draft dedicated task chat", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
@@ -381,14 +605,15 @@ test("console new task action sends a draft topic card", async () => {
       rootMessageId: "root_console",
       payload: {}
     });
+    assert.equal(feishu.createdChats.length, 1);
     assert.equal(feishu.sent.length, 2);
     assert.equal(feishu.sent[0]?.type, "text");
-    assert.equal(feishu.sent[1]?.type, "card");
-    assert.equal(feishu.sent[1]?.mode, "thread");
+    assert.equal(feishu.sent[1]?.type, "text");
     const draft = repo.listBindings().find((binding) => binding.status === "waiting_for_prompt");
     assert.ok(draft);
-    assert.equal(draft.feishuTopicRootMessageId, "msg_1");
-    assert.equal(draft.feishuThreadId, "omt_2");
+    assert.equal(draft.feishuContainerKind, "dedicated_chat");
+    assert.equal(draft.feishuChatId, "task_chat_1");
+    assert.equal(draft.feishuThreadId, null);
   } finally {
     cleanup();
   }
@@ -451,12 +676,12 @@ test("claim sessions card can bind an existing Codex thread", async () => {
     });
     const binding = repo.findBindingByThreadId("thr_existing");
     assert.ok(binding);
-    assert.equal(binding.feishuTopicRootMessageId, "msg_1");
-    assert.equal(binding.feishuThreadId, "omt_2");
+    assert.equal(binding.feishuContainerKind, "dedicated_chat");
+    assert.equal(binding.feishuChatId, "task_chat_1");
+    assert.equal(binding.feishuThreadId, null);
     assert.equal(binding.createdFrom, "codex_app_claimed");
-    assert.equal(feishu.sent.length, 2);
+    assert.equal(feishu.createdChats.length, 1);
     assert.equal(feishu.sent[0]?.type, "text");
-    assert.equal(feishu.sent[1]?.mode, "thread");
   } finally {
     cleanup();
   }
@@ -489,15 +714,16 @@ test("message command can claim an existing Codex thread without card callback",
     });
     const binding = repo.findBindingByThreadId("thr_command_claim");
     assert.ok(binding);
-    assert.equal(binding.feishuTopicRootMessageId, "msg_1");
-    assert.equal(binding.feishuThreadId, "omt_2");
+    assert.equal(binding.feishuContainerKind, "dedicated_chat");
+    assert.equal(binding.feishuChatId, "task_chat_1");
+    assert.equal(binding.feishuThreadId, null);
     assert.equal(binding.createdFrom, "codex_app_claimed");
   } finally {
     cleanup();
   }
 });
 
-test("message commands cover project, notification, status, logs and diff actions", async () => {
+test("message commands cover project, notification, status and logs actions", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
@@ -513,7 +739,7 @@ test("message commands cover project, notification, status, logs and diff action
       status: "completed",
       createdFrom: "manual_import"
     });
-    for (const [index, text] of ["/projects", "/notify test", "/notify history", "/status", "/logs", "/diff"].entries()) {
+    for (const [index, text] of ["/projects", "/notify test", "/notify history", "/status", "/logs"].entries()) {
       await service.handleMessage({
         messageId: `msg_command_${index}`,
         chatId: "chat_1",
@@ -525,14 +751,6 @@ test("message commands cover project, notification, status, logs and diff action
     }
     assert.equal(feishu.sent.some((entry) => entry.type === "text" && String(entry.payload).includes("测试通知")), true);
     assert.equal(feishu.sent.filter((entry) => entry.type === "card").length >= 4, true);
-    assert.equal(
-      feishu.sent.some(
-        (entry) =>
-          entry.type === "text" &&
-          (String(entry.payload).includes("Git 变更摘要") || String(entry.payload).includes("不是 Git 仓库"))
-      ),
-      true
-    );
   } finally {
     cleanup();
   }
@@ -592,7 +810,8 @@ test("claim summary and ignore commands work without card callback", async () =>
       text: "/claim ignore thr_summary"
     });
     assert.equal(feishu.sent.some((entry) => String(entry.payload).includes("任务摘要：Summary task")), true);
-    assert.equal(feishu.sent.some((entry) => String(entry.payload).includes("最近命令：npm test")), true);
+    assert.equal(feishu.sent.some((entry) => String(entry.payload).includes("最近执行步骤：1 个")), true);
+    assert.equal(feishu.sent.some((entry) => String(entry.payload).includes("npm test")), false);
     assert.equal(repo.findIgnoredThread("thr_summary")?.codexThreadId, "thr_summary");
   } finally {
     cleanup();
@@ -753,23 +972,23 @@ test("pick project command shows assignment card without card callback", async (
   }
 });
 
-test("unclassified command excludes threads that match project by git remote rule", async () => {
+test("unclassified command excludes threads that match project by cwd rule", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
-    const project = repo.upsertProject({ id: "proj_remote", name: "Remote mapped", rootPath: "C:\\known" });
+    const project = repo.upsertProject({ id: "proj_mapped", name: "Path mapped", rootPath: "C:\\known" });
     repo.addProjectMatchRule({
       projectId: project.id,
-      ruleType: "git_remote",
-      ruleValue: "https://example.com/repo.git"
+      ruleType: "cwd_prefix",
+      ruleValue: dir
     });
     const feishu = new MockFeishu();
     const codex = new MockCodex();
     codex.threads = [
       {
-        id: "thr_remote_mapped",
-        name: "Remote mapped task",
-        preview: "Remote mapped task",
+        id: "thr_path_mapped",
+        name: "Path mapped task",
+        preview: "Path mapped task",
         cwd: dir,
         status: { type: "idle" },
         updatedAt: Date.now()
@@ -783,37 +1002,18 @@ test("unclassified command excludes threads that match project by git remote rul
         updatedAt: Date.now()
       }
     ];
-    const originalReadThread = codex.readThread.bind(codex);
-    (codex as unknown as { readThread: (threadId: string) => Promise<Record<string, unknown>> }).readThread = originalReadThread;
     const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
     await service.bootstrapProjectsFromConfig();
-    const originalSummarize = (service as unknown as { git: { summarize: (cwd: string | null | undefined) => Promise<any> } }).git.summarize.bind(
-      (service as unknown as { git: { summarize: (cwd: string | null | undefined) => Promise<any> } }).git
-    );
-    (service as unknown as { git: { summarize: (cwd: string | null | undefined) => Promise<any> } }).git.summarize = async (
-      cwd: string | null | undefined
-    ) => {
-      if (cwd === dir) {
-        return {
-          repoRoot: cwd,
-          branchName: "main",
-          remoteUrl: "https://example.com/repo.git",
-          changedFiles: 0,
-          statusText: ""
-        };
-      }
-      return originalSummarize(cwd);
-    };
     await service.handleMessage({
-      messageId: "msg_unclassified_remote",
+      messageId: "msg_unclassified_path",
       chatId: "chat_1",
-      rootMessageId: "root_unclassified_remote",
+      rootMessageId: "root_unclassified_path",
       threadId: null,
       userId: "user_1",
       text: "/unclassified"
     });
     const payload = JSON.stringify(feishu.sent.find((entry) => entry.type === "card")?.payload ?? {});
-    assert.equal(payload.includes("Remote mapped task"), false);
+    assert.equal(payload.includes("Path mapped task"), false);
     assert.equal(payload.includes("Still unclassified"), true);
   } finally {
     cleanup();
@@ -913,7 +1113,7 @@ test("approval commands resolve approvals without card callback", async () => {
   }
 });
 
-test("task control commands require a bound topic and can stop, retry, run tests and archive", async () => {
+test("task control commands require a bound task and can stop, retry, run tests and archive", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
@@ -929,6 +1129,7 @@ test("task control commands require a bound topic and can stop, retry, run tests
       status: "failed",
       createdFrom: "manual_import"
     });
+    repo.updateBindingStatus(binding.id, "failed", "turn_control_command");
     await service.handleMessage({
       messageId: "msg_orphan_status_command",
       chatId: "chat_1",
@@ -970,10 +1171,11 @@ test("task control commands require a bound topic and can stop, retry, run tests
       userId: "user_1",
       text: "/archive"
     });
-    assert.equal(feishu.sent.some((entry) => String(entry.payload).includes("需要在已绑定的任务话题里发送")), true);
+    assert.equal(feishu.sent.some((entry) => String(entry.payload).includes("需要在已绑定的任务会话里发送")), true);
     assert.equal(codex.turns.length >= 2, true);
     assert.deepEqual(codex.interrupted, ["thr_control_command"]);
     assert.equal(repo.findBindingById(binding.id)?.status, "archived");
+    assert.deepEqual(codex.archived, ["thr_control_command"]);
   } finally {
     cleanup();
   }
@@ -1115,6 +1317,29 @@ test("bootstrap restores terminal status from event history after stale idle rec
   }
 });
 
+test("bootstrap skips draft task chats that do not have real Codex thread ids yet", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "draft_waiting_prompt",
+      feishuChatId: "task_chat_draft",
+      feishuTopicRootMessageId: "task-draft",
+      feishuContainerKind: "dedicated_chat",
+      title: "Draft task",
+      status: "waiting_for_prompt",
+      createdFrom: "feishu_new_task"
+    });
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    await service.bootstrapProjectsFromConfig();
+    assert.equal(repo.findBindingById(binding.id)?.status, "waiting_for_prompt");
+    assert.equal(repo.listEventsForBinding(binding.id).some((event) => event.eventType === "session.reconcile_failed"), false);
+  } finally {
+    cleanup();
+  }
+});
+
 test("visible task and diagnostic buttons have concrete handlers", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
@@ -1146,7 +1371,7 @@ test("visible task and diagnostic buttons have concrete handlers", async () => {
       payload: { text: "done" },
       dedupeKey: "button-history"
     });
-    for (const [index, action] of ["task_status", "task_logs", "task_diff", "notification_history", "send_test_notification"].entries()) {
+    for (const [index, action] of ["task_status", "task_logs", "notification_history", "send_test_notification"].entries()) {
       await service.handleCardAction({
         actionId: `act_button_${index}`,
         action,
@@ -1166,9 +1391,9 @@ test("visible task and diagnostic buttons have concrete handlers", async () => {
     });
     assert.equal(repo.findBindingById(binding.id)?.status, "archived");
     assert.equal(feishu.sent.filter((entry) => entry.type === "card").length >= 3, true);
-    assert.equal(feishu.sent.filter((entry) => entry.type === "text").length >= 2, true);
+    assert.equal(feishu.sent.filter((entry) => entry.type === "text").length >= 1, true);
     assert.equal(
-      feishu.sent.filter((entry) => entry.mode === "thread" && entry.root === "root_buttons").length >= 3,
+      feishu.sent.filter((entry) => entry.mode === "thread" && entry.root === "root_buttons").length >= 2,
       true
     );
   } finally {

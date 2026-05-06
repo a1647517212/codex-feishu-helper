@@ -55,6 +55,7 @@ export class DiagnosticsService {
       feishuInteractionMode: this.config.feishu.interactionMode,
       feishuDefaultChatId: this.config.feishu.defaultChatId ?? null,
       feishuDefaultChatDiagnostic: await this.defaultChatDiagnostic(),
+      feishuTaskContainerMode: this.config.feishu.taskContainerMode,
       databasePath: this.config.storage.databasePath,
       projectsCount: this.repo.count("projects"),
       sessionBindingsCount: this.repo.count("session_bindings"),
@@ -98,8 +99,10 @@ export class DiagnosticsService {
         groupMessageType: chat.groupMessageType,
         topicReplySupported,
         fullTopicMode,
-        recommendation: chatRecommendation(chat.chatMode, chat.groupMessageType),
-        requiredScopes: ["im:chat:readonly"],
+        recommendation: chatRecommendation(chat.chatMode, chat.groupMessageType, this.config.feishu.taskContainerMode),
+        requiredScopes: this.config.feishu.taskContainerMode === "dedicated_chat"
+          ? ["im:chat:readonly", "im:chat:create", "im:chat:update", "im:chat.members:write_only"]
+          : ["im:chat:readonly"],
         error: null
       };
     } catch (error) {
@@ -120,7 +123,10 @@ export class DiagnosticsService {
   }
 }
 
-const chatRecommendation = (chatMode: string | null, groupMessageType: string | null): string => {
+const chatRecommendation = (chatMode: string | null, groupMessageType: string | null, containerMode: string): string => {
+  if (containerMode === "dedicated_chat") {
+    return "当前默认群作为主控群使用；新任务默认创建独立任务会话，不依赖群内话题列表。";
+  }
   if (chatMode === "topic" || groupMessageType === "thread") {
     return "当前群已经是话题消息形式；新的任务回复会在话题流中展示。";
   }

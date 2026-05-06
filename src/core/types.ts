@@ -11,6 +11,8 @@ export type TaskStatus =
 
 export type CreatedFrom = "codex_app_claimed" | "feishu_new_task" | "manual_import";
 
+export type FeishuTaskContainerKind = "topic" | "dedicated_chat";
+
 export type ApprovalType = "command_execution" | "file_change";
 
 export type ApprovalStatus =
@@ -45,10 +47,8 @@ export interface Project {
   id: string;
   name: string;
   rootPath: string;
-  gitRepoRoot: string | null;
-  gitRemote: string | null;
-  defaultBranch: string | null;
   defaultModel: string | null;
+  defaultReasoningEffort: string | null;
   approvalPolicy: string | null;
   sandboxPolicy: string | null;
   feishuChatId: string | null;
@@ -65,11 +65,11 @@ export interface SessionBinding {
   feishuChatId: string;
   feishuTopicRootMessageId: string;
   feishuThreadId: string | null;
+  feishuTaskCardMessageId: string | null;
+  feishuContainerKind: FeishuTaskContainerKind;
+  feishuControlChatId: string | null;
   title: string | null;
   cwd: string | null;
-  gitRepoRoot: string | null;
-  branchName: string | null;
-  worktreePath: string | null;
   status: TaskStatus;
   lastTurnId: string | null;
   lastEventCursor: string | null;
@@ -146,7 +146,6 @@ export interface IgnoredThread {
   codexThreadId: string;
   title: string | null;
   cwd: string | null;
-  gitRepoRoot: string | null;
   reason: string | null;
   createdByFeishuUserId: string | null;
   createdAt: string;
@@ -177,6 +176,7 @@ export interface DiagnosticSnapshot {
   feishuInteractionMode: "message_command" | "hybrid" | "card_callback";
   feishuDefaultChatId: string | null;
   feishuDefaultChatDiagnostic: FeishuChatDiagnostic | null;
+  feishuTaskContainerMode: "dedicated_chat" | "topic";
   databasePath: string;
   projectsCount: number;
   sessionBindingsCount: number;
@@ -210,8 +210,6 @@ export interface TaskStatusProjection {
   projectName: string;
   status: TaskStatus;
   cwd: string | null;
-  branchName: string | null;
-  changedFiles: number;
   queuedMessages: number;
   pendingApprovals: number;
   lastTurnId: string | null;
@@ -223,6 +221,7 @@ export interface FeishuIncomingMessage {
   messageId: string;
   chatId: string;
   rootMessageId: string | null;
+  parentMessageId?: string | null;
   threadId: string | null;
   userId: string;
   text: string;

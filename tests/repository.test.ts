@@ -21,6 +21,16 @@ test("repository persists bindings and keeps action requests idempotent", () => 
     });
     assert.equal(repo.findBindingByTopic("chat_1", "msg_root")?.id, binding.id);
     assert.equal(repo.findBindingByFeishuThreadId("chat_1", "omt_1")?.id, binding.id);
+    const taskChat = repo.createOrUpdateBinding({
+      codexThreadId: "thr_task_chat",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Task chat",
+      status: "idle",
+      createdFrom: "manual_import"
+    });
+    assert.equal(repo.findBindingByChatId("task_chat_1")?.id, taskChat.id);
     const first = repo.beginAction({
       actionId: "act_1",
       actionType: "task_continue",
@@ -118,8 +128,7 @@ test("repository matches project path across Windows slash styles", () => {
     assert.equal(repo.findProjectForPath("C:\\Users\\EPEANZ\\Documents\\Playground\\src")?.id, project.id);
     assert.equal(
       repo.findProjectForContext({
-        cwd: "C:\\Users\\EPEANZ\\Documents\\Playground\\src",
-        gitRepoRoot: "C:\\Users\\EPEANZ\\Documents\\Playground"
+        cwd: "C:\\Users\\EPEANZ\\Documents\\Playground\\src"
       })?.id,
       project.id
     );

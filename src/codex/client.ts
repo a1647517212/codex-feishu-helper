@@ -101,10 +101,15 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
     return result as Record<string, unknown>;
   }
 
-  async startThread(params: { cwd?: string | null; model?: string | null }): Promise<CodexThreadSummary> {
+  async startThread(params: { cwd?: string | null; model?: string | null; reasoningEffort?: string | null } = {}): Promise<CodexThreadSummary> {
     const result = await this.request("thread/start", {
       model: params.model ?? this.config.codex.defaultModel,
       cwd: params.cwd ?? null,
+      approvalPolicy: this.config.codex.defaultApprovalPolicy,
+      sandbox: this.config.codex.defaultSandboxMode,
+      config: {
+        model_reasoning_effort: params.reasoningEffort ?? this.config.codex.defaultReasoningEffort
+      },
       serviceName: this.config.codex.serviceName,
       experimentalRawEvents: false,
       persistExtendedHistory: true
@@ -117,13 +122,19 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
     return normalizeThread((result as { thread?: unknown }).thread);
   }
 
-  async startTurn(threadId: string, text: string, options: { cwd?: string | null; model?: string | null } = {}): Promise<Record<string, unknown>> {
+  async startTurn(
+    threadId: string,
+    text: string,
+    options: { cwd?: string | null; model?: string | null; reasoningEffort?: string | null } = {}
+  ): Promise<Record<string, unknown>> {
     const result = await this.request("turn/start", {
       threadId,
       input: [textInput(text)],
       cwd: options.cwd ?? undefined,
       model: options.model ?? undefined,
-      effort: this.config.codex.defaultReasoningEffort
+      effort: options.reasoningEffort ?? this.config.codex.defaultReasoningEffort,
+      approvalPolicy: this.config.codex.defaultApprovalPolicy,
+      sandboxPolicy: sandboxPolicyFromMode(this.config.codex.defaultSandboxMode)
     });
     return result as Record<string, unknown>;
   }
@@ -133,8 +144,13 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
     return result as Record<string, unknown>;
   }
 
-  async interruptTurn(threadId: string): Promise<Record<string, unknown>> {
-    const result = await this.request("turn/interrupt", { threadId });
+  async interruptTurn(threadId: string, turnId: string): Promise<Record<string, unknown>> {
+    const result = await this.request("turn/interrupt", { threadId, turnId });
+    return result as Record<string, unknown>;
+  }
+
+  async archiveThread(threadId: string): Promise<Record<string, unknown>> {
+    const result = await this.request("thread/archive", { threadId });
     return result as Record<string, unknown>;
   }
 
@@ -249,5 +265,18 @@ const normalizeThread = (value: unknown): CodexThreadSummary => {
     status: toTaskStatus(raw.status),
     updatedAt: typeof raw.updatedAt === "number" ? raw.updatedAt : null,
     raw
+  };
+};
+
+const sandboxPolicyFromMode = (mode: string): Record<string, unknown> => {
+  if (mode === "danger-full-access") return { type: "dangerFullAccess" };
+  if (mode === "read-only") return { type: "readOnly", access: { type: "fullAccess" }, networkAccess: true };
+  return {
+    type: "workspaceWrite",
+    writableRoots: [],
+    readOnlyAccess: { type: "fullAccess" },
+    networkAccess: true,
+    excludeTmpdirEnvVar: false,
+    excludeSlashTmp: false
   };
 };

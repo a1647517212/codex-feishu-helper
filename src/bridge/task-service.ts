@@ -5,14 +5,21 @@ import type { FeishuCardAction, FeishuIncomingMessage, PendingApproval, Project,
 import type { Repository } from "../db/repo.js";
 import { commandApprovalDecision, fileApprovalDecision, classifyCommandRisk } from "../domain/approval.js";
 import { CardRenderer } from "../domain/cards.js";
-import { GitInspector } from "../domain/git.js";
-import type { GitSummary } from "../domain/git.js";
 import { ProjectionBuilder } from "../domain/projection.js";
 import { SecurityPolicy } from "../domain/security.js";
 import type { CodexClient, CodexThreadSummary } from "../codex/client.js";
 import type { FeishuSender } from "../feishu/client.js";
 import type { Logger } from "../logger.js";
 import { DiagnosticsService } from "./diagnostics.js";
+
+type TaskContainer = {
+  chatId: string;
+  rootMessageId: string;
+  threadId: string | null;
+  cardMessageId: string | null;
+  kind: "topic" | "dedicated_chat";
+  controlChatId: string | null;
+};
 
 type FeishuReplyTarget = {
   chatId: string;
@@ -23,7 +30,6 @@ type FeishuReplyTarget = {
 export class TaskService {
   private readonly cards: CardRenderer;
   private readonly projection: ProjectionBuilder;
-  private readonly git = new GitInspector();
   private readonly security: SecurityPolicy;
 
   constructor(
@@ -36,23 +42,20 @@ export class TaskService {
   ) {
     this.cards = new CardRenderer(config.feishu.interactionMode);
     this.projection = new ProjectionBuilder(repo);
-    this.security = new SecurityPolicy(config);
+    this.security = new SecurityPolicy(config, repo);
     this.codex.on("notification", (message) => this.handleCodexNotification(message).catch((error) => this.logger.error("codex notification handling failed", { error: String(error), message })));
     this.codex.on("serverRequest", (message) => this.handleCodexServerRequest(message).catch((error) => this.logger.error("codex server request handling failed", { error: String(error), message })));
   }
 
   async bootstrapProjectsFromConfig(): Promise<void> {
     for (const project of this.config.projects) {
-      const gitSummary = await this.git.summarize(project.rootPath);
       this.repo.upsertProject({
         id: project.id,
         name: project.name,
         rootPath: project.rootPath,
-        gitRepoRoot: gitSummary.repoRoot,
-        gitRemote: gitSummary.remoteUrl,
-        defaultBranch: gitSummary.branchName,
         feishuChatId: project.feishuChatId,
         defaultModel: project.defaultModel,
+        defaultReasoningEffort: project.defaultReasoningEffort,
         approvalPolicy: project.approvalPolicy,
         sandboxPolicy: project.sandboxPolicy
       });
@@ -62,6 +65,9 @@ export class TaskService {
 
   async reconcilePersistedBindings(): Promise<void> {
     for (const binding of this.repo.listBindings(this.config.bridge.threadListLimit)) {
+      if (binding.status === "waiting_for_prompt" || binding.codexThreadId.startsWith("draft_")) {
+        continue;
+      }
       try {
         const detail = await this.codex.readThread(binding.codexThreadId, false);
         const thread = normalizeThreadFromDetail(binding.codexThreadId, detail);
@@ -190,7 +196,9 @@ export class TaskService {
     const rootMessageId = message.rootMessageId ?? message.messageId;
     const binding =
       (message.threadId ? this.repo.findBindingByFeishuThreadId(message.chatId, message.threadId) : null) ??
-      this.repo.findBindingByTopic(message.chatId, rootMessageId);
+      (message.parentMessageId ? this.repo.findBindingByTaskCardMessageId(message.chatId, message.parentMessageId) : null) ??
+      this.repo.findBindingByTopic(message.chatId, rootMessageId) ??
+      this.repo.findBindingByChatId(message.chatId);
     if (binding) {
       if (binding.status === "waiting_for_prompt") {
         await this.startNewTaskFromPrompt(binding, message);
@@ -199,7 +207,7 @@ export class TaskService {
       await this.continueBindingFromFeishu(binding, message);
       return;
     }
-    await this.createNewTaskFromFeishu(message, rootMessageId);
+    await this.createNewTaskFromFeishu(message);
   }
 
   async handleCardAction(action: FeishuCardAction): Promise<Record<string, unknown>> {
@@ -260,11 +268,8 @@ export class TaskService {
     userId: string;
     skipCardRefresh?: boolean;
   }): Promise<SessionBinding> {
-    const gitSummary = await this.git.summarize(params.thread.cwd);
     const project = this.repo.findProjectForContext({
-      cwd: params.thread.cwd,
-      gitRepoRoot: gitSummary.repoRoot,
-      gitRemote: gitSummary.remoteUrl
+      cwd: params.thread.cwd
     });
     const binding = this.repo.createOrUpdateBinding({
       projectId: project?.id ?? null,
@@ -273,8 +278,6 @@ export class TaskService {
       feishuTopicRootMessageId: params.rootMessageId,
       title: params.thread.title ?? params.thread.preview ?? "Codex 任务",
       cwd: params.thread.cwd,
-      gitRepoRoot: gitSummary.repoRoot,
-      branchName: gitSummary.branchName,
       status: params.thread.status,
       createdByFeishuUserId: params.userId,
       createdFrom: "codex_app_claimed"
@@ -291,29 +294,44 @@ export class TaskService {
     return binding;
   }
 
-  private async createNewTaskFromFeishu(message: FeishuIncomingMessage, rootMessageId: string): Promise<void> {
+  private async createNewTaskFromFeishu(message: FeishuIncomingMessage): Promise<void> {
     const project = this.repo.listProjects()[0] ?? null;
-    const topic = await this.ensureTaskTopic({
+    const title = summarizeTitle(message.text);
+    const container = await this.ensureTaskContainer({
       chatId: project?.feishuChatId ?? message.chatId,
-      title: summarizeTitle(message.text),
+      title,
       card: project ? this.cards.waitingForPromptCard(project) : this.cards.newTaskDraftCard()
-    });
+    }, message);
+    if (container.kind === "dedicated_chat") {
+      await this.feishu.sendText(
+        message.chatId,
+        `已创建独立任务会话：${buildTaskChatName(this.config, container.rootMessageId, title)}\n请在新会话里继续补充需求。`,
+        message.rootMessageId ?? message.messageId
+      );
+      await this.feishu.sendText(container.chatId, `任务：${title}\n\n后续补充、/status、/logs、/archive 都在这个会话里发送。`);
+      await this.repo.beginIncomingMessage({
+        messageId: `system:${container.chatId}:${message.messageId}`,
+        chatId: container.chatId,
+        userId: message.userId,
+        text: message.text
+      });
+    }
     const thread = await this.codex.startThread({
       cwd: project?.rootPath ?? null,
-      model: project?.defaultModel ?? this.config.codex.defaultModel
+      model: projectModel(project, this.config),
+      reasoningEffort: projectReasoningEffort(project, this.config)
     });
-    const gitSummary = await this.git.summarize(thread.cwd ?? project?.rootPath);
-    const title = summarizeTitle(message.text);
     const binding = this.repo.createOrUpdateBinding({
       projectId: project?.id ?? null,
       codexThreadId: thread.id,
-      feishuChatId: topic.chatId,
-      feishuTopicRootMessageId: topic.rootMessageId,
-      feishuThreadId: topic.threadId,
+      feishuChatId: container.chatId,
+      feishuTopicRootMessageId: container.rootMessageId,
+      feishuThreadId: container.threadId,
+      feishuTaskCardMessageId: container.cardMessageId,
+      feishuContainerKind: container.kind,
+      feishuControlChatId: container.controlChatId,
       title,
       cwd: thread.cwd ?? project?.rootPath ?? null,
-      gitRepoRoot: gitSummary.repoRoot,
-      branchName: gitSummary.branchName,
       status: "running",
       createdByFeishuUserId: message.userId,
       createdFrom: "feishu_new_task"
@@ -327,9 +345,11 @@ export class TaskService {
     });
     const turn = await this.codex.startTurn(binding.codexThreadId, message.text, {
       cwd: binding.cwd,
-      model: project?.defaultModel ?? this.config.codex.defaultModel
+      model: projectModel(project, this.config),
+      reasoningEffort: projectReasoningEffort(project, this.config)
     });
     this.repo.updateBindingStatus(binding.id, "running", extractTurnId(turn));
+    await this.updateTaskTitle(binding.id, "running", title);
     await this.updateTaskCard(binding.id);
   }
 
@@ -337,13 +357,14 @@ export class TaskService {
     const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
     const thread = await this.codex.startThread({
       cwd: project?.rootPath ?? binding.cwd ?? null,
-      model: project?.defaultModel ?? this.config.codex.defaultModel
+      model: projectModel(project, this.config),
+      reasoningEffort: projectReasoningEffort(project, this.config)
     });
-    const gitSummary = await this.git.summarize(thread.cwd ?? project?.rootPath ?? binding.cwd);
     const title = summarizeTitle(message.text);
     const turn = await this.codex.startTurn(thread.id, message.text, {
       cwd: thread.cwd ?? project?.rootPath ?? binding.cwd ?? null,
-      model: project?.defaultModel ?? this.config.codex.defaultModel
+      model: projectModel(project, this.config),
+      reasoningEffort: projectReasoningEffort(project, this.config)
     });
     this.repo.activateDraftBinding({
       bindingId: binding.id,
@@ -351,9 +372,6 @@ export class TaskService {
       projectId: project?.id ?? null,
       title,
       cwd: thread.cwd ?? project?.rootPath ?? binding.cwd ?? null,
-      gitRepoRoot: gitSummary.repoRoot,
-      branchName: gitSummary.branchName,
-      worktreePath: thread.cwd ?? project?.rootPath ?? binding.cwd ?? null,
       status: "running",
       lastTurnId: extractTurnId(turn)
     });
@@ -364,6 +382,7 @@ export class TaskService {
       eventPayload: { text: message.text, fromDraft: true },
       feishuMessageId: message.messageId
     });
+    await this.updateTaskTitle(binding.id, "running", title);
     await this.updateTaskCard(binding.id);
   }
 
@@ -411,7 +430,12 @@ export class TaskService {
       feishuMessageId: message.messageId
     });
     await this.codex.resumeThread(binding.codexThreadId);
-    await this.codex.startTurn(binding.codexThreadId, message.text, { cwd: binding.cwd });
+    const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
+    await this.codex.startTurn(binding.codexThreadId, message.text, {
+      cwd: binding.cwd,
+      model: projectModel(project, this.config),
+      reasoningEffort: projectReasoningEffort(project, this.config)
+    });
   }
 
   private async dispatchCardAction(action: FeishuCardAction): Promise<Record<string, unknown>> {
@@ -455,9 +479,6 @@ export class TaskService {
           asString(action.payload.projectId)
         );
         return { ok: true };
-      case "project_diff":
-        await this.sendProjectDiff(action);
-        return { ok: true };
       case "unclassified_threads":
         await this.sendUnclassifiedThreads(action);
         return { ok: true };
@@ -471,12 +492,9 @@ export class TaskService {
       case "task_logs":
         await this.sendTaskEvents(action, action.action === "task_logs" ? "任务日志" : "任务进度");
         return { ok: true };
-      case "task_diff":
-        await this.sendTaskDiff(action);
-        return { ok: true };
       case "task_continue":
       case "task_append_hint":
-        return { ok: true, text: "请直接在本话题回复要追加的要求。" };
+        return { ok: true, text: "请直接在当前任务会话回复要追加的要求。" };
       case "task_run_tests":
         await this.startSyntheticInstruction(action, "请根据当前项目的测试配置运行相关测试；如果失败，先分析原因，再修复。");
         return { ok: true };
@@ -550,7 +568,8 @@ export class TaskService {
     if (!command) return null;
     const currentBinding =
       (message.threadId ? this.repo.findBindingByFeishuThreadId(message.chatId, message.threadId) : null) ??
-      this.repo.findBindingByTopic(message.chatId, rootMessageId);
+      this.repo.findBindingByTopic(message.chatId, rootMessageId) ??
+      this.repo.findBindingByChatId(message.chatId);
     const actionId = newId("cmd");
     const base = (action: string, payload: Record<string, unknown> = {}, root = rootMessageId): FeishuCardAction => ({
       actionId,
@@ -581,7 +600,6 @@ export class TaskService {
     }
     if (command === "status") return base("task_status", { bindingId: requireCurrentBindingId(currentBinding, command) });
     if (command === "logs") return base("task_logs", { bindingId: requireCurrentBindingId(currentBinding, command) });
-    if (command === "diff") return base("task_diff", { bindingId: requireCurrentBindingId(currentBinding, command) });
     if (command === "queue") {
       if (parts[1]?.toLowerCase() === "cancel") {
         return base("queue_cancel", {
@@ -633,25 +651,77 @@ export class TaskService {
     const project = projectId ? this.repo.getProject(projectId) : this.repo.listProjects()[0] ?? null;
     const chatId = project?.feishuChatId ?? action.chatId ?? this.config.feishu.defaultChatId ?? "";
     const card = project ? this.cards.waitingForPromptCard(project) : this.cards.newTaskDraftCard();
-    const topic = await this.ensureTaskTopic({
+    const container = await this.ensureTaskContainer({
       chatId,
       title: project ? `新任务：${project.name}` : "新任务",
       card
-    });
+    }, { userId: action.userId });
+    if (container.kind === "dedicated_chat") {
+      await this.feishu.sendText(chatId, `已创建独立任务会话：${buildTaskChatName(this.config, container.rootMessageId, "新任务")}\n请在新会话里发送任务描述。`, action.rootMessageId);
+      await this.feishu.sendText(container.chatId, "请直接发送你希望 Codex 完成的事情。");
+    }
     this.repo.createOrUpdateBinding({
       projectId: project?.id ?? null,
       codexThreadId: newId("draft"),
-      feishuChatId: chatId,
-      feishuTopicRootMessageId: topic.rootMessageId,
-      feishuThreadId: topic.threadId,
+      feishuChatId: container.chatId,
+      feishuTopicRootMessageId: container.rootMessageId,
+      feishuThreadId: container.threadId,
+      feishuTaskCardMessageId: container.cardMessageId,
+      feishuContainerKind: container.kind,
+      feishuControlChatId: container.controlChatId,
       title: "新任务",
       cwd: project?.rootPath ?? null,
-      gitRepoRoot: project?.gitRepoRoot ?? null,
-      branchName: project?.defaultBranch ?? null,
       status: "waiting_for_prompt",
       createdByFeishuUserId: action.userId,
       createdFrom: "feishu_new_task"
     });
+  }
+
+  private async ensureTaskContainer(
+    input: {
+      chatId: string;
+      title: string;
+      card: ReturnType<CardRenderer["newTaskDraftCard"]>;
+    },
+    actor?: { userId?: string | null }
+  ): Promise<TaskContainer> {
+    if (this.config.feishu.taskContainerMode === "dedicated_chat") {
+      try {
+        return await this.ensureTaskChat(input, actor);
+      } catch (error) {
+        this.logger.warn("feishu task chat creation failed", { error: String(error), title: input.title });
+        if (!this.config.feishu.taskChatFallbackToTopic) throw error;
+      }
+    }
+    return this.ensureTaskTopic(input);
+  }
+
+  private async ensureTaskChat(
+    input: {
+      chatId: string;
+      title: string;
+      card: ReturnType<CardRenderer["newTaskDraftCard"]>;
+    },
+    actor?: { userId?: string | null }
+  ): Promise<TaskContainer> {
+    const sequence = this.repo.count("session_bindings") + 1;
+    const rootKey = `task-${Date.now().toString(36)}-${sequence.toString().padStart(3, "0")}`;
+    const name = buildTaskChatName(this.config, rootKey, input.title);
+    const created = await this.feishu.createTaskChat({
+      name,
+      userIds: actor?.userId ? [actor.userId] : [],
+      chatType: this.config.feishu.taskChatType,
+      description: "Codex 独立任务会话",
+      setBotManager: this.config.feishu.taskChatSetBotManager
+    });
+    return {
+      chatId: created.chatId,
+      rootMessageId: rootKey,
+      threadId: null,
+      cardMessageId: null,
+      kind: "dedicated_chat",
+      controlChatId: input.chatId
+    };
   }
 
   /**
@@ -662,17 +732,16 @@ export class TaskService {
     chatId: string;
     title: string;
     card: ReturnType<CardRenderer["newTaskDraftCard"]>;
-  }): Promise<{
-    chatId: string;
-    rootMessageId: string;
-    threadId: string | null;
-  }> {
+  }): Promise<TaskContainer> {
     const anchor = await this.feishu.sendText(input.chatId, input.title);
     const sent = await this.feishu.replyCardInThread(anchor.messageId, input.card);
     return {
       chatId: input.chatId,
       rootMessageId: sent.rootId ?? anchor.messageId,
-      threadId: sent.threadId
+      threadId: sent.threadId,
+      cardMessageId: sent.messageId,
+      kind: "topic",
+      controlChatId: null
     };
   }
 
@@ -695,24 +764,44 @@ export class TaskService {
     const detail = await this.codex.readThread(threadId, false);
     const thread = normalizeThreadFromDetail(threadId, detail);
     const chatId = action.chatId || this.config.feishu.defaultChatId || "";
-    const anchor = await this.feishu.sendText(chatId, `任务接管：${thread.title ?? thread.preview ?? thread.id}`);
+    const title = thread.title ?? thread.preview ?? thread.id;
+    const container = await this.ensureTaskContainer({
+      chatId,
+      title: `任务接管：${title}`,
+      card: this.cards.taskStatusCard({
+        bindingId: "pending",
+        title,
+        projectName: "未归类项目",
+        status: thread.status,
+        cwd: thread.cwd,
+        queuedMessages: 0,
+        pendingApprovals: 0,
+        lastTurnId: null,
+        lastSummary: "正在接管本机 Codex 任务。",
+        updatedAt: new Date().toISOString()
+      })
+    }, { userId: action.userId });
+    if (container.kind === "dedicated_chat") {
+      await this.feishu.sendText(chatId, `已创建独立任务会话：${buildTaskChatName(this.config, container.rootMessageId, title)}\n请在新会话里继续。`, action.rootMessageId);
+    }
     const binding = await this.claimThread({
       thread,
-      chatId,
-      rootMessageId: anchor.messageId,
+      chatId: container.chatId,
+      rootMessageId: container.rootMessageId,
       userId: action.userId,
       skipCardRefresh: true
     });
-    const sent = await this.feishu.replyCardInThread(
-      anchor.messageId,
-      this.cards.taskStatusCard(this.projection.buildTaskStatus(binding.id))
-    );
     this.repo.updateBindingTopic({
       bindingId: binding.id,
-      feishuChatId: chatId,
-      feishuTopicRootMessageId: sent.rootId ?? sent.messageId,
-      feishuThreadId: sent.threadId
+      feishuChatId: container.chatId,
+      feishuTopicRootMessageId: container.rootMessageId,
+      feishuThreadId: container.threadId,
+      feishuTaskCardMessageId: container.cardMessageId,
+      feishuContainerKind: container.kind,
+      feishuControlChatId: container.controlChatId
     });
+    await this.updateTaskTitle(binding.id, binding.status, title);
+    await this.updateTaskCard(binding.id);
     return { ok: true };
   }
 
@@ -734,7 +823,7 @@ export class TaskService {
           if (this.repo.findIgnoredThread(thread.id)) return null;
           const binding = this.repo.findBindingByThreadId(thread.id);
           if (binding?.projectId) return null;
-          const { project } = await this.classifyThreadContext(thread, binding);
+          const project = await this.classifyThreadContext(thread, binding);
           return project ? null : thread;
         })
       )
@@ -757,23 +846,10 @@ export class TaskService {
   private async classifyThreadContext(
     thread: CodexThreadSummary,
     binding?: SessionBinding | null
-  ): Promise<{
-    project: Project | null;
-    gitSummary: GitSummary;
-  }> {
-    const gitSummary = await this.git.summarize(thread.cwd ?? binding?.cwd);
-    const project = this.repo.findProjectForContext({
-      cwd: thread.cwd ?? binding?.cwd,
-      gitRepoRoot: binding?.gitRepoRoot ?? gitSummary.repoRoot,
-      gitRemote: gitSummary.remoteUrl
+  ): Promise<Project | null> {
+    return this.repo.findProjectForContext({
+      cwd: thread.cwd ?? binding?.cwd
     });
-    return { project, gitSummary };
-  }
-
-  private async sendProjectDiff(action: FeishuCardAction): Promise<void> {
-    const project = this.requireProject(action);
-    const summary = await this.git.diffSummary(project.rootPath);
-    await this.feishu.sendText(action.chatId || project.feishuChatId || this.config.feishu.defaultChatId || "", summary, action.rootMessageId);
   }
 
   private async sendClaimSummary(action: FeishuCardAction): Promise<void> {
@@ -801,12 +877,10 @@ export class TaskService {
     if (!threadId) throw new Error("缺少 Codex 任务 ID");
     const detail = await this.codex.readThread(threadId, false);
     const thread = normalizeThreadFromDetail(threadId, detail);
-    const gitSummary = await this.git.summarize(thread.cwd);
     this.repo.ignoreThread({
       codexThreadId: thread.id,
       title: thread.title ?? thread.preview ?? thread.id,
       cwd: thread.cwd,
-      gitRepoRoot: gitSummary.repoRoot,
       reason: "feishu_claim_ignored",
       createdByFeishuUserId: action.userId
     });
@@ -819,14 +893,10 @@ export class TaskService {
     const detail = await this.codex.readThread(threadId, false);
     const thread = normalizeThreadFromDetail(threadId, detail);
     if (!thread.cwd) throw new Error("这个任务没有可用工作目录，无法创建项目。");
-    const { gitSummary } = await this.classifyThreadContext(thread, this.repo.findBindingByThreadId(thread.id));
     const projectName = inferProjectName(thread.cwd, thread.title ?? thread.preview ?? thread.id);
     const project = this.repo.upsertProject({
       name: projectName,
-      rootPath: gitSummary.repoRoot ?? thread.cwd,
-      gitRepoRoot: gitSummary.repoRoot,
-      gitRemote: gitSummary.remoteUrl,
-      defaultBranch: gitSummary.branchName,
+      rootPath: thread.cwd,
       feishuChatId: action.chatId || this.config.feishu.defaultChatId || null
     });
     this.repo.addProjectMatchRule({
@@ -834,20 +904,6 @@ export class TaskService {
       ruleType: "cwd_prefix",
       ruleValue: thread.cwd
     });
-    if (gitSummary.repoRoot) {
-      this.repo.addProjectMatchRule({
-        projectId: project.id,
-        ruleType: "git_repo_root",
-        ruleValue: gitSummary.repoRoot
-      });
-    }
-    if (gitSummary.remoteUrl) {
-      this.repo.addProjectMatchRule({
-        projectId: project.id,
-        ruleType: "git_remote",
-        ruleValue: gitSummary.remoteUrl
-      });
-    }
     const binding = this.repo.findBindingByThreadId(thread.id);
     if (binding) {
       this.repo.updateBindingProject(binding.id, project.id);
@@ -888,26 +944,11 @@ export class TaskService {
     if (!project) throw new Error("项目不存在");
     const detail = await this.codex.readThread(threadId, false);
     const thread = normalizeThreadFromDetail(threadId, detail);
-    const { gitSummary } = await this.classifyThreadContext(thread, this.repo.findBindingByThreadId(thread.id));
     if (thread.cwd) {
       this.repo.addProjectMatchRule({
         projectId,
         ruleType: "cwd_prefix",
         ruleValue: thread.cwd
-      });
-    }
-    if (gitSummary.repoRoot) {
-      this.repo.addProjectMatchRule({
-        projectId,
-        ruleType: "git_repo_root",
-        ruleValue: gitSummary.repoRoot
-      });
-    }
-    if (gitSummary.remoteUrl) {
-      this.repo.addProjectMatchRule({
-        projectId,
-        ruleType: "git_remote",
-        ruleValue: gitSummary.remoteUrl
       });
     }
     const binding = this.repo.findBindingByThreadId(threadId);
@@ -921,7 +962,12 @@ export class TaskService {
   private async openBoundTopic(action: FeishuCardAction): Promise<Record<string, unknown>> {
     const binding = this.requireBinding(action);
     await this.sendCardToTarget(this.targetForBinding(binding, action.chatId), this.cards.taskStatusCard(this.projection.buildTaskStatus(binding.id)));
-    return { ok: true, text: "已在这个任务绑定的话题里回发最新状态，可直接在那条回复链继续。"};
+    return {
+      ok: true,
+      text: binding.feishuContainerKind === "dedicated_chat"
+        ? "已在这个任务独立会话里回发最新状态，可直接在那个会话继续。"
+        : "已在这个任务绑定的话题里回发最新状态，可直接在那条回复链继续。"
+    };
   }
 
   private async sendTestNotification(action: FeishuCardAction): Promise<void> {
@@ -940,12 +986,6 @@ export class TaskService {
       this.targetForBinding(binding, action.chatId),
       this.cards.eventListCard(title, this.repo.listEventsForBinding(binding.id, 20))
     );
-  }
-
-  private async sendTaskDiff(action: FeishuCardAction): Promise<void> {
-    const binding = this.requireBinding(action);
-    const summary = binding.cwd ? await this.git.diffSummary(binding.cwd) : "当前任务没有可用工作目录。";
-    await this.sendTextToTarget(this.targetForBinding(binding, action.chatId), summary);
   }
 
   private async sendApprovalList(action: FeishuCardAction): Promise<void> {
@@ -977,6 +1017,10 @@ export class TaskService {
       eventType: "task.archived",
       eventPayload: {}
     });
+    await this.codex.archiveThread(binding.codexThreadId).catch((error) => {
+      this.logger.warn("codex thread archive failed", { bindingId, threadId: binding.codexThreadId, error: String(error) });
+    });
+    await this.updateTaskTitle(binding.id, "archived", binding.title ?? "Codex 任务");
     await this.updateTaskCard(binding.id);
   }
 
@@ -1016,7 +1060,8 @@ export class TaskService {
   private async stopTask(bindingId: string): Promise<void> {
     const binding = this.repo.findBindingById(bindingId);
     if (!binding) throw new Error("任务不存在");
-    await this.codex.interruptTurn(binding.codexThreadId);
+    if (!binding.lastTurnId) throw new Error("当前任务没有可中断的 turnId");
+    await this.codex.interruptTurn(binding.codexThreadId, binding.lastTurnId);
     this.repo.updateBindingStatus(binding.id, "interrupted");
     this.repo.insertEvent({
       sessionBindingId: binding.id,
@@ -1046,6 +1091,13 @@ export class TaskService {
    * approval and queue messages stay inside the same reply thread.
    */
   private targetForBinding(binding: SessionBinding, chatId?: string | null): FeishuReplyTarget {
+    if (binding.feishuContainerKind === "dedicated_chat") {
+      return {
+        chatId: binding.feishuChatId,
+        rootMessageId: null,
+        threadId: null
+      };
+    }
     return {
       chatId: chatId || binding.feishuChatId || this.config.feishu.defaultChatId || "",
       rootMessageId: binding.feishuTopicRootMessageId,
@@ -1202,24 +1254,34 @@ export class TaskService {
       if (!turnId) throw new Error("turn/completed notification missing turn.id");
       const status = normalizeTurnStatus(turn.status);
       this.repo.updateBindingStatus(binding.id, status, turnId);
-      const gitSummary = await this.git.summarize(binding.cwd);
+      const detail = await this.codex.readThread(threadId, true).catch(() => null);
+      const report =
+        status === "completed"
+          ? mergeThreadReports(
+              detail ? extractThreadReport(detail) : null,
+              extractTurnReport(turn),
+              extractEventReport(this.repo.listEventsForBinding(binding.id, 200), turnId)
+            ) ?? emptyThreadReport()
+          : null;
+      const finalResult = report?.finalResult ?? null;
+      const reasoningSummary = report?.reasoningSummary ?? null;
+      const summaryText =
+        status === "completed"
+          ? finalResult
+            ? truncate(singleLine(finalResult), 180)
+            : "已完成。需要细节时发送 /logs 查看任务记录。"
+          : `任务状态：${taskStatusText(status)}。发送 /logs 查看任务记录。`;
       const event = this.repo.insertEvent({
         sessionBindingId: binding.id,
         codexThreadId: threadId,
         codexTurnId: turnId,
         eventType: status === "completed" ? "task.completed" : `task.${status}`,
         eventPayload: {
-          text: status === "completed" ? "任务完成" : `任务状态：${status}`,
-          turn,
-          changedFiles: gitSummary.changedFiles
+          text: summaryText,
+          reasoningSummary,
+          finalResult,
+          turn
         }
-      });
-      this.repo.insertEvent({
-        sessionBindingId: binding.id,
-        codexThreadId: threadId,
-        codexTurnId: turnId,
-        eventType: "git.changed_files",
-        eventPayload: { count: gitSummary.changedFiles, statusText: gitSummary.statusText }
       });
       this.repo.enqueueOutbox({
         sessionBindingId: binding.id,
@@ -1231,7 +1293,45 @@ export class TaskService {
         payload: { card: this.cards.taskStatusCard(this.projection.buildTaskStatus(binding.id)) },
         dedupeKey: `turn:${threadId}:${turnId}:completed`
       });
+      if (status === "completed") {
+        await this.updateTaskTitle(binding.id, "completed", binding.title ?? "Codex 任务");
+        if (this.config.codex.autoArchiveOnCompletion) {
+          await this.codex.archiveThread(threadId).catch((error) => {
+            this.logger.warn("codex thread auto archive failed", { bindingId: binding.id, threadId, error: String(error) });
+          });
+        }
+      } else if (status === "failed" || status === "interrupted") {
+        await this.updateTaskTitle(binding.id, status, binding.title ?? "Codex 任务");
+      }
+      if (status === "completed" && report) {
+        this.repo.enqueueOutbox({
+          sessionBindingId: binding.id,
+          eventSeq: event.seq,
+          notificationType: "task_completed",
+          feishuChatId: binding.feishuChatId,
+          feishuTopicRootMessageId: binding.feishuTopicRootMessageId,
+          feishuThreadId: binding.feishuThreadId,
+          payload: { text: formatThreadReport(report) },
+          dedupeKey: `turn:${threadId}:${turnId}:result`
+        });
+      }
       await this.deliverNextQueuedMessage(binding.id);
+    }
+    if (method === "item/completed") {
+      const item = params.item && typeof params.item === "object" ? (params.item as Record<string, unknown>) : {};
+      const itemEvent = buildCompletedItemEvent(item);
+      if (itemEvent) {
+        this.repo.insertEvent({
+          sessionBindingId: binding.id,
+          codexThreadId: threadId,
+          codexTurnId: asString(params.turnId),
+          eventType: itemEvent.eventType,
+          eventPayload: {
+            itemId: asString(item.id) ?? asString(params.itemId),
+            text: itemEvent.text
+          }
+        });
+      }
     }
     if (method === "item/agentMessage/delta") {
       const delta = asString(params.delta);
@@ -1241,7 +1341,40 @@ export class TaskService {
           codexThreadId: threadId,
           codexTurnId: asString(params.turnId),
           eventType: "codex.agent_delta",
-          eventPayload: { text: truncate(delta, this.config.bridge.maxFeishuTextLength) }
+          eventPayload: {
+            itemId: asString(params.itemId),
+            text: truncate(delta, this.config.bridge.maxFeishuTextLength)
+          }
+        });
+      }
+    }
+    if (method === "item/plan/delta") {
+      const delta = asString(params.delta);
+      if (delta) {
+        this.repo.insertEvent({
+          sessionBindingId: binding.id,
+          codexThreadId: threadId,
+          codexTurnId: asString(params.turnId),
+          eventType: "codex.plan_delta",
+          eventPayload: {
+            itemId: asString(params.itemId),
+            text: truncate(delta, this.config.bridge.maxFeishuTextLength)
+          }
+        });
+      }
+    }
+    if (method === "item/reasoning/summaryTextDelta" || method === "item/reasoning/textDelta") {
+      const delta = asString(params.delta);
+      if (delta) {
+        this.repo.insertEvent({
+          sessionBindingId: binding.id,
+          codexThreadId: threadId,
+          codexTurnId: asString(params.turnId),
+          eventType: method === "item/reasoning/summaryTextDelta" ? "codex.reasoning_summary_delta" : "codex.reasoning_delta",
+          eventPayload: {
+            itemId: asString(params.itemId),
+            text: truncate(delta, this.config.bridge.maxFeishuTextLength)
+          }
         });
       }
     }
@@ -1273,13 +1406,22 @@ export class TaskService {
     this.repo.markQueuedDelivered(next.id);
     this.repo.updateBindingStatus(binding.id, "running");
     await this.codex.resumeThread(binding.codexThreadId);
-    await this.codex.startTurn(binding.codexThreadId, next.text, { cwd: binding.cwd });
+    const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
+    await this.codex.startTurn(binding.codexThreadId, next.text, {
+      cwd: binding.cwd,
+      model: projectModel(project, this.config),
+      reasoningEffort: projectReasoningEffort(project, this.config)
+    });
   }
 
   private async updateTaskCard(bindingId: string): Promise<void> {
     const binding = this.repo.findBindingById(bindingId);
     if (!binding) return;
     const projection = this.projection.buildTaskStatus(bindingId);
+    if (binding.feishuTaskCardMessageId) {
+      await this.feishu.updateCard(binding.feishuTaskCardMessageId, this.cards.taskStatusCard(projection));
+      return;
+    }
     this.repo.enqueueOutbox({
       sessionBindingId: binding.id,
       notificationType: "task_status",
@@ -1292,12 +1434,43 @@ export class TaskService {
         binding.id,
         projection.status,
         projection.lastTurnId ?? "no-turn",
-        projection.changedFiles,
         projection.queuedMessages,
         projection.pendingApprovals,
         stableSummaryKey(projection.lastSummary)
       ].join(":")
     });
+  }
+
+  private async updateTaskTitle(bindingId: string, status: TaskStatus, title: string): Promise<void> {
+    const binding = this.repo.findBindingById(bindingId);
+    if (!binding) return;
+    if (binding.feishuContainerKind === "dedicated_chat") {
+      try {
+        await this.feishu.updateChatName(binding.feishuChatId, buildTaskChatName(this.config, binding.feishuTopicRootMessageId, title, status));
+      } catch (error) {
+        this.logger.warn("feishu task chat title update failed", {
+          bindingId,
+          chatId: binding.feishuChatId,
+          error: String(error)
+        });
+      }
+      return;
+    }
+    await this.updateTopicTitle(bindingId, buildTopicTitle(title, status));
+  }
+
+  private async updateTopicTitle(bindingId: string, title: string): Promise<void> {
+    const binding = this.repo.findBindingById(bindingId);
+    if (!binding?.feishuTopicRootMessageId) return;
+    try {
+      await this.feishu.updateText(binding.feishuTopicRootMessageId, title);
+    } catch (error) {
+      this.logger.warn("feishu topic title update failed", {
+        bindingId,
+        rootMessageId: binding.feishuTopicRootMessageId,
+        error: String(error)
+      });
+    }
   }
 
   private latestStateFromHistory(bindingId: string): TaskStatus | null {
@@ -1317,7 +1490,6 @@ export class TaskService {
     id: string;
     name: string;
     rootPath: string;
-    branchName?: string | null;
     runningCount: number;
     pendingApprovals: number;
     completedCount: number;
@@ -1326,12 +1498,10 @@ export class TaskService {
     const runningCount = bindings.filter((binding) => binding.status === "running").length;
     const completedCount = bindings.filter((binding) => binding.status === "completed").length;
     const pendingApprovals = bindings.reduce((sum, binding) => sum + this.repo.listPendingApprovals(binding.id).length, 0);
-    const recentBinding = bindings[0] ?? null;
     return {
       id: project.id,
       name: project.name,
       rootPath: project.rootPath,
-      branchName: recentBinding?.branchName ?? project.defaultBranch,
       runningCount,
       pendingApprovals,
       completedCount
@@ -1342,6 +1512,25 @@ export class TaskService {
 const summarizeTitle = (text: string): string => {
   const compact = text.replace(/\s+/g, " ").trim();
   return compact.length > 40 ? `${compact.slice(0, 40)}...` : compact || "Codex 任务";
+};
+
+const buildTaskChatName = (config: BridgeConfig, key: string, title: string, status: TaskStatus = "running"): string => {
+  const prefix = config.feishu.taskChatNamePrefix || "C";
+  const index = key.replace(/[^a-z0-9]/gi, "").slice(-6).toUpperCase() || "TASK";
+  const statusPrefix = taskStatusPrefix(status);
+  return truncatePlain(`${statusPrefix}${prefix}-${index} ${title}`, 60);
+};
+
+const buildTopicTitle = (title: string, status: TaskStatus): string =>
+  status === "running" ? title : `${taskStatusPrefix(status)}${title}`;
+
+const taskStatusPrefix = (status: TaskStatus): string => {
+  if (status === "completed" || status === "archived") return "[完成] ";
+  if (status === "failed") return "[失败] ";
+  if (status === "interrupted") return "[中断] ";
+  if (status === "waiting_for_approval") return "[确认] ";
+  if (status === "running") return "[运行中] ";
+  return "";
 };
 
 const normalizeTurnStatus = (status: unknown): TaskStatus => {
@@ -1358,14 +1547,39 @@ const extractTurnId = (result: Record<string, unknown>): string | null => {
   return typeof id === "string" ? id : null;
 };
 
+const projectModel = (project: Project | null, config: BridgeConfig): string =>
+  project?.defaultModel ?? config.codex.defaultModel;
+
+const projectReasoningEffort = (project: Project | null, config: BridgeConfig): string =>
+  project?.defaultReasoningEffort ?? config.codex.defaultReasoningEffort;
+
+const taskStatusText = (status: TaskStatus): string =>
+  ({
+    draft: "草稿",
+    waiting_for_prompt: "等待任务描述",
+    running: "运行中",
+    waiting_for_approval: "等待确认",
+    idle: "可继续",
+    completed: "任务完成",
+    failed: "任务失败",
+    interrupted: "已中断",
+    archived: "已归档"
+  })[status] ?? status;
+
 const truncate = (text: string, max: number): string => (text.length > max ? `${text.slice(0, max - 20)}\n...(已截断)` : text);
+
+const truncatePlain = (text: string, max: number): string => {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= max) return compact;
+  return `${compact.slice(0, Math.max(1, max - 3)).trimEnd()}...`;
+};
 
 const isTerminalStatus = (status: TaskStatus): boolean =>
   status === "completed" || status === "failed" || status === "interrupted" || status === "archived";
 
 const isCommandText = (text: string): boolean =>
   text.startsWith("/") ||
-  ["项目列表", "查看进度", "查看日志", "查看变更", "查看队列", "通知历史", "发送测试通知", "未归类任务"].includes(text);
+  ["项目列表", "查看进度", "查看日志", "查看队列", "通知历史", "发送测试通知", "未归类任务"].includes(text);
 
 const normalizeCommand = (value: string): string => {
   const lowered = value.trim().toLowerCase().replace(/^\/+/, "");
@@ -1386,9 +1600,6 @@ const normalizeCommand = (value: string): string => {
     "查看日志": "logs",
     logs: "logs",
     log: "logs",
-    "查看变更": "diff",
-    diff: "diff",
-    changes: "diff",
     "查看队列": "queue",
     queue: "queue",
     claim: "claim",
@@ -1425,7 +1636,7 @@ const requireArgument = (value: string | undefined, usage: string): string => {
 
 const requireCurrentBindingId = (binding: SessionBinding | null, command: string): string => {
   if (binding) return binding.id;
-  throw new Error(`/${command} 需要在已绑定的任务话题里发送。`);
+  throw new Error(`/${command} 需要在已绑定的任务会话里发送。`);
 };
 
 const shouldAckCommand = (action: string): boolean =>
@@ -1460,29 +1671,260 @@ const summarizeThreadDetail = (detail: Record<string, unknown>): string => {
   const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
   const turnObject = lastTurn && typeof lastTurn === "object" ? (lastTurn as Record<string, unknown>) : null;
   const items = Array.isArray(turnObject?.items) ? (turnObject?.items as unknown[]) : [];
-  const agentMessages = items
+  const report = extractThreadReport(detail);
+  const commandCount = items
     .filter((item) => item && typeof item === "object")
     .map((item) => item as Record<string, unknown>)
-    .filter((item) => item.type === "agentMessage" && typeof item.text === "string")
-    .map((item) => String(item.text).trim())
-    .filter(Boolean);
-  const commandItems = items
-    .filter((item) => item && typeof item === "object")
-    .map((item) => item as Record<string, unknown>)
-    .filter((item) => item.type === "commandExecution");
-  const commands = commandItems
-    .map((item) => (typeof item.command === "string" ? item.command.trim() : ""))
-    .filter(Boolean)
-    .slice(-3);
+    .filter((item) => item.type === "commandExecution").length;
   const status = typeof turnObject?.status === "string" ? turnObject.status : null;
   const lines = [
     turns.length > 0 ? `历史轮次：${turns.length}` : "历史轮次：0",
     status ? `最近一轮：${status}` : null,
-    commands.length > 0 ? `最近命令：${commands.join(" | ")}` : null,
-    agentMessages.length > 0 ? `最近回复：${truncate(agentMessages[agentMessages.length - 1]!, 600)}` : "最近回复：暂无"
+    commandCount > 0 ? `最近执行步骤：${commandCount} 个` : null,
+    report?.reasoningSummary ? `处理摘要：${report.reasoningSummary}` : null,
+    report?.finalResult ? `最近结论：${report.finalResult}` : "最近结论：暂无"
   ].filter(Boolean);
   return lines.join("\n");
 };
+
+type ThreadReport = {
+  reasoningSummary: string | null;
+  finalResult: string | null;
+};
+
+const emptyThreadReport = (): ThreadReport => ({
+  reasoningSummary: null,
+  finalResult: null
+});
+
+const mergeThreadReports = (...reports: Array<ThreadReport | null>): ThreadReport | null => {
+  const finalResult = firstPresent(reports.map((report) => report?.finalResult ?? null));
+  const reasoningSummary = firstPresent(reports.map((report) => report?.reasoningSummary ?? null));
+  if (!finalResult && !reasoningSummary) return null;
+  return { reasoningSummary, finalResult };
+};
+
+const extractThreadReport = (detail: Record<string, unknown>): ThreadReport | null => {
+  const rawThread = detail.thread && typeof detail.thread === "object" ? (detail.thread as Record<string, unknown>) : detail;
+  const turns = Array.isArray(rawThread.turns) ? rawThread.turns : [];
+  const reasoning: string[] = [];
+  const finalMessages: string[] = [];
+  const plans: string[] = [];
+  for (let turnIndex = turns.length - 1; turnIndex >= 0; turnIndex -= 1) {
+    const turn = turns[turnIndex];
+    if (!turn || typeof turn !== "object") continue;
+    const items = Array.isArray((turn as Record<string, unknown>).items) ? ((turn as Record<string, unknown>).items as unknown[]) : [];
+    for (let itemIndex = items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+      const item = items[itemIndex];
+      if (!item || typeof item !== "object") continue;
+      const object = item as Record<string, unknown>;
+      const type = asString(object.type);
+      if (type === "agentMessage") {
+        const text = extractTextFromUnknown(object);
+        if (text) finalMessages.push(text);
+        continue;
+      }
+      if (type === "reasoning") {
+        const summary = extractTextArray(object.summary);
+        const content = extractTextArray(object.content);
+        if (summary) reasoning.push(summary);
+        else if (content) reasoning.push(content);
+        continue;
+      }
+      if (type === "plan") {
+        const text = extractTextFromUnknown(object);
+        if (text) plans.push(text);
+      }
+    }
+    if (finalMessages.length > 0) break;
+  }
+  const finalResult = firstSanitized(finalMessages);
+  const reasoningSummary = firstSanitized(reasoning) ?? firstSanitized(plans);
+  if (!finalResult && !reasoningSummary) return null;
+  return { reasoningSummary, finalResult };
+};
+
+const extractTurnReport = (turn: Record<string, unknown>): ThreadReport | null => {
+  const items = Array.isArray(turn.items) ? turn.items : [];
+  return extractReportFromItems(items);
+};
+
+const extractReportFromItems = (items: unknown[]): ThreadReport | null => {
+  const reasoning: string[] = [];
+  const finalMessages: string[] = [];
+  const plans: string[] = [];
+  for (let itemIndex = items.length - 1; itemIndex >= 0; itemIndex -= 1) {
+    const item = items[itemIndex];
+    if (!item || typeof item !== "object") continue;
+    const object = item as Record<string, unknown>;
+    const type = asString(object.type);
+    if (type === "agentMessage") {
+      const text = extractTextFromUnknown(object);
+      if (text) finalMessages.push(text);
+      continue;
+    }
+    if (type === "reasoning") {
+      const summary = extractTextArray(object.summary);
+      const content = extractTextArray(object.content);
+      if (summary) reasoning.push(summary);
+      else if (content) reasoning.push(content);
+      continue;
+    }
+    if (type === "plan") {
+      const text = extractTextFromUnknown(object);
+      if (text) plans.push(text);
+    }
+  }
+  const finalResult = firstSanitized(finalMessages);
+  const reasoningSummary = firstSanitized(reasoning) ?? firstSanitized(plans);
+  if (!finalResult && !reasoningSummary) return null;
+  return { reasoningSummary, finalResult };
+};
+
+const extractEventReport = (events: Array<{ codexTurnId: string | null; eventType: string; eventPayload: Record<string, unknown>; seq: number }>, turnId: string): ThreadReport | null => {
+  const currentTurnEvents = events.filter((event) => !event.codexTurnId || event.codexTurnId === turnId);
+  const completedAgent = latestSanitizedEventText(currentTurnEvents, "codex.agent_message");
+  const agentDelta = firstSanitized([joinDeltaEvents(currentTurnEvents, "codex.agent_delta")].filter(Boolean) as string[]);
+  const reasoningCompleted =
+    latestSanitizedEventText(currentTurnEvents, "codex.reasoning_summary") ??
+    latestSanitizedEventText(currentTurnEvents, "codex.reasoning");
+  const reasoningDelta = firstSanitized(
+    [
+      joinDeltaEvents(currentTurnEvents, "codex.reasoning_summary_delta"),
+      joinDeltaEvents(currentTurnEvents, "codex.reasoning_delta")
+    ].filter(Boolean) as string[]
+  );
+  const planCompleted = latestSanitizedEventText(currentTurnEvents, "codex.plan");
+  const planDelta = firstSanitized([joinDeltaEvents(currentTurnEvents, "codex.plan_delta")].filter(Boolean) as string[]);
+  const finalResult = completedAgent ?? agentDelta;
+  const reasoningSummary = reasoningCompleted ?? reasoningDelta ?? planCompleted ?? planDelta;
+  if (!finalResult && !reasoningSummary) return null;
+  return { reasoningSummary, finalResult };
+};
+
+const buildCompletedItemEvent = (item: Record<string, unknown>): { eventType: string; text: string } | null => {
+  const type = asString(item.type);
+  if (type === "agentMessage") {
+    const text = extractTextFromUnknown(item);
+    return text ? { eventType: "codex.agent_message", text: truncate(text, 2000) } : null;
+  }
+  if (type === "plan") {
+    const text = extractTextFromUnknown(item);
+    return text ? { eventType: "codex.plan", text: truncate(text, 2000) } : null;
+  }
+  if (type === "reasoning") {
+    const summary = extractTextArray(item.summary);
+    const content = extractTextArray(item.content);
+    const text = summary ?? content;
+    if (!text) return null;
+    return { eventType: summary ? "codex.reasoning_summary" : "codex.reasoning", text: truncate(text, 2000) };
+  }
+  return null;
+};
+
+const formatThreadReport = (report: ThreadReport): string => {
+  const lines = [
+    "处理完成",
+    report.reasoningSummary ? `处理摘要：\n${report.reasoningSummary}` : "处理摘要：未提取到可展示的步骤摘要。",
+    report.finalResult ? `最终结论：\n${report.finalResult}` : "最终结论：未提取到最终回复文本，请发送 /logs 查看本地任务记录。"
+  ];
+  return lines.join("\n\n");
+};
+
+const firstSanitized = (items: string[]): string | null => {
+  for (const item of items) {
+    const sanitized = sanitizeAssistantSummary(item);
+    if (sanitized && sanitized !== "有输出，原始内容已保留在本地记录中。") return sanitized;
+  }
+  return null;
+};
+
+const firstPresent = (items: Array<string | null>): string | null => {
+  for (const item of items) {
+    if (item && item.trim()) return item.trim();
+  }
+  return null;
+};
+
+const latestSanitizedEventText = (
+  events: Array<{ eventType: string; eventPayload: Record<string, unknown>; seq: number }>,
+  eventType: string
+): string | null => {
+  const matched = [...events]
+    .filter((event) => event.eventType === eventType)
+    .sort((left, right) => right.seq - left.seq);
+  for (const event of matched) {
+    const text = asString(event.eventPayload.text);
+    if (!text) continue;
+    const sanitized = sanitizeAssistantSummary(text);
+    if (sanitized && sanitized !== "有输出，原始内容已保留在本地记录中。") return sanitized;
+  }
+  return null;
+};
+
+const joinDeltaEvents = (
+  events: Array<{ eventType: string; eventPayload: Record<string, unknown>; seq: number }>,
+  eventType: string
+): string | null => {
+  const grouped = new Map<string, Array<{ seq: number; text: string }>>();
+  for (const event of events) {
+    if (event.eventType !== eventType) continue;
+    const text = asString(event.eventPayload.text);
+    if (!text) continue;
+    const itemId = asString(event.eventPayload.itemId) ?? "default";
+    const group = grouped.get(itemId) ?? [];
+    group.push({ seq: event.seq, text });
+    grouped.set(itemId, group);
+  }
+  const candidates = [...grouped.values()]
+    .map((group) => group.sort((left, right) => left.seq - right.seq).map((entry) => entry.text).join(""))
+    .filter((text) => text.trim().length > 0);
+  return candidates.length > 0 ? candidates[candidates.length - 1]!.trim() : null;
+};
+
+const extractTextArray = (value: unknown): string | null => {
+  if (!Array.isArray(value)) return null;
+  const text = value
+    .map((entry) => {
+      if (typeof entry === "string") return entry;
+      if (entry && typeof entry === "object") return extractTextFromUnknown(entry as Record<string, unknown>);
+      return "";
+    })
+    .filter(Boolean)
+    .join("\n");
+  return text.trim() || null;
+};
+
+const extractTextFromUnknown = (value: unknown): string | null => {
+  if (typeof value === "string") return value.trim() || null;
+  if (!value || typeof value !== "object") return null;
+  const object = value as Record<string, unknown>;
+  for (const key of ["text", "content", "message", "delta", "summary"]) {
+    const raw = object[key];
+    if (typeof raw === "string" && raw.trim()) return raw.trim();
+    const arrayText = extractTextArray(raw);
+    if (arrayText) return arrayText;
+  }
+  return null;
+};
+
+const sanitizeAssistantSummary = (text: string): string => {
+  const withoutCodeBlocks = text.replace(/```[\s\S]*?```/g, "[代码块已省略]");
+  const compact = withoutCodeBlocks
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !looksLikeCommandLine(line))
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return truncate(compact || "有输出，原始内容已保留在本地记录中。", 360);
+};
+
+const singleLine = (text: string): string => text.replace(/\s+/g, " ").trim();
+
+const looksLikeCommandLine = (line: string): boolean =>
+  /(?:powershell|pwsh|cmd\.exe|node|npm|pnpm|yarn|python|git|rg|Get-Content|Get-ChildItem|Select-String)/i.test(line) ||
+  line.length > 180;
 
 const inferProjectName = (cwd: string, fallback: string): string => {
   const normalized = cwd.replace(/[\\/]+$/, "");

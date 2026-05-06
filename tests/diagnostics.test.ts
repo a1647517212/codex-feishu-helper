@@ -7,6 +7,7 @@ test("diagnostics distinguishes normal group chat from full topic-mode group", a
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
+    config.feishu.taskContainerMode = "topic";
     const diagnostics = new DiagnosticsService(config, repo, new MockCodex() as any, {
       async getChatInfo() {
         return {
@@ -36,6 +37,7 @@ test("diagnostics reports topic-mode group as full topic UX", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
+    config.feishu.taskContainerMode = "topic";
     const diagnostics = new DiagnosticsService(config, repo, new MockCodex() as any, {
       async getChatInfo() {
         return {

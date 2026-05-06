@@ -1,6 +1,7 @@
 import { resolve, sep } from "node:path";
 import type { BridgeConfig } from "../config.js";
 import type { FeishuIncomingMessage } from "../core/types.js";
+import type { Repository } from "../db/repo.js";
 
 const secretFilePatterns = [
   /(^|[\\/])\.env([\\/.]|$)/i,
@@ -14,7 +15,10 @@ const secretFilePatterns = [
 ];
 
 export class SecurityPolicy {
-  constructor(private readonly config: BridgeConfig) {}
+  constructor(
+    private readonly config: BridgeConfig,
+    private readonly repo?: Repository
+  ) {}
 
   assertFeishuMessageAllowed(message: FeishuIncomingMessage): void {
     this.assertFeishuAllowed(message.userId, message.chatId);
@@ -27,6 +31,7 @@ export class SecurityPolicy {
       throw new Error("Feishu user is not allowed to control this bridge.");
     }
     if (allowedChats.length > 0 && !allowedChats.includes(chatId)) {
+      if (this.repo?.findBindingByChatId(chatId)) return;
       throw new Error("Feishu chat is not allowed to control this bridge.");
     }
   }

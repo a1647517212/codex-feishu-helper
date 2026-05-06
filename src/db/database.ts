@@ -12,11 +12,12 @@ export class BridgeDatabase {
 
   migrate(): void {
     this.db.exec(schemaSql);
-    ensureColumn(this.db, "projects", "git_repo_root", "TEXT");
-    ensureColumn(this.db, "projects", "git_remote", "TEXT");
-    ensureColumn(this.db, "projects", "default_branch", "TEXT");
+    ensureColumn(this.db, "projects", "default_reasoning_effort", "TEXT");
     ensureColumn(this.db, "projects", "notification_policy", "TEXT");
     ensureColumn(this.db, "session_bindings", "feishu_thread_id", "TEXT");
+    ensureColumn(this.db, "session_bindings", "feishu_task_card_message_id", "TEXT");
+    ensureColumn(this.db, "session_bindings", "feishu_container_kind", "TEXT NOT NULL DEFAULT 'topic'");
+    ensureColumn(this.db, "session_bindings", "feishu_control_chat_id", "TEXT");
     ensureColumn(this.db, "notification_outbox", "feishu_thread_id", "TEXT");
   }
 
@@ -42,10 +43,8 @@ CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   root_path TEXT NOT NULL,
-  git_repo_root TEXT,
-  git_remote TEXT,
-  default_branch TEXT,
   default_model TEXT,
+  default_reasoning_effort TEXT,
   approval_policy TEXT,
   sandbox_policy TEXT,
   feishu_chat_id TEXT,
@@ -62,11 +61,11 @@ CREATE TABLE IF NOT EXISTS session_bindings (
   feishu_chat_id TEXT NOT NULL,
   feishu_topic_root_message_id TEXT NOT NULL,
   feishu_thread_id TEXT,
+  feishu_task_card_message_id TEXT,
+  feishu_container_kind TEXT NOT NULL DEFAULT 'topic',
+  feishu_control_chat_id TEXT,
   title TEXT,
   cwd TEXT,
-  git_repo_root TEXT,
-  branch_name TEXT,
-  worktree_path TEXT,
   status TEXT NOT NULL,
   last_turn_id TEXT,
   last_event_cursor TEXT,
@@ -216,7 +215,6 @@ CREATE TABLE IF NOT EXISTS ignored_threads (
   codex_thread_id TEXT PRIMARY KEY,
   title TEXT,
   cwd TEXT,
-  git_repo_root TEXT,
   reason TEXT,
   created_by_feishu_user_id TEXT,
   created_at TEXT NOT NULL

@@ -71,7 +71,7 @@ export class CardRenderer {
       );
       const actionsForThread = thread.claimed
         ? [
-            button("打开话题", "open_bound_topic", {
+            button("打开任务", "open_bound_topic", {
               bindingId: thread.bindingId,
               rootMessageId: thread.rootMessageId ?? thread.bindingId
             }),
@@ -103,7 +103,6 @@ export class CardRenderer {
     id: string;
     name: string;
     rootPath: string;
-    branchName?: string | null;
     runningCount: number;
     pendingApprovals: number;
     completedCount: number;
@@ -112,7 +111,6 @@ export class CardRenderer {
       text(
         [
           `路径：${project.rootPath}`,
-          project.branchName ? `分支：${project.branchName}` : null,
           `运行中：${project.runningCount}`,
           `待确认：${project.pendingApprovals}`,
           `最近完成：${project.completedCount}`
@@ -123,7 +121,6 @@ export class CardRenderer {
       maybeActions(this.interactionMode, [
         button("新建任务", "new_task", { projectId: project.id }),
         button("接管任务", "claim_sessions", { projectId: project.id }),
-        button("查看变更", "project_diff", { projectId: project.id }),
         button("运行中任务", "project_running", { projectId: project.id })
       ])
     ].filter(Boolean) as Record<string, unknown>[];
@@ -134,11 +131,9 @@ export class CardRenderer {
     const lines = [
       `状态：${statusText(projection.status)}`,
       `项目：${projection.projectName}`,
-      projection.branchName ? `分支：${projection.branchName}` : null,
-      `变更：${projection.changedFiles} 个文件`,
       projection.queuedMessages > 0 ? `队列：${projection.queuedMessages} 条后续要求` : null,
       projection.pendingApprovals > 0 ? `待确认：${projection.pendingApprovals} 项` : null,
-      projection.lastSummary ? `摘要：${projection.lastSummary}` : null,
+      projection.lastSummary ? `结论：${projection.lastSummary}` : null,
       commandHintForStatus(projection.status)
     ].filter(Boolean);
     const elements = [
@@ -228,16 +223,7 @@ export class CardRenderer {
     return card(
       title,
       events.slice(0, 12).map((event) =>
-        text(
-          [
-            `#${event.seq} ${event.eventType}`,
-            event.codexTurnId ? `turn：${event.codexTurnId}` : null,
-            event.eventPayload.text ? `内容：${String(event.eventPayload.text)}` : null,
-            `时间：${event.createdAt}`
-          ]
-            .filter(Boolean)
-            .join("\n")
-        )
+        text(formatEventSummary(event))
       )
     );
   }
@@ -364,6 +350,7 @@ export class CardRenderer {
           `消息接入：${snapshot.feishuMessageTransport === "long_connection" ? "长连接" : "HTTP 回调"}`,
           `卡片回调：${snapshot.feishuCardActionTransport === "long_connection" ? "长连接" : "HTTP 回调"}`,
           `交互模式：${interactionModeText(snapshot.feishuInteractionMode)}`,
+          `任务承载：${snapshot.feishuTaskContainerMode === "dedicated_chat" ? "一任务一独立会话" : "主控群内话题"}`,
           `默认群：${chatDiagnosticText(snapshot)}`,
           `运行中任务：${snapshot.runningTasksCount}`,
           `待确认：${snapshot.pendingApprovalsCount}`,
@@ -455,12 +442,11 @@ const taskButtons = (status: string): [string, string][] => {
     case "waiting_for_approval":
       return [
         ["查看详情", "approval_list"],
-        ["查看变更", "task_diff"],
         ["停止任务", "task_stop"]
       ];
     case "completed":
       return [
-        ["查看变更", "task_diff"],
+        ["查看日志", "task_logs"],
         ["继续处理", "task_continue"],
         ["新建相关任务", "new_related_task"],
         ["归档", "task_archive"]
@@ -476,7 +462,7 @@ const taskButtons = (status: string): [string, string][] => {
       return [
         ["继续处理", "task_continue"],
         ["跑测试", "task_run_tests"],
-        ["查看变更", "task_diff"],
+        ["查看日志", "task_logs"],
         ["归档", "task_archive"]
       ];
   }
@@ -487,15 +473,49 @@ const commandHintForStatus = (status: string): string => {
     case "running":
       return "命令：/status、/queue、/stop；直接回复可追加要求";
     case "waiting_for_approval":
-      return "命令：/approval list、/diff、/stop";
+      return "命令：/approval list、/logs、/stop";
     case "completed":
-      return "命令：/diff、/archive；直接回复可继续处理";
+      return "命令：/logs、/archive；直接回复可继续处理";
     case "failed":
       return "命令：/retry、/analyze-failure、/logs、/stop";
     default:
-      return "命令：/status、/run-tests、/diff、/archive；直接回复可继续处理";
+      return "命令：/status、/run-tests、/logs、/archive；直接回复可继续处理";
   }
 };
+
+const formatEventSummary = (event: TaskEvent): string => {
+  const lines = [
+    `#${event.seq} ${eventLabel(event.eventType)}`,
+    event.codexTurnId ? `轮次：${event.codexTurnId}` : null,
+    event.eventType === "codex.agent_delta"
+      ? "内容：Codex 有新的处理输出，原始内容已保留在本地记录中。"
+      : safeEventText(event.eventPayload.text),
+    `时间：${event.createdAt}`
+  ].filter(Boolean);
+  return lines.join("\n");
+};
+
+const safeEventText = (value: unknown): string | null => {
+  if (typeof value !== "string") return null;
+  const compact = value.replace(/\s+/g, " ").trim();
+  if (!compact) return null;
+  return `内容：${truncate(compact, 240)}`;
+};
+
+const eventLabel = (type: string): string =>
+  ({
+    "task.created_from_feishu": "收到任务",
+    "turn.started": "开始处理",
+    "turn.requested_from_feishu": "继续处理",
+    "turn.steer_requested_from_feishu": "追加要求",
+    "codex.agent_delta": "处理中",
+    "task.completed": "处理完成",
+    "task.failed": "处理失败",
+    "task.interrupted": "已中断",
+    "approval.requested": "等待确认",
+    "approval.resolved": "确认完成",
+    "queue.cancelled": "队列已取消"
+  })[type] ?? type;
 
 const statusText = (status: string): string => {
   const map: Record<string, string> = {

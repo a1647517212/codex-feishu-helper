@@ -44,6 +44,7 @@ test("long connection adapter maps message and card events into task service cal
       messageId: "om_1",
       chatId: "oc_1",
       rootMessageId: "om_root",
+      parentMessageId: null,
       threadId: "omt_1",
       userId: "ou_1",
       text: "继续处理",

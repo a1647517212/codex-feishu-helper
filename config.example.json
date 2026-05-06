@@ -13,7 +13,10 @@
     "args": ["app-server"],
     "experimentalApi": true,
     "defaultModel": "gpt-5.4",
-    "defaultReasoningEffort": "medium",
+    "defaultReasoningEffort": "xhigh",
+    "defaultSandboxMode": "danger-full-access",
+    "defaultApprovalPolicy": "never",
+    "autoArchiveOnCompletion": true,
     "serviceName": "feishu_codex_bridge"
   },
   "feishu": {
@@ -26,6 +29,11 @@
     "messageTransport": "long_connection",
     "cardActionTransport": "long_connection",
     "interactionMode": "hybrid",
+    "taskContainerMode": "dedicated_chat",
+    "taskChatNamePrefix": "C",
+    "taskChatType": "private",
+    "taskChatFallbackToTopic": true,
+    "taskChatSetBotManager": true,
     "allowedUserIds": ["${FEISHU_ALLOWED_USER_IDS}"],
     "allowedChatIds": ["${FEISHU_ALLOWED_CHAT_IDS}"]
   },
