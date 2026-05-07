@@ -389,7 +389,7 @@ test("completed notification sends result from completed item when thread read h
         }
       }
     });
-    const result = repo.listDueOutbox(10).find((item) => typeof item.payload.text === "string");
+    const result = repo.listDueOutbox(10).find((item) => item.notificationType === "task_completed" && typeof item.payload.text === "string");
     assert.ok(result);
     assert.equal(String(result.payload.text).includes("处理摘要"), true);
     assert.equal(String(result.payload.text).includes("先检查输入，再整理结论。"), true);
@@ -452,10 +452,109 @@ test("completed notification sends result from streamed deltas when read and tur
         }
       }
     });
-    const result = repo.listDueOutbox(10).find((item) => typeof item.payload.text === "string");
+    const result = repo.listDueOutbox(10).find((item) => item.notificationType === "task_completed" && typeof item.payload.text === "string");
     assert.ok(result);
     assert.equal(String(result.payload.text).includes("先确认目标，再输出结果。"), true);
     assert.equal(String(result.payload.text).includes("已完成并给出结论。"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("running deltas enqueue readable progress updates for Feishu", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_progress",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Progress task",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "item/plan/delta",
+      params: {
+        threadId: binding.codexThreadId,
+        turnId: "turn_progress",
+        itemId: "plan_1",
+        delta: "先确认输入和当前代码状态，再定位飞书进度消息缺失原因。"
+      }
+    });
+    await codex.notifications.notification![0]!({
+      method: "item/reasoning/summaryTextDelta",
+      params: {
+        threadId: binding.codexThreadId,
+        turnId: "turn_progress",
+        itemId: "rs_1",
+        delta: "已经定位到事件只写入本地记录，没有进入飞书发送队列。"
+      }
+    });
+    const progress = repo.listDueOutbox(10).filter((item) => item.notificationType === "task_progress");
+    assert.equal(progress.length, 2);
+    assert.equal(progress.some((item) => String(item.payload.text).includes("进行中：处理步骤")), true);
+    assert.equal(progress.some((item) => String(item.payload.text).includes("进行中：处理摘要")), true);
+    assert.equal(progress.every((item) => item.feishuChatId === "task_chat_1"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("completed notification keeps long final result for outbox chunking", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    const longFinal = Array.from({ length: 80 }, (_, index) => `第${index + 1}条建议：这部分最终结论需要完整回传到飞书。`).join("\n");
+    codex.threads = [
+      {
+        id: "thr_long_result",
+        name: "Long result",
+        preview: "Long result",
+        cwd: dir,
+        status: { type: "idle" },
+        turns: [
+          {
+            id: "turn_long_result",
+            status: "completed",
+            items: [
+              { type: "reasoning", summary: ["整理长结论并保留完整文本。"], content: [] },
+              { type: "agentMessage", text: longFinal }
+            ]
+          }
+        ],
+        updatedAt: Date.now()
+      }
+    ];
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_long_result",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Long result",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: {
+          id: "turn_long_result",
+          status: "completed",
+          items: []
+        }
+      }
+    });
+    const result = repo.listDueOutbox(10).find((item) => typeof item.payload.text === "string");
+    assert.ok(result);
+    assert.equal(String(result.payload.text).includes("第80条建议"), true);
+    assert.equal(String(result.payload.text).includes("...(已截断)"), false);
   } finally {
     cleanup();
   }

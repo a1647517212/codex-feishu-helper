@@ -41,6 +41,7 @@ export type NotificationType =
   | "project_unclassified"
   | "console"
   | "diagnostic"
+  | "task_progress"
   | "task_status";
 
 export interface Project {

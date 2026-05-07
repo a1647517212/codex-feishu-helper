@@ -31,6 +31,7 @@ export class TaskService {
   private readonly cards: CardRenderer;
   private readonly projection: ProjectionBuilder;
   private readonly security: SecurityPolicy;
+  private readonly progressState = new Map<string, { text: string; lastSentLength: number; lastSentAt: number }>();
 
   constructor(
     private readonly config: BridgeConfig,
@@ -1327,7 +1328,7 @@ export class TaskService {
     if (method === "item/agentMessage/delta") {
       const delta = asString(params.delta);
       if (delta) {
-        this.repo.insertEvent({
+        const event = this.repo.insertEvent({
           sessionBindingId: binding.id,
           codexThreadId: threadId,
           codexTurnId: asString(params.turnId),
@@ -1337,12 +1338,13 @@ export class TaskService {
             text: truncate(delta, this.config.bridge.maxFeishuTextLength)
           }
         });
+        this.enqueueProgressUpdate(binding, event.seq, "阶段性回复", asString(params.turnId), asString(params.itemId), delta);
       }
     }
     if (method === "item/plan/delta") {
       const delta = asString(params.delta);
       if (delta) {
-        this.repo.insertEvent({
+        const event = this.repo.insertEvent({
           sessionBindingId: binding.id,
           codexThreadId: threadId,
           codexTurnId: asString(params.turnId),
@@ -1352,12 +1354,13 @@ export class TaskService {
             text: truncate(delta, this.config.bridge.maxFeishuTextLength)
           }
         });
+        this.enqueueProgressUpdate(binding, event.seq, "处理步骤", asString(params.turnId), asString(params.itemId), delta);
       }
     }
     if (method === "item/reasoning/summaryTextDelta" || method === "item/reasoning/textDelta") {
       const delta = asString(params.delta);
       if (delta) {
-        this.repo.insertEvent({
+        const event = this.repo.insertEvent({
           sessionBindingId: binding.id,
           codexThreadId: threadId,
           codexTurnId: asString(params.turnId),
@@ -1367,8 +1370,83 @@ export class TaskService {
             text: truncate(delta, this.config.bridge.maxFeishuTextLength)
           }
         });
+        this.enqueueProgressUpdate(binding, event.seq, "处理摘要", asString(params.turnId), asString(params.itemId), delta);
       }
     }
+    if (method === "turn/plan/updated") {
+      const planText = formatPlanProgress(params.plan);
+      if (planText) {
+        const event = this.repo.insertEvent({
+          sessionBindingId: binding.id,
+          codexThreadId: threadId,
+          codexTurnId: asString(params.turnId),
+          eventType: "codex.plan_updated",
+          eventPayload: { text: planText }
+        });
+        this.enqueueProgressUpdate(binding, event.seq, "处理步骤", asString(params.turnId), "plan-updated", planText, { force: true, replace: true });
+      }
+    }
+    if (method === "item/mcpToolCall/progress") {
+      const messageText = asString(params.message);
+      if (messageText) {
+        const event = this.repo.insertEvent({
+          sessionBindingId: binding.id,
+          codexThreadId: threadId,
+          codexTurnId: asString(params.turnId),
+          eventType: "codex.tool_progress",
+          eventPayload: {
+            itemId: asString(params.itemId),
+            text: truncate(messageText, this.config.bridge.maxFeishuTextLength)
+          }
+        });
+        this.enqueueProgressUpdate(binding, event.seq, "工具进度", asString(params.turnId), asString(params.itemId), messageText);
+      }
+    }
+  }
+
+  private enqueueProgressUpdate(
+    binding: SessionBinding,
+    eventSeq: number,
+    label: string,
+    turnId: string | null,
+    itemId: string | null,
+    delta: string,
+    options: { force?: boolean; replace?: boolean } = {}
+  ): void {
+    if (!delta.trim() || looksLikeCommandLine(delta.trim())) return;
+    const key = `${binding.id}:${turnId ?? "no-turn"}:${itemId ?? label}:${label}`;
+    const current = this.progressState.get(key) ?? { text: "", lastSentLength: 0, lastSentAt: 0 };
+    const nextText = options.replace ? delta.trim() : `${current.text}${delta}`.trim();
+    const visible = sanitizeProgressText(nextText);
+    if (!visible || visible === "有输出，原始内容已保留在本地记录中。") {
+      this.progressState.set(key, { ...current, text: nextText });
+      return;
+    }
+    const now = Date.now();
+    const shouldSend =
+      options.force ||
+      current.lastSentLength === 0 ||
+      visible.length - current.lastSentLength >= 120 ||
+      now - current.lastSentAt >= 8000;
+    if (!shouldSend) {
+      this.progressState.set(key, { ...current, text: nextText });
+      return;
+    }
+    this.progressState.set(key, {
+      text: nextText,
+      lastSentLength: visible.length,
+      lastSentAt: now
+    });
+    this.repo.enqueueOutbox({
+      sessionBindingId: binding.id,
+      eventSeq,
+      notificationType: "task_progress",
+      feishuChatId: binding.feishuChatId,
+      feishuTopicRootMessageId: binding.feishuTopicRootMessageId,
+      feishuThreadId: binding.feishuThreadId,
+      payload: { text: `进行中：${label}\n\n${visible}` },
+      dedupeKey: `progress:${binding.id}:${turnId ?? "no-turn"}:${itemId ?? label}:${label}:${eventSeq}`
+    });
   }
 
   private recordProtocolFailure(message: Record<string, unknown>, error: unknown): void {
@@ -1899,7 +1977,7 @@ const extractTextFromUnknown = (value: unknown): string | null => {
   return null;
 };
 
-const sanitizeAssistantSummary = (text: string): string => {
+const sanitizeAssistantSummary = (text: string, maxLength = 6000): string => {
   const withoutCodeBlocks = text.replace(/```[\s\S]*?```/g, "[代码块已省略]");
   const compact = withoutCodeBlocks
     .split(/\r?\n/)
@@ -1908,7 +1986,7 @@ const sanitizeAssistantSummary = (text: string): string => {
     .join(" ")
     .replace(/\s+/g, " ")
     .trim();
-  return truncate(compact || "有输出，原始内容已保留在本地记录中。", 360);
+  return truncate(compact || "有输出，原始内容已保留在本地记录中。", maxLength);
 };
 
 const singleLine = (text: string): string => text.replace(/\s+/g, " ").trim();
@@ -1916,6 +1994,30 @@ const singleLine = (text: string): string => text.replace(/\s+/g, " ").trim();
 const looksLikeCommandLine = (line: string): boolean =>
   /(?:powershell|pwsh|cmd\.exe|node|npm|pnpm|yarn|python|git|rg|Get-Content|Get-ChildItem|Select-String)/i.test(line) ||
   line.length > 180;
+
+const formatPlanProgress = (value: unknown): string | null => {
+  if (!Array.isArray(value)) return null;
+  const lines = value
+    .map((item, index) => {
+      if (!item || typeof item !== "object") return null;
+      const object = item as Record<string, unknown>;
+      const step = asString(object.step);
+      if (!step) return null;
+      const status = asString(object.status);
+      const prefix =
+        status === "completed" ? "[完成]" :
+        status === "in_progress" || status === "inProgress" ? "[进行中]" :
+        "[待处理]";
+      return `${index + 1}. ${prefix} ${step}`;
+    })
+    .filter(Boolean);
+  return lines.length > 0 ? lines.join("\n") : null;
+};
+
+const sanitizeProgressText = (text: string): string => {
+  const sanitized = sanitizeAssistantSummary(text, 900);
+  return sanitized.length > 900 ? truncatePlain(sanitized, 900) : sanitized;
+};
 
 const inferProjectName = (cwd: string, fallback: string): string => {
   const normalized = cwd.replace(/[\\/]+$/, "");

@@ -46,10 +46,13 @@ export class OutboxWorker {
           await this.feishu.sendCard(item.feishuChatId, card, dedicatedChat ? null : item.feishuTopicRootMessageId);
         }
       } else if (text) {
-        if (!dedicatedChat && item.feishuThreadId) {
-          await this.feishu.replyTextInThread(item.feishuTopicRootMessageId ?? item.feishuThreadId, text);
-        } else {
-          await this.feishu.sendText(item.feishuChatId, text, dedicatedChat ? null : item.feishuTopicRootMessageId);
+        const chunks = splitFeishuText(text, this.config.bridge.maxFeishuTextLength);
+        for (const chunk of chunks) {
+          if (!dedicatedChat && item.feishuThreadId) {
+            await this.feishu.replyTextInThread(item.feishuTopicRootMessageId ?? item.feishuThreadId, chunk);
+          } else {
+            await this.feishu.sendText(item.feishuChatId, chunk, dedicatedChat ? null : item.feishuTopicRootMessageId);
+          }
         }
       } else {
         throw new Error("outbox payload must include card or text");
@@ -70,3 +73,36 @@ export class OutboxWorker {
     }
   }
 }
+
+const splitFeishuText = (text: string, maxLength: number): string[] => {
+  const limit = Math.max(500, maxLength);
+  if (text.length <= limit) return [text];
+  const bodyLimit = Math.max(400, limit - 24);
+  const chunks: string[] = [];
+  let offset = 0;
+  while (offset < text.length) {
+    const remaining = text.slice(offset);
+    if (remaining.length <= bodyLimit) {
+      chunks.push(remaining);
+      break;
+    }
+    const boundary = bestBoundary(remaining, bodyLimit);
+    chunks.push(remaining.slice(0, boundary).trimEnd());
+    offset += boundary;
+    while (text[offset] === "\n") offset += 1;
+  }
+  if (chunks.length <= 1) return chunks;
+  return chunks.map((chunk, index) => `(${index + 1}/${chunks.length})\n${chunk}`);
+};
+
+const bestBoundary = (text: string, limit: number): number => {
+  const candidates = [
+    text.lastIndexOf("\n\n", limit),
+    text.lastIndexOf("\n", limit),
+    text.lastIndexOf("。", limit),
+    text.lastIndexOf("；", limit),
+    text.lastIndexOf(". ", limit)
+  ].filter((index) => index >= Math.floor(limit * 0.55));
+  if (candidates.length > 0) return Math.max(...candidates) + 1;
+  return limit;
+};

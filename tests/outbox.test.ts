@@ -83,3 +83,26 @@ test("outbox sends dedicated task chat notifications as normal chat messages", a
     cleanup();
   }
 });
+
+test("outbox splits long text notifications instead of truncating them", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.bridge.maxFeishuTextLength = 1200;
+    const feishu = new MockFeishu();
+    const worker = new OutboxWorker(config, repo, feishu, makeLogger(dir));
+    const longText = Array.from({ length: 90 }, (_, index) => `第${index + 1}条结论：这里是需要完整发送到飞书的最终结果内容。`).join("\n");
+    repo.enqueueOutbox({
+      notificationType: "task_completed",
+      feishuChatId: "chat_1",
+      payload: { text: longText },
+      dedupeKey: "long-result"
+    });
+    await worker.flush();
+    assert.equal(feishu.sent.length > 1, true);
+    assert.equal(feishu.sent.every((entry) => String(entry.payload).length <= config.bridge.maxFeishuTextLength), true);
+    assert.equal(feishu.sent.some((entry) => String(entry.payload).includes("第90条结论")), true);
+  } finally {
+    cleanup();
+  }
+});
