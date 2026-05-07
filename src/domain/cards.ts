@@ -19,12 +19,17 @@ export class CardRenderer {
   consoleCard(stats: { running: number; approvals: number; queued: number; completedToday: number }): FeishuCard {
     const elements = [
       text(`运行中 ${stats.running}   待确认 ${stats.approvals}   已排队 ${stats.queued}   今日完成 ${stats.completedToday}`),
-      commandText(["/tasks", "/projects", "/doctor", "/notify test", "/notify history"]),
+      commandText(["/tasks", "/projects", "/unclassified", "/doctor", "/notify history"]),
       maybeActions(this.interactionMode, [
         button("新建任务", "new_task"),
         button("接管电脑任务", "claim_sessions"),
         button("项目列表", "project_list"),
         button("诊断", "doctor")
+      ]),
+      maybeActions(this.interactionMode, [
+        button("未归类任务", "unclassified_threads"),
+        button("通知历史", "notification_history"),
+        button("发送测试通知", "send_test_notification")
       ])
     ].filter(Boolean) as Record<string, unknown>[];
     return card("Codex 控制台", elements);
@@ -124,6 +129,10 @@ export class CardRenderer {
         button("新建任务", "new_task", { projectId: project.id }),
         button("接管任务", "claim_sessions", { projectId: project.id }),
         button("运行中任务", "project_running", { projectId: project.id })
+      ]),
+      maybeActions(this.interactionMode, [
+        button("未归类任务", "unclassified_threads", { projectId: project.id }),
+        button("项目列表", "project_list")
       ])
     ].filter(Boolean) as Record<string, unknown>[];
     return card(project.name, elements);

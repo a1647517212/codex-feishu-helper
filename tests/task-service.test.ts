@@ -23,6 +23,15 @@ test("hybrid cards render Card JSON 2.0 callback buttons for long connection", (
   }
 });
 
+test("console card exposes control-group buttons for unclassified and notification operations", () => {
+  const card = new CardRenderer("hybrid").consoleCard({ running: 1, approvals: 2, queued: 3, completedToday: 4 });
+  const buttons = collectButtons(card);
+  const labels = buttons.map((button) => String((button.text as Record<string, unknown>)?.content ?? ""));
+  assert.equal(labels.includes("未归类任务"), true);
+  assert.equal(labels.includes("通知历史"), true);
+  assert.equal(labels.includes("发送测试通知"), true);
+});
+
 test("claimable sessions card keeps button names unique when actions repeat", () => {
   const card = new CardRenderer("hybrid").claimableSessionsCard([
     { id: "thr_1", title: "Task 1", status: "idle", cwd: "C:\\repo-1" },
