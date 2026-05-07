@@ -19,8 +19,17 @@ if (command === "serve") {
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
   await app.start();
-  console.log(`feishu-codex listening on http://${config.server.host}:${config.server.port}`);
-  console.log(`admin token: ${config.server.adminToken}`);
+  const summary = app.startupSummary();
+  console.log(`feishu-codex started`);
+  console.log(`message transport: ${summary.messageTransport}`);
+  console.log(`card action transport: ${summary.cardActionTransport}`);
+  console.log(`task container: ${summary.taskContainerMode}`);
+  if (summary.httpStarted && summary.httpUrl) {
+    console.log(`http callback: ${summary.httpUrl}`);
+    console.log(`admin token: ${config.server.adminToken}`);
+  } else {
+    console.log(`http callback: disabled`);
+  }
 } else if (command === "doctor") {
   const app = new BridgeApp(config);
   await app.tasks.bootstrapProjectsFromConfig();

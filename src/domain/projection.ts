@@ -20,6 +20,8 @@ export class ProjectionBuilder {
       projectName: project?.name ?? "未归类项目",
       status: binding.status,
       cwd: binding.cwd,
+      selectedModel: binding.selectedModel,
+      selectedReasoningEffort: binding.selectedReasoningEffort,
       queuedMessages,
       pendingApprovals,
       lastTurnId: binding.lastTurnId,

@@ -22,6 +22,7 @@ export class BridgeApp {
   readonly diagnostics: DiagnosticsService;
   readonly http: BridgeHttpServer;
   readonly longConnection: FeishuLongConnectionServer;
+  private httpStarted = false;
 
   constructor(readonly config: BridgeConfig) {
     this.database = new BridgeDatabase(config.storage.databasePath);
@@ -41,7 +42,12 @@ export class BridgeApp {
     await this.tasks.bootstrapProjectsFromConfig();
     await this.codex.start();
     this.outbox.start();
-    await this.http.start();
+    if (this.http.shouldStart()) {
+      await this.http.start();
+      this.httpStarted = true;
+    } else {
+      this.httpStarted = false;
+    }
     await this.longConnection.start();
   }
 
@@ -51,5 +57,21 @@ export class BridgeApp {
     await this.http.stop();
     await this.codex.stop();
     this.database.close();
+  }
+
+  startupSummary(): {
+    httpStarted: boolean;
+    httpUrl: string | null;
+    messageTransport: BridgeConfig["feishu"]["messageTransport"];
+    cardActionTransport: BridgeConfig["feishu"]["cardActionTransport"];
+    taskContainerMode: BridgeConfig["feishu"]["taskContainerMode"];
+  } {
+    return {
+      httpStarted: this.httpStarted,
+      httpUrl: this.httpStarted ? this.http.localUrl() : null,
+      messageTransport: this.config.feishu.messageTransport,
+      cardActionTransport: this.config.feishu.cardActionTransport,
+      taskContainerMode: this.config.feishu.taskContainerMode
+    };
   }
 }

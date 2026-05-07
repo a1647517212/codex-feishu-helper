@@ -32,6 +32,14 @@ export type TrustedRole = "owner" | "operator" | "viewer";
 
 export type TrustedSubjectStatus = "active" | "disabled";
 
+export type NotificationScopeType = "global" | "project" | "session";
+
+export type NotificationLevel = "all" | "important" | "errors" | "muted";
+
+export type ThreadOwnerKind = "codex_app" | "feishu_bridge" | "app_server" | "unknown";
+
+export type WorkspaceCheckpointKind = "turn_start" | "turn_end" | "manual";
+
 export type NotificationType =
   | "task_completed"
   | "task_failed"
@@ -71,6 +79,8 @@ export interface SessionBinding {
   feishuControlChatId: string | null;
   title: string | null;
   cwd: string | null;
+  selectedModel: string | null;
+  selectedReasoningEffort: string | null;
   status: TaskStatus;
   lastTurnId: string | null;
   lastEventCursor: string | null;
@@ -143,6 +153,59 @@ export interface NotificationOutboxItem {
   createdAt: string;
 }
 
+export interface NotificationPreference {
+  id: string;
+  scopeType: NotificationScopeType;
+  scopeId: string;
+  feishuUserId: string | null;
+  level: NotificationLevel;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface BridgeDevice {
+  id: string;
+  machineName: string;
+  devicePublicKey: string | null;
+  devicePrivateKeyRef: string | null;
+  codexHome: string | null;
+  status: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface TrustedFeishuSubject {
+  id: string;
+  tenantKey: string | null;
+  chatId: string | null;
+  userId: string | null;
+  role: TrustedRole;
+  status: TrustedSubjectStatus;
+  pairedAt: string;
+  lastSeenAt: string | null;
+}
+
+export interface ThreadOwnership {
+  codexThreadId: string;
+  ownerKind: ThreadOwnerKind;
+  ownerClientId: string | null;
+  observedAt: string;
+  confidence: string;
+}
+
+export interface WorkspaceCheckpoint {
+  id: string;
+  sessionBindingId: string;
+  codexThreadId: string;
+  turnId: string | null;
+  workspaceRoot: string;
+  checkpointRef: string;
+  snapshotNote: string | null;
+  kind: WorkspaceCheckpointKind;
+  manifest: Record<string, unknown>;
+  createdAt: string;
+}
+
 export interface IgnoredThread {
   codexThreadId: string;
   title: string | null;
@@ -184,6 +247,11 @@ export interface DiagnosticSnapshot {
   runningTasksCount: number;
   pendingOutboxCount: number;
   pendingApprovalsCount: number;
+  notificationPreferenceCount: number;
+  trustedSubjectsCount: number;
+  bridgeDevicesCount: number;
+  currentDevice: BridgeDevice | null;
+  trustedSubjects: TrustedFeishuSubject[];
   lastFeishuMessageAt: string | null;
   lastFeishuMessageId: string | null;
   lastFeishuCardActionAt: string | null;
@@ -211,6 +279,8 @@ export interface TaskStatusProjection {
   projectName: string;
   status: TaskStatus;
   cwd: string | null;
+  selectedModel: string | null;
+  selectedReasoningEffort: string | null;
   queuedMessages: number;
   pendingApprovals: number;
   lastTurnId: string | null;
@@ -235,6 +305,11 @@ export interface TaskReportProjection {
   projectName: string;
   reasoningSummary: string | null;
   finalResult: string | null;
+  highlights?: string[];
+  changeItems?: string[];
+  verificationItems?: string[];
+  nextSteps?: string[];
+  fullFinalResult?: string | null;
   finalResultTruncated?: boolean;
   updatedAt: string;
 }

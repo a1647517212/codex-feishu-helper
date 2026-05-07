@@ -137,3 +137,82 @@ test("outbox stores first task status card message id for later updates", async 
     cleanup();
   }
 });
+
+test("outbox respects muted global notification preference", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const worker = new OutboxWorker(config, repo, feishu, makeLogger(dir));
+    repo.upsertNotificationPreference({
+      scopeType: "global",
+      scopeId: "bridge",
+      level: "muted"
+    });
+    repo.enqueueOutbox({
+      notificationType: "task_completed",
+      feishuChatId: "chat_1",
+      payload: { text: "done" },
+      dedupeKey: "muted-complete"
+    });
+    await worker.flush();
+    assert.equal(feishu.sent.length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("outbox still delivers approval requests when notifications are muted", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const worker = new OutboxWorker(config, repo, feishu, makeLogger(dir));
+    repo.upsertNotificationPreference({
+      scopeType: "global",
+      scopeId: "bridge",
+      level: "muted"
+    });
+    repo.enqueueOutbox({
+      notificationType: "approval_required",
+      feishuChatId: "chat_1",
+      payload: { text: "need approval" },
+      dedupeKey: "muted-approval"
+    });
+    await worker.flush();
+    assert.equal(feishu.sent.length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("outbox sends only error notifications when level is errors", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const worker = new OutboxWorker(config, repo, feishu, makeLogger(dir));
+    repo.upsertNotificationPreference({
+      scopeType: "global",
+      scopeId: "bridge",
+      level: "errors"
+    });
+    repo.enqueueOutbox({
+      notificationType: "task_completed",
+      feishuChatId: "chat_1",
+      payload: { text: "completed" },
+      dedupeKey: "errors-complete"
+    });
+    repo.enqueueOutbox({
+      notificationType: "task_failed",
+      feishuChatId: "chat_1",
+      payload: { text: "failed" },
+      dedupeKey: "errors-failed"
+    });
+    await worker.flush();
+    assert.equal(feishu.sent.length, 1);
+    assert.equal(String(feishu.sent[0]?.payload), "failed");
+  } finally {
+    cleanup();
+  }
+});

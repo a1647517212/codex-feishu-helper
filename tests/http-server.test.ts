@@ -82,6 +82,7 @@ test("http callback endpoints are disabled when long connection transport is act
   const { repo, dir, cleanup } = makeTempRepo();
   const config = makeConfig(dir);
   config.server.port = 0;
+  config.server.mode = "enabled";
   config.feishu.messageTransport = "long_connection";
   config.feishu.cardActionTransport = "long_connection";
   const diagnostics = {
@@ -131,6 +132,62 @@ test("http callback endpoints are disabled when long connection transport is act
       body: JSON.stringify({ type: "url_verification", challenge: "blocked" })
     });
     assert.equal(response.status, 409);
+  } finally {
+    await server.stop();
+    cleanup();
+  }
+});
+
+test("http server skips startup in auto mode when both transports use long connection", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  const config = makeConfig(dir);
+  config.server.mode = "auto";
+  config.server.port = 0;
+  config.feishu.messageTransport = "long_connection";
+  config.feishu.cardActionTransport = "long_connection";
+  const diagnostics = {
+    recordError(): void {},
+    recordFeishuMessage(): void {},
+    recordFeishuCardAction(): void {},
+    async snapshot() {
+      return {
+        uptimeSeconds: 1,
+        machineName: "test-machine",
+        platform: "win32",
+        nodeVersion: process.version,
+        codexCommand: "codex",
+        codexAvailable: true,
+        appServerStatus: "connected" as const,
+        feishuConfigured: true,
+        feishuMessageTransport: config.feishu.messageTransport,
+        feishuCardActionTransport: config.feishu.cardActionTransport,
+        feishuInteractionMode: config.feishu.interactionMode,
+        feishuDefaultChatId: config.feishu.defaultChatId ?? null,
+        feishuDefaultChatDiagnostic: null,
+        databasePath: config.storage.databasePath,
+        projectsCount: 0,
+        sessionBindingsCount: repo.count("session_bindings"),
+        runningTasksCount: 0,
+        pendingOutboxCount: 0,
+        pendingApprovalsCount: 0,
+        lastFeishuMessageAt: null,
+        lastFeishuMessageId: null,
+        lastFeishuCardActionAt: null,
+        lastFeishuCardAction: null,
+        lastFeishuCardActionId: null,
+        lastError: null
+      };
+    }
+  };
+  const tasks = {
+    async handleMessage(): Promise<void> {},
+    async processCardActionDeferred(): Promise<void> {}
+  };
+  const server = new BridgeHttpServer(config, tasks as any, diagnostics as any, new CardRenderer(), makeLogger(dir));
+  try {
+    assert.equal(server.shouldStart(), false);
+    await server.start();
+    assert.throws(() => server.localUrl(), /not started/);
   } finally {
     await server.stop();
     cleanup();

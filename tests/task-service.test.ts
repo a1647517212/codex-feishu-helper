@@ -27,9 +27,10 @@ test("console card exposes control-group buttons for unclassified and notificati
   const card = new CardRenderer("hybrid").consoleCard({ running: 1, approvals: 2, queued: 3, completedToday: 4 });
   const buttons = collectButtons(card);
   const labels = buttons.map((button) => String((button.text as Record<string, unknown>)?.content ?? ""));
-  assert.equal(labels.includes("未归类任务"), true);
-  assert.equal(labels.includes("通知历史"), true);
-  assert.equal(labels.includes("发送测试通知"), true);
+  assert.equal(labels.includes("未归类"), true);
+  assert.equal(labels.includes("项目"), true);
+  assert.equal(labels.includes("最近任务"), true);
+  assert.equal(labels.includes("待确认"), true);
 });
 
 test("claimable sessions card keeps button names unique when actions repeat", () => {
@@ -481,7 +482,7 @@ test("status card summary uses short plain text instead of visible truncation ma
       }
     });
     const statusOutbox = repo.listDueOutbox(10).find(
-      (item) => item.notificationType === "task_completed" && JSON.stringify(item.payload.card ?? {}).includes("命令：/logs")
+      (item) => item.notificationType === "task_completed" && JSON.stringify(item.payload.card ?? {}).includes("直接回复即可继续处理")
     );
     assert.ok(statusOutbox);
     assert.equal(JSON.stringify(statusOutbox.payload.card).includes("...(已截断)"), false);
@@ -1805,14 +1806,60 @@ test("visible task and diagnostic buttons have concrete handlers", async () => {
       payload: { text: "done" },
       dedupeKey: "button-history"
     });
-    for (const [index, action] of ["task_status", "task_logs", "notification_history", "send_test_notification"].entries()) {
+    repo.createWorkspaceCheckpoint({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      turnId: "turn_buttons",
+      workspaceRoot: dir,
+      checkpointRef: "start",
+      snapshotNote: "before",
+      kind: "turn_start",
+      manifest: {
+        version: 1,
+        root: dir,
+        capturedAt: new Date().toISOString(),
+        files: [],
+        truncated: false,
+        limits: { maxFiles: 10, maxFileBytes: 10, maxSampleBytes: 10 },
+        skipped: { directories: [], files: [] }
+      }
+    });
+    repo.createWorkspaceCheckpoint({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      turnId: "turn_buttons",
+      workspaceRoot: dir,
+      checkpointRef: "end",
+      snapshotNote: "after",
+      kind: "turn_end",
+      manifest: {
+        version: 1,
+        root: dir,
+        capturedAt: new Date().toISOString(),
+        files: [{ path: "src/index.ts", size: 1, mtimeMs: 1, sha256: "hash", sample: "x" }],
+        truncated: false,
+        limits: { maxFiles: 10, maxFileBytes: 10, maxSampleBytes: 10 },
+        skipped: { directories: [], files: [] }
+      }
+    });
+    for (const [index, action] of [
+      "task_status",
+      "task_logs",
+      "task_detail",
+      "task_impact",
+      "task_restore_confirm",
+      "task_search",
+      "notification_history",
+      "send_test_notification",
+      "diagnostic_recover"
+    ].entries()) {
       await service.handleCardAction({
         actionId: `act_button_${index}`,
         action,
         userId: "user_1",
         chatId: "chat_1",
         rootMessageId: "root_buttons",
-        payload: { bindingId: binding.id }
+        payload: { bindingId: binding.id, query: "Button" }
       });
     }
     await service.handleCardAction({
@@ -1853,6 +1900,8 @@ test("task status card renders summary and command hint as separate blocks", () 
     projectName: "Playground",
     status: "running",
     cwd: null,
+    selectedModel: "gpt-5.4",
+    selectedReasoningEffort: "xhigh",
     queuedMessages: 1,
     pendingApprovals: 0,
     lastTurnId: "turn_layout",
@@ -1863,6 +1912,94 @@ test("task status card renders summary and command hint as separate blocks", () 
   assert.equal(content.includes("当前结论"), true);
   assert.equal(content.includes("操作提示"), true);
   assert.equal(content.includes("这里是当前阶段的简要结论。"), true);
+  assert.equal(content.includes("gpt-5.4"), true);
+  assert.equal(content.includes("xhigh"), true);
+});
+
+test("console card uses compact mobile-safe button labels", () => {
+  const card = new CardRenderer("hybrid").consoleCard({ running: 1, approvals: 2, queued: 3, completedToday: 4 });
+  const buttons = collectButtons(card);
+  const labels = buttons.map((button) => String((button.text as Record<string, unknown>)?.content ?? ""));
+  assert.equal(labels.includes("新任务"), true);
+  assert.equal(labels.includes("最近任务"), true);
+  assert.equal(labels.includes("运行中"), true);
+  assert.equal(labels.includes("已完成"), true);
+  assert.equal(labels.includes("归档"), true);
+  assert.equal(labels.includes("接管电脑任务"), false);
+});
+
+test("task settings card shows model and reasoning options", () => {
+  const card = new CardRenderer("hybrid").taskSettingsCard({
+    bindingId: "bind_setting",
+    title: "Setting task",
+    projectName: "Playground",
+    currentModel: "gpt-5.4",
+    currentReasoningEffort: "xhigh",
+    currentNotificationLevel: "important",
+    modelOptions: ["gpt-5.4", "gpt-5.5"],
+    reasoningOptions: ["medium", "high", "xhigh"]
+  });
+  const content = JSON.stringify(card);
+  assert.equal(content.includes("当前模型"), true);
+  assert.equal(content.includes("当前思考"), true);
+  assert.equal(content.includes("通知级别"), true);
+  assert.equal(content.includes("5.5"), true);
+  assert.equal(content.includes("极高"), true);
+});
+
+test("task report card renders highlights and next steps blocks", () => {
+  const card = new CardRenderer("hybrid").taskReportCard({
+    title: "Report task",
+    status: "completed",
+    projectName: "Playground",
+    reasoningSummary: "先确认范围，再整理结论。",
+    finalResult: "建议先上线主流程。后续可以再优化移动端显示和归档流程。",
+    highlights: ["主流程已完成", "移动端仍可继续优化"],
+    changeItems: ["已完成主流程实现"],
+    verificationItems: ["已完成基础验证"],
+    nextSteps: ["继续优化移动端显示", "补强归档流程体验"],
+    finalResultTruncated: false,
+    updatedAt: new Date().toISOString()
+  });
+  const content = JSON.stringify(card);
+  assert.equal(content.includes("关键信息"), true);
+  assert.equal(content.includes("本次改动"), true);
+  assert.equal(content.includes("验证情况"), true);
+  assert.equal(content.includes("建议后续"), true);
+  assert.equal(content.includes("主流程已完成"), true);
+  assert.equal(content.includes("补强归档流程体验"), true);
+});
+
+test("project card and settings card expose mobile-safe settings entry", () => {
+  const projectCard = new CardRenderer("hybrid").projectCard({
+    id: "proj_1",
+    name: "Playground",
+    rootPath: "C:\\repo",
+    runningCount: 1,
+    pendingApprovals: 2,
+    completedCount: 3,
+    defaultModel: "gpt-5.4",
+    defaultReasoningEffort: "xhigh"
+  });
+  const labels = collectButtons(projectCard).map((button) => String((button.text as Record<string, unknown>)?.content ?? ""));
+  assert.equal(labels.includes("设置"), true);
+  assert.equal(labels.includes("运行中"), true);
+  assert.equal(labels.includes("接管"), true);
+
+  const settingsCard = new CardRenderer("hybrid").projectSettingsCard({
+    projectId: "proj_1",
+    projectName: "Playground",
+    rootPath: "C:\\repo",
+    currentModel: "gpt-5.4",
+    currentReasoningEffort: "xhigh",
+    currentNotificationLevel: "important",
+    modelOptions: ["gpt-5.4", "gpt-5.5"],
+    reasoningOptions: ["medium", "high", "xhigh"]
+  });
+  const content = JSON.stringify(settingsCard);
+  assert.equal(content.includes("默认模型"), true);
+  assert.equal(content.includes("默认思考"), true);
+  assert.equal(content.includes("5.5"), true);
 });
 
 test("approval list and detail buttons render stored pending approvals", async () => {
@@ -1908,6 +2045,297 @@ test("approval list and detail buttons render stored pending approvals", async (
     assert.equal(feishu.sent.length, 2);
     assert.equal(feishu.sent.every((entry) => entry.type === "card"), true);
     assert.equal(feishu.sent.every((entry) => entry.mode === "thread" && entry.root === "root_approval_buttons"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("task settings actions update binding model and reasoning effort", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_setting_action",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_setting_action",
+      feishuThreadId: "omt_setting_action",
+      title: "Setting action task",
+      cwd: dir,
+      selectedModel: "gpt-5.4",
+      selectedReasoningEffort: "xhigh",
+      status: "idle",
+      createdFrom: "manual_import"
+    });
+    await service.handleCardAction({
+      actionId: "act_setting_model",
+      action: "task_setting_model",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_setting_action",
+      payload: { bindingId: binding.id, model: "gpt-5.5" }
+    });
+    await service.handleCardAction({
+      actionId: "act_setting_reasoning",
+      action: "task_setting_reasoning",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_setting_action",
+      payload: { bindingId: binding.id, reasoningEffort: "high" }
+    });
+    const updated = repo.findBindingById(binding.id);
+    assert.equal(updated?.selectedModel, "gpt-5.5");
+    assert.equal(updated?.selectedReasoningEffort, "high");
+  } finally {
+    cleanup();
+  }
+});
+
+test("project settings actions update project defaults", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({
+      id: "proj_setting_action",
+      name: "Playground",
+      rootPath: dir,
+      defaultModel: "gpt-5.4",
+      defaultReasoningEffort: "xhigh"
+    });
+    await service.handleCardAction({
+      actionId: "act_project_setting_model",
+      action: "project_setting_model",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_project_setting",
+      payload: { projectId: project.id, model: "gpt-5.5" }
+    });
+    await service.handleCardAction({
+      actionId: "act_project_setting_reasoning",
+      action: "project_setting_reasoning",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_project_setting",
+      payload: { projectId: project.id, reasoningEffort: "high" }
+    });
+    const updated = repo.getProject(project.id);
+    assert.equal(updated?.defaultModel, "gpt-5.5");
+    assert.equal(updated?.defaultReasoningEffort, "high");
+  } finally {
+    cleanup();
+  }
+});
+
+test("project notification level action updates project notification policy", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({
+      id: "proj_notify_setting",
+      name: "Playground",
+      rootPath: dir,
+      notificationPolicy: "important"
+    });
+    await service.handleCardAction({
+      actionId: "act_project_notification_level",
+      action: "project_notification_level",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_project_notify_setting",
+      payload: { projectId: project.id, level: "errors" }
+    });
+    assert.equal(repo.getProject(project.id)?.notificationPolicy, "errors");
+  } finally {
+    cleanup();
+  }
+});
+
+test("global notification settings card is available from main console actions", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    await service.handleCardAction({
+      actionId: "act_notification_settings_global",
+      action: "notification_settings_global",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_notification_settings",
+      payload: {}
+    });
+    assert.equal(feishu.sent.length, 1);
+    assert.equal(JSON.stringify(feishu.sent[0]?.payload ?? {}).includes("通知设置"), true);
+    assert.equal(JSON.stringify(feishu.sent[0]?.payload ?? {}).includes("当前级别"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("archived task center lists archived tasks from main console", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_archived_task",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_archived_task",
+      feishuThreadId: "omt_archived_task",
+      title: "Archived task",
+      cwd: dir,
+      status: "archived",
+      createdFrom: "manual_import"
+    });
+    await service.handleCardAction({
+      actionId: "act_archived_list",
+      action: "task_list_archived",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_archived_task",
+      payload: {}
+    });
+    assert.equal(feishu.sent.length, 1);
+    assert.equal(JSON.stringify(feishu.sent[0]?.payload ?? {}).includes("归档任务"), true);
+    assert.equal(JSON.stringify(feishu.sent[0]?.payload ?? {}).includes("Archived task"), true);
+    assert.equal(JSON.stringify(feishu.sent[0]?.payload ?? {}).includes(binding.id), false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("archived task center can restore an archived task", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_archived_restore",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root-restore",
+      feishuContainerKind: "dedicated_chat",
+      title: "Archived restore",
+      cwd: dir,
+      status: "archived",
+      createdFrom: "manual_import"
+    });
+    await service.handleCardAction({
+      actionId: "act_task_unarchive",
+      action: "task_unarchive",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_archived_restore",
+      payload: { bindingId: binding.id }
+    });
+    assert.deepEqual(codex.unarchived, ["thr_archived_restore"]);
+    assert.equal(repo.findBindingById(binding.id)?.status, "idle");
+    assert.equal(repo.listEventsForBinding(binding.id).some((event) => event.eventType === "task.unarchived"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("continuing a task uses task-level selected model and reasoning effort", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    repo.createOrUpdateBinding({
+      codexThreadId: "thr_binding_setting",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root-setting",
+      feishuContainerKind: "dedicated_chat",
+      feishuControlChatId: "chat_1",
+      title: "Bound setting task",
+      cwd: dir,
+      selectedModel: "gpt-5.5",
+      selectedReasoningEffort: "high",
+      status: "idle",
+      createdFrom: "manual_import"
+    });
+    await service.handleMessage({
+      messageId: "msg_setting_continue",
+      chatId: "task_chat_1",
+      rootMessageId: "task-root-setting",
+      threadId: null,
+      userId: "user_1",
+      text: "继续处理"
+    });
+    assert.equal(codex.startedTurns.length, 1);
+    assert.equal(codex.startedTurns[0]?.model, "gpt-5.5");
+    assert.equal(codex.startedTurns[0]?.reasoningEffort, "high");
+  } finally {
+    cleanup();
+  }
+});
+
+test("starting a new turn clears old progress card state", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_progress_reset",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root-progress-reset",
+      feishuContainerKind: "dedicated_chat",
+      feishuControlChatId: "chat_1",
+      title: "Progress reset task",
+      cwd: dir,
+      status: "idle",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!(
+      {
+        method: "item/plan/delta",
+        params: {
+          threadId: binding.codexThreadId,
+          turnId: "turn_old",
+          itemId: "plan_old",
+          delta: "旧的一轮进度。"
+        }
+      }
+    );
+    assert.equal(feishu.sent.filter((entry) => entry.type === "card" && entry.chatId === "task_chat_1").length, 1);
+    await service.handleMessage({
+      messageId: "msg_progress_reset",
+      chatId: "task_chat_1",
+      rootMessageId: "task-root-progress-reset",
+      threadId: null,
+      userId: "user_1",
+      text: "继续处理下一轮"
+    });
+    await codex.notifications.notification![0]!(
+      {
+        method: "item/reasoning/summaryTextDelta",
+        params: {
+          threadId: binding.codexThreadId,
+          turnId: "turn_1",
+          itemId: "reasoning_new",
+          delta: "这是新一轮的处理摘要。"
+        }
+      }
+    );
+    const latest = JSON.stringify(feishu.updatedCards[feishu.updatedCards.length - 1]?.card ?? {});
+    assert.equal(latest.includes("这是新一轮的处理摘要。"), true);
+    assert.equal(latest.includes("旧的一轮进度。"), false);
   } finally {
     cleanup();
   }

@@ -21,6 +21,15 @@ export interface CodexClientEvents {
   error: [error: Error];
 }
 
+export interface CodexModelSummary {
+  id: string;
+  model: string;
+  displayName: string;
+  defaultReasoningEffort: string | null;
+  supportedReasoningEfforts: string[];
+  isDefault: boolean;
+}
+
 export class CodexClient extends EventEmitter<CodexClientEvents> {
   private proc: ChildProcessWithoutNullStreams | null = null;
   private rl: Interface | null = null;
@@ -120,6 +129,13 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
   async resumeThread(threadId: string): Promise<CodexThreadSummary> {
     const result = await this.request("thread/resume", { threadId });
     return normalizeThread((result as { thread?: unknown }).thread);
+  }
+
+  async listModels(limit = 20): Promise<CodexModelSummary[]> {
+    const result = await this.request("model/list", { limit });
+    const response = result && typeof result === "object" ? (result as Record<string, unknown>) : {};
+    const data = Array.isArray(response.data) ? response.data : [];
+    return data.map((entry) => normalizeModel(entry));
   }
 
   async startTurn(
@@ -283,5 +299,27 @@ const sandboxPolicyFromMode = (mode: string): Record<string, unknown> => {
     networkAccess: true,
     excludeTmpdirEnvVar: false,
     excludeSlashTmp: false
+  };
+};
+
+const normalizeModel = (value: unknown): CodexModelSummary => {
+  const raw = value && typeof value === "object" ? (value as Record<string, unknown>) : {};
+  const supported = Array.isArray(raw.supportedReasoningEfforts)
+    ? raw.supportedReasoningEfforts
+        .map((entry) => {
+          if (entry && typeof entry === "object" && typeof (entry as Record<string, unknown>).reasoningEffort === "string") {
+            return String((entry as Record<string, unknown>).reasoningEffort);
+          }
+          return null;
+        })
+        .filter((entry): entry is string => Boolean(entry))
+    : [];
+  return {
+    id: String(raw.id ?? raw.model ?? ""),
+    model: String(raw.model ?? raw.id ?? ""),
+    displayName: typeof raw.displayName === "string" ? raw.displayName : String(raw.model ?? raw.id ?? ""),
+    defaultReasoningEffort: typeof raw.defaultReasoningEffort === "string" ? raw.defaultReasoningEffort : null,
+    supportedReasoningEfforts: supported,
+    isDefault: raw.isDefault === true
   };
 };

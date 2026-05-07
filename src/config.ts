@@ -10,6 +10,7 @@ const TaskContainerModeSchema = z.enum(["dedicated_chat", "topic"]);
 const TaskChatTypeSchema = z.enum(["private", "public"]);
 const SandboxModeSchema = z.enum(["read-only", "workspace-write", "danger-full-access"]);
 const ApprovalPolicySchema = z.enum(["untrusted", "on-failure", "on-request", "never"]);
+const HttpServerModeSchema = z.enum(["auto", "enabled", "disabled"]);
 
 const stringArrayFromEnv = z
   .union([z.array(z.string()), z.string()])
@@ -35,9 +36,10 @@ const ConfigSchema = z.object({
     .object({
       host: z.string().default("127.0.0.1"),
       port: z.number().int().positive().default(8787),
+      mode: HttpServerModeSchema.default("auto"),
       adminToken: z.string().optional()
     })
-    .default({ host: "127.0.0.1", port: 8787 }),
+    .default({ host: "127.0.0.1", port: 8787, mode: "auto" }),
   codex: z
     .object({
       command: z.string().default("codex"),
@@ -150,6 +152,7 @@ export type BridgeConfig = Omit<ParsedConfig, "feishu" | "storage" | "server"> &
   };
   server: ParsedConfig["server"] & {
     adminToken: string;
+    mode: z.infer<typeof HttpServerModeSchema>;
   };
 };
 

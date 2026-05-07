@@ -4,19 +4,27 @@ import { asString } from "../core/json.js";
 import type {
   FeishuCardAction,
   FeishuIncomingMessage,
+  NotificationLevel,
   PendingApproval,
   Project,
   SessionBinding,
   TaskEvent,
   TaskProcessProjection,
-  TaskStatus
+  TaskStatus,
+  WorkspaceCheckpoint,
+  WorkspaceCheckpointKind
 } from "../core/types.js";
 import type { Repository } from "../db/repo.js";
 import { commandApprovalDecision, fileApprovalDecision, classifyCommandRisk } from "../domain/approval.js";
 import { CardRenderer } from "../domain/cards.js";
+import {
+  captureWorkspaceManifest,
+  compareWorkspaceManifests,
+  restoreWorkspaceFromCheckpoints
+} from "../domain/checkpoints.js";
 import { ProjectionBuilder } from "../domain/projection.js";
 import { SecurityPolicy } from "../domain/security.js";
-import type { CodexClient, CodexThreadSummary } from "../codex/client.js";
+import type { CodexClient, CodexModelSummary, CodexThreadSummary } from "../codex/client.js";
 import type { FeishuSender, SentMessage } from "../feishu/client.js";
 import type { Logger } from "../logger.js";
 import { DiagnosticsService } from "./diagnostics.js";
@@ -42,6 +50,8 @@ type ProgressSection = {
   updatedAt: number;
 };
 
+type TaskListKind = "recent" | "running" | "completed" | "failed" | "archived";
+
 export class TaskService {
   private readonly cards: CardRenderer;
   private readonly projection: ProjectionBuilder;
@@ -65,6 +75,19 @@ export class TaskService {
   }
 
   async bootstrapProjectsFromConfig(): Promise<void> {
+    this.repo.upsertBridgeDevice({
+      id: this.config.machine.id,
+      machineName: this.config.machine.name,
+      codexHome: this.config.storage.homeDir,
+      status: "active"
+    });
+    if (this.config.feishu.defaultChatId) {
+      this.repo.upsertTrustedFeishuSubject({
+        chatId: this.config.feishu.defaultChatId,
+        role: "owner",
+        status: "active"
+      });
+    }
     for (const project of this.config.projects) {
       this.repo.upsertProject({
         id: project.id,
@@ -153,7 +176,23 @@ export class TaskService {
     const running = this.repo.count("session_bindings", "status = 'running'");
     const approvals = this.repo.count("pending_approvals", "status = 'pending'");
     const queued = this.repo.count("message_queue", "status = 'queued'");
-    const card = this.cards.consoleCard({ running, approvals, queued, completedToday: 0 });
+    const completedToday = this.repo.count(
+      "session_bindings",
+      `status = 'completed' AND updated_at >= '${new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()}'`
+    );
+    const card = this.cards.consoleCard({
+      running,
+      approvals,
+      queued,
+      completedToday,
+      recentTasks: this.listTaskSummaries("recent", 5).map((task) => ({
+        title: task.title,
+        status: task.status,
+        projectName: task.projectName,
+        model: task.model,
+        reasoningEffort: task.reasoningEffort
+      }))
+    });
     await this.feishu.sendCard(chatId, card, rootMessageId);
   }
 
@@ -225,6 +264,12 @@ export class TaskService {
       await this.listClaimableSessions(message.chatId, message.rootMessageId ?? message.messageId);
       return;
     }
+    this.repo.upsertTrustedFeishuSubject({
+      chatId: message.chatId,
+      userId: message.userId,
+      role: "owner",
+      status: "active"
+    });
     if (await this.tryHandleMessageCommand(message, text)) {
       return;
     }
@@ -247,6 +292,12 @@ export class TaskService {
 
   async handleCardAction(action: FeishuCardAction): Promise<Record<string, unknown>> {
     this.security.assertFeishuAllowed(action.userId, action.chatId || this.config.feishu.defaultChatId || "");
+    this.repo.upsertTrustedFeishuSubject({
+      chatId: action.chatId || this.config.feishu.defaultChatId || null,
+      userId: action.userId,
+      role: "owner",
+      status: "active"
+    });
     const { existing } = this.repo.beginAction({
       actionId: action.actionId,
       actionType: action.action,
@@ -296,6 +347,25 @@ export class TaskService {
     }
   }
 
+  taskDetailData(bindingId: string): Record<string, unknown> {
+    const binding = this.repo.findBindingById(bindingId);
+    if (!binding) throw new Error("任务不存在");
+    const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
+    const events = this.repo.listEventsForBinding(binding.id, 500);
+    const checkpoints = this.repo.listWorkspaceCheckpoints(binding.id, 50);
+    const pair = this.repo.findWorkspaceCheckpointPair(binding.id, binding.lastTurnId);
+    const impact = compareWorkspaceManifests(pair.start, pair.end);
+    return {
+      binding,
+      project,
+      status: this.projection.buildTaskStatus(binding.id),
+      process: this.buildTaskProcessProjection(binding),
+      impact,
+      checkpoints,
+      events
+    };
+  }
+
   async claimThread(params: {
     thread: CodexThreadSummary;
     chatId: string;
@@ -313,9 +383,17 @@ export class TaskService {
       feishuTopicRootMessageId: params.rootMessageId,
       title: params.thread.title ?? params.thread.preview ?? "Codex 任务",
       cwd: params.thread.cwd,
+      selectedModel: projectModel(project, this.config),
+      selectedReasoningEffort: projectReasoningEffort(project, this.config),
       status: params.thread.status,
       createdByFeishuUserId: params.userId,
       createdFrom: "codex_app_claimed"
+    });
+    this.repo.upsertThreadOwnership({
+      codexThreadId: binding.codexThreadId,
+      ownerKind: "feishu_bridge",
+      ownerClientId: this.config.machine.id,
+      confidence: "high"
     });
     this.repo.insertEvent({
       sessionBindingId: binding.id,
@@ -362,9 +440,17 @@ export class TaskService {
       feishuControlChatId: container.controlChatId,
       title,
       cwd: thread.cwd ?? project?.rootPath ?? null,
+      selectedModel: projectModel(project, this.config),
+      selectedReasoningEffort: projectReasoningEffort(project, this.config),
       status: "running",
       createdByFeishuUserId: message.userId,
       createdFrom: "feishu_new_task"
+    });
+    this.repo.upsertThreadOwnership({
+      codexThreadId: binding.codexThreadId,
+      ownerKind: "feishu_bridge",
+      ownerClientId: this.config.machine.id,
+      confidence: "high"
     });
     this.repo.insertEvent({
       sessionBindingId: binding.id,
@@ -373,12 +459,22 @@ export class TaskService {
       eventPayload: { text: message.text },
       feishuMessageId: message.messageId
     });
+    const startCheckpoint = await this.captureCheckpointForWorkspace({
+      binding,
+      codexThreadId: thread.id,
+      workspaceRoot: thread.cwd ?? project?.rootPath ?? binding.cwd ?? null,
+      kind: "turn_start",
+      turnId: null,
+      note: "任务开始前"
+    });
     const turn = await this.codex.startTurn(binding.codexThreadId, message.text, {
       cwd: binding.cwd,
-      model: projectModel(project, this.config),
-      reasoningEffort: projectReasoningEffort(project, this.config)
+      model: resolveBindingModel(binding, project, this.config),
+      reasoningEffort: resolveBindingReasoningEffort(binding, project, this.config)
     });
-    this.repo.updateBindingStatus(binding.id, "running", extractTurnId(turn));
+    const turnId = extractTurnId(turn);
+    if (startCheckpoint && turnId) this.repo.updateWorkspaceCheckpointTurnId(startCheckpoint.id, turnId);
+    this.repo.updateBindingStatus(binding.id, "running", turnId);
     await this.updateTaskTitle(binding.id, "running", title);
     await this.updateTaskCard(binding.id);
   }
@@ -391,11 +487,14 @@ export class TaskService {
       reasoningEffort: projectReasoningEffort(project, this.config)
     });
     const title = summarizeTitle(message.text);
+    const startCheckpoint = await this.captureCheckpoint(binding.id, "turn_start", null, "任务开始前");
     const turn = await this.codex.startTurn(thread.id, message.text, {
       cwd: thread.cwd ?? project?.rootPath ?? binding.cwd ?? null,
-      model: projectModel(project, this.config),
-      reasoningEffort: projectReasoningEffort(project, this.config)
+      model: resolveBindingModel(binding, project, this.config),
+      reasoningEffort: resolveBindingReasoningEffort(binding, project, this.config)
     });
+    const turnId = extractTurnId(turn);
+    if (startCheckpoint && turnId) this.repo.updateWorkspaceCheckpointTurnId(startCheckpoint.id, turnId);
     this.repo.activateDraftBinding({
       bindingId: binding.id,
       codexThreadId: thread.id,
@@ -403,7 +502,18 @@ export class TaskService {
       title,
       cwd: thread.cwd ?? project?.rootPath ?? binding.cwd ?? null,
       status: "running",
-      lastTurnId: extractTurnId(turn)
+      lastTurnId: turnId
+    });
+    this.repo.upsertThreadOwnership({
+      codexThreadId: thread.id,
+      ownerKind: "feishu_bridge",
+      ownerClientId: this.config.machine.id,
+      confidence: "high"
+    });
+    this.repo.updateBindingSettings({
+      bindingId: binding.id,
+      selectedModel: binding.selectedModel ?? projectModel(project, this.config),
+      selectedReasoningEffort: binding.selectedReasoningEffort ?? projectReasoningEffort(project, this.config)
     });
     this.repo.insertEvent({
       sessionBindingId: binding.id,
@@ -451,6 +561,7 @@ export class TaskService {
       await this.updateTaskCard(binding.id);
       return;
     }
+    this.resetProgressState(binding.id);
     this.repo.updateBindingStatus(binding.id, "running");
     this.repo.insertEvent({
       sessionBindingId: binding.id,
@@ -463,11 +574,15 @@ export class TaskService {
     await this.updateTaskCard(binding.id);
     await this.codex.resumeThread(binding.codexThreadId);
     const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
-    await this.codex.startTurn(binding.codexThreadId, message.text, {
+    const startCheckpoint = await this.captureCheckpoint(binding.id, "turn_start", null, "继续处理前");
+    const turn = await this.codex.startTurn(binding.codexThreadId, message.text, {
       cwd: binding.cwd,
-      model: projectModel(project, this.config),
-      reasoningEffort: projectReasoningEffort(project, this.config)
+      model: resolveBindingModel(binding, project, this.config),
+      reasoningEffort: resolveBindingReasoningEffort(binding, project, this.config)
     });
+    const turnId = extractTurnId(turn);
+    if (startCheckpoint && turnId) this.repo.updateWorkspaceCheckpointTurnId(startCheckpoint.id, turnId);
+    if (turnId) this.repo.updateBindingStatus(binding.id, "running", turnId);
   }
 
   private async dispatchCardAction(action: FeishuCardAction): Promise<Record<string, unknown>> {
@@ -475,6 +590,8 @@ export class TaskService {
       case "doctor":
         await this.sendDoctorCard(action.chatId || this.config.feishu.defaultChatId || "", action.rootMessageId);
         return { ok: true, action: "doctor" };
+      case "diagnostic_recover":
+        return this.runDiagnosticRecover(action);
       case "new_task":
         await this.sendNewTaskDraft(action);
         return { ok: true };
@@ -504,6 +621,18 @@ export class TaskService {
       case "project_list":
         await this.sendProjectList(action);
         return { ok: true };
+      case "project_settings":
+        await this.sendProjectSettings(action);
+        return { ok: true };
+      case "project_setting_model":
+        await this.updateProjectSettingModel(action);
+        return { ok: true, text: "项目默认模型已更新，新任务会按新模型执行。" };
+      case "project_setting_reasoning":
+        await this.updateProjectSettingReasoning(action);
+        return { ok: true, text: "项目默认思考强度已更新，新任务会按新设置执行。" };
+      case "project_notification_level":
+        await this.updateProjectNotificationLevel(action);
+        return { ok: true, text: "项目通知级别已更新。" };
       case "project_running":
         await this.listClaimableSessions(
           action.chatId || this.config.feishu.defaultChatId || "",
@@ -520,12 +649,60 @@ export class TaskService {
       case "notification_history":
         await this.sendNotificationHistory(action);
         return { ok: true };
+      case "notification_settings_global":
+        await this.sendGlobalNotificationSettings(action);
+        return { ok: true };
+      case "notification_level_set":
+        await this.updateNotificationLevel(action);
+        return { ok: true, text: "通知级别已更新。" };
+      case "task_list_recent":
+        await this.sendTaskList(action, "recent");
+        return { ok: true };
+      case "task_list_running":
+        await this.sendTaskList(action, "running");
+        return { ok: true };
+      case "task_list_completed":
+        await this.sendTaskList(action, "completed");
+        return { ok: true };
+      case "task_list_failed":
+        await this.sendTaskList(action, "failed");
+        return { ok: true };
+      case "task_list_archived":
+        await this.sendTaskList(action, "archived");
+        return { ok: true };
+      case "task_search":
+        await this.sendTaskSearch(action);
+        return { ok: true };
+      case "approval_list_all":
+        await this.sendApprovalListAll(action);
+        return { ok: true };
       case "task_status":
         await this.sendTaskStatus(action);
         return { ok: true };
       case "task_logs":
         await this.sendTaskProcess(action);
         return { ok: true };
+      case "task_impact":
+        await this.sendTaskImpact(action);
+        return { ok: true };
+      case "task_restore_confirm":
+        await this.sendTaskRestoreConfirm(action);
+        return { ok: true };
+      case "task_restore_apply":
+        await this.applyTaskRestore(action);
+        return { ok: true };
+      case "task_detail":
+        await this.sendTaskDetail(action);
+        return { ok: true };
+      case "task_settings":
+        await this.sendTaskSettings(action);
+        return { ok: true };
+      case "task_setting_model":
+        await this.updateTaskSettingModel(action);
+        return { ok: true, text: "模型已更新，下一轮处理会按新模型执行。" };
+      case "task_setting_reasoning":
+        await this.updateTaskSettingReasoning(action);
+        return { ok: true, text: "思考强度已更新，下一轮处理会按新设置执行。" };
       case "task_continue":
       case "task_append_hint":
         return { ok: true, text: "请直接在当前任务会话回复要追加的要求。" };
@@ -550,6 +727,9 @@ export class TaskService {
       case "task_archive":
         await this.archiveTask(String(action.payload.bindingId ?? ""));
         return { ok: true, text: "任务已归档。" };
+      case "task_unarchive":
+        await this.unarchiveTask(String(action.payload.bindingId ?? ""));
+        return { ok: true, text: "任务已恢复，可继续处理。" };
       case "new_related_task":
         await this.sendNewTaskDraft(action);
         return { ok: true };
@@ -616,6 +796,14 @@ export class TaskService {
 
     if (command === "projects") return base("project_list");
     if (command === "unclassified") return base("unclassified_threads");
+    if (command === "recent") return base("task_list_recent");
+    if (command === "running") return base("task_list_running");
+    if (command === "completed") return base("task_list_completed");
+    if (command === "failed") return base("task_list_failed");
+    if (command === "archived") return base("task_list_archived");
+    if (command === "search") {
+      return base("task_search", { query: requireArgument(parts.slice(1).join(" "), "/search <关键词>") });
+    }
     if (command === "create-project") {
       return base("unclassified_create_project", {
         codexThreadId: requireArgument(parts[1], "/create-project <codexThreadId>")
@@ -634,6 +822,9 @@ export class TaskService {
     }
     if (command === "status") return base("task_status", { bindingId: requireCurrentBindingId(currentBinding, command) });
     if (command === "logs") return base("task_logs", { bindingId: requireCurrentBindingId(currentBinding, command) });
+    if (command === "impact") return base("task_impact", { bindingId: requireCurrentBindingId(currentBinding, command) });
+    if (command === "detail") return base("task_detail", { bindingId: requireCurrentBindingId(currentBinding, command) });
+    if (command === "settings") return base("task_settings", { bindingId: requireCurrentBindingId(currentBinding, command) });
     if (command === "queue") {
       if (parts[1]?.toLowerCase() === "cancel") {
         return base("queue_cancel", {
@@ -782,6 +973,35 @@ export class TaskService {
     await this.feishu.sendCard(chatId, this.cards.diagnosticCard(await this.diagnostics.snapshot()), rootMessageId);
   }
 
+  private async runDiagnosticRecover(action: FeishuCardAction): Promise<Record<string, unknown>> {
+    const chatId = action.chatId || this.config.feishu.defaultChatId || "";
+    await this.feishu.sendText(chatId, "正在恢复：检查 Codex 连接、重置失败通知、同步任务状态。", action.rootMessageId);
+    const before = await this.diagnostics.snapshot();
+    let codexRecovered = false;
+    if (before.appServerStatus !== "connected") {
+      await this.codex.stop().catch((error) => {
+        this.logger.warn("codex stop during recovery failed", { error: String(error) });
+      });
+      await this.codex.start();
+      codexRecovered = true;
+    } else {
+      await this.codex.start();
+    }
+    const resetOutbox = this.repo.resetDeadOutbox(50);
+    await this.reconcilePersistedBindings();
+    const after = await this.diagnostics.snapshot();
+    await this.feishu.sendCard(chatId, this.cards.diagnosticCard(after), action.rootMessageId);
+    return {
+      ok: true,
+      text: [
+        "恢复完成。",
+        `Codex：${before.appServerStatus} -> ${after.appServerStatus}${codexRecovered ? "（已重启）" : ""}`,
+        `失败通知重置：${resetOutbox} 条`,
+        "长连接如果处于 SDK 自动重连中，会继续由飞书 SDK 维持；如仍无事件，请重启 bridge 进程。"
+      ].join("\n")
+    };
+  }
+
   private async claimThreadById(action: FeishuCardAction): Promise<Record<string, unknown>> {
     const threadId = String(action.payload.codexThreadId ?? "");
     if (!threadId) throw new Error("缺少 Codex 任务 ID");
@@ -808,6 +1028,8 @@ export class TaskService {
         projectName: "未归类项目",
         status: thread.status,
         cwd: thread.cwd,
+        selectedModel: null,
+        selectedReasoningEffort: null,
         queuedMessages: 0,
         pendingApprovals: 0,
         lastTurnId: null,
@@ -843,6 +1065,62 @@ export class TaskService {
     for (const project of projects.slice(0, 3)) {
       await this.feishu.sendCard(chatId, this.cards.projectCard(this.buildProjectCardInput(project)), action.rootMessageId);
     }
+  }
+
+  private async sendProjectSettings(action: FeishuCardAction): Promise<void> {
+    const projectId = String(action.payload.projectId ?? "");
+    if (!projectId) throw new Error("缺少项目 ID");
+    const project = this.repo.getProject(projectId);
+    if (!project) throw new Error("项目不存在");
+    const models = await this.getModelOptions();
+    await this.feishu.sendCard(
+      action.chatId || this.config.feishu.defaultChatId || "",
+      this.cards.projectSettingsCard({
+        projectId: project.id,
+        projectName: project.name,
+        rootPath: project.rootPath,
+        currentModel: projectModel(project, this.config),
+        currentReasoningEffort: projectReasoningEffort(project, this.config),
+        currentNotificationLevel: resolveProjectNotificationLevel(project),
+        modelOptions: prioritizeModels(models, projectModel(project, this.config)),
+        reasoningOptions: prioritizeReasoningOptions(
+          models,
+          projectModel(project, this.config),
+          projectReasoningEffort(project, this.config)
+        )
+      }),
+      action.rootMessageId
+    );
+  }
+
+  private async updateProjectSettingModel(action: FeishuCardAction): Promise<void> {
+    const projectId = String(action.payload.projectId ?? "").trim();
+    const model = String(action.payload.model ?? "").trim();
+    if (!projectId) throw new Error("缺少项目 ID");
+    if (!model) throw new Error("缺少模型参数");
+    const project = this.repo.getProject(projectId);
+    if (!project) throw new Error("项目不存在");
+    this.repo.updateProjectDefaults({ projectId, defaultModel: model });
+  }
+
+  private async updateProjectSettingReasoning(action: FeishuCardAction): Promise<void> {
+    const projectId = String(action.payload.projectId ?? "").trim();
+    const reasoningEffort = String(action.payload.reasoningEffort ?? "").trim();
+    if (!projectId) throw new Error("缺少项目 ID");
+    if (!reasoningEffort) throw new Error("缺少思考强度参数");
+    const project = this.repo.getProject(projectId);
+    if (!project) throw new Error("项目不存在");
+    this.repo.updateProjectDefaults({ projectId, defaultReasoningEffort: reasoningEffort });
+  }
+
+  private async updateProjectNotificationLevel(action: FeishuCardAction): Promise<void> {
+    const projectId = String(action.payload.projectId ?? "").trim();
+    const level = String(action.payload.level ?? "").trim();
+    if (!projectId) throw new Error("缺少项目 ID");
+    if (!level) throw new Error("缺少通知级别参数");
+    const project = this.repo.getProject(projectId);
+    if (!project) throw new Error("项目不存在");
+    this.repo.updateProjectNotificationPolicy(projectId, level);
   }
 
   private async sendUnclassifiedThreads(action: FeishuCardAction): Promise<void> {
@@ -1019,6 +1297,86 @@ export class TaskService {
     await this.feishu.sendCard(chatId, this.cards.notificationHistoryCard(this.repo.listRecentOutbox(20)), action.rootMessageId);
   }
 
+  private async sendGlobalNotificationSettings(action: FeishuCardAction): Promise<void> {
+    const chatId = action.chatId || this.config.feishu.defaultChatId || "";
+    const current = this.repo.getNotificationPreference("global", "bridge", null)?.level ?? "important";
+    await this.feishu.sendCard(
+      chatId,
+      this.cards.notificationSettingsCard({
+        title: "通知设置",
+        scopeType: "global",
+        scopeId: "bridge",
+        currentLevel: current,
+        description: "这里控制默认主动通知策略。状态卡刷新和手动查看不受影响。"
+      }),
+      action.rootMessageId
+    );
+  }
+
+  private async updateNotificationLevel(action: FeishuCardAction): Promise<void> {
+    const scopeType = String(action.payload.scopeType ?? "").trim() as "global" | "project" | "session";
+    const scopeId = String(action.payload.scopeId ?? "").trim();
+    const level = String(action.payload.level ?? "").trim() as NotificationLevel;
+    if (!scopeType) throw new Error("缺少通知作用域");
+    if (!scopeId) throw new Error("缺少通知作用域 ID");
+    if (!level) throw new Error("缺少通知级别");
+    this.repo.upsertNotificationPreference({
+      scopeType,
+      scopeId,
+      level
+    });
+  }
+
+  private async sendTaskList(action: FeishuCardAction, kind: TaskListKind): Promise<void> {
+    const chatId = action.chatId || this.config.feishu.defaultChatId || "";
+    const titleMap: Record<TaskListKind, string> = {
+      recent: "最近任务",
+      running: "运行中任务",
+      completed: "已完成任务",
+      failed: "失败/中断任务",
+      archived: "已归档任务"
+    };
+    if (kind === "archived") {
+      const tasks = this.repo
+        .listBindingsByStatuses(["archived"], 10)
+        .map((binding) => {
+          const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
+          return {
+            bindingId: binding.id,
+            title: binding.title ?? "Codex 任务",
+            projectName: project?.name ?? "未归类项目",
+            status: binding.status,
+            updatedAt: binding.updatedAt
+          };
+        });
+      await this.feishu.sendCard(chatId, this.cards.archivedTaskCenterCard(tasks), action.rootMessageId);
+      return;
+    }
+    await this.feishu.sendCard(chatId, this.cards.taskListCard(titleMap[kind], this.listTaskSummaries(kind, 10)), action.rootMessageId);
+  }
+
+  private async sendTaskSearch(action: FeishuCardAction): Promise<void> {
+    const chatId = action.chatId || this.config.feishu.defaultChatId || "";
+    const query = String(action.payload.query ?? "").trim();
+    if (!query) throw new Error("缺少搜索关键词");
+    const tasks = this.repo.searchBindings(query, 10).map((binding) => {
+      const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
+      return {
+        bindingId: binding.id,
+        title: binding.title ?? "Codex 任务",
+        status: binding.status,
+        projectName: project?.name ?? "未归类项目",
+        updatedAt: binding.updatedAt
+      };
+    });
+    await this.feishu.sendCard(chatId, this.cards.taskSearchCard({ query, tasks }), action.rootMessageId);
+  }
+
+  private async sendApprovalListAll(action: FeishuCardAction): Promise<void> {
+    const chatId = action.chatId || this.config.feishu.defaultChatId || "";
+    await this.feishu.sendCard(chatId, this.cards.approvalListCard(this.repo.listPendingApprovals()), action.rootMessageId);
+  }
+
   private async sendTaskStatus(action: FeishuCardAction): Promise<void> {
     const binding = this.requireBinding(action);
     await this.sendCardToTarget(
@@ -1033,6 +1391,133 @@ export class TaskService {
       this.targetForBinding(binding, action.chatId),
       this.cards.taskProcessCard(this.buildTaskProcessProjection(binding))
     );
+  }
+
+  private async sendTaskImpact(action: FeishuCardAction): Promise<void> {
+    const binding = this.requireBinding(action);
+    const fallbackPair = this.workspaceCheckpointPair(binding);
+    const impact = compareWorkspaceManifests(fallbackPair.start, fallbackPair.end);
+    await this.sendCardToTarget(
+      this.targetForBinding(binding, action.chatId),
+      this.cards.taskImpactCard({
+        bindingId: binding.id,
+        title: binding.title ?? "Codex 任务",
+        impact,
+        startCheckpoint: fallbackPair.start,
+        endCheckpoint: fallbackPair.end,
+        detailUrl: this.localTaskDetailUrl(binding.id)
+      })
+    );
+  }
+
+  private async sendTaskRestoreConfirm(action: FeishuCardAction): Promise<void> {
+    const binding = this.requireBinding(action);
+    const pair = this.workspaceCheckpointPair(binding);
+    const impact = compareWorkspaceManifests(pair.start, pair.end);
+    await this.sendCardToTarget(
+      this.targetForBinding(binding, action.chatId),
+      this.cards.taskRestoreConfirmCard({
+        bindingId: binding.id,
+        title: binding.title ?? "Codex 任务",
+        impact
+      })
+    );
+  }
+
+  private async applyTaskRestore(action: FeishuCardAction): Promise<void> {
+    const binding = this.requireBinding(action);
+    const pair = this.workspaceCheckpointPair(binding);
+    if (!pair.start || !pair.end) throw new Error("缺少可撤销的检查点");
+    await this.captureCheckpoint(binding.id, "manual", binding.lastTurnId, "撤销前备份");
+    const result = restoreWorkspaceFromCheckpoints(pair.start, pair.end);
+    this.repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      codexTurnId: binding.lastTurnId,
+      eventType: "workspace.restore_applied",
+      eventPayload: { result }
+    });
+    await this.sendCardToTarget(
+      this.targetForBinding(binding, action.chatId),
+      this.cards.taskRestoreResultCard({
+        title: binding.title ?? "Codex 任务",
+        result
+      })
+    );
+  }
+
+  private async sendTaskDetail(action: FeishuCardAction): Promise<void> {
+    const binding = this.requireBinding(action);
+    const status = this.projection.buildTaskStatus(binding.id);
+    await this.sendCardToTarget(
+      this.targetForBinding(binding, action.chatId),
+      this.cards.taskDetailCard({
+        bindingId: binding.id,
+        title: status.title,
+        status: status.status,
+        projectName: status.projectName,
+        cwd: status.cwd,
+        model: status.selectedModel,
+        reasoningEffort: status.selectedReasoningEffort,
+        queuedMessages: status.queuedMessages,
+        pendingApprovals: status.pendingApprovals,
+        checkpoints: this.repo.listWorkspaceCheckpoints(binding.id, 100).length,
+        updatedAt: status.updatedAt,
+        lastSummary: status.lastSummary,
+        detailUrl: this.localTaskDetailUrl(binding.id)
+      })
+    );
+  }
+
+  private async sendTaskSettings(action: FeishuCardAction): Promise<void> {
+    const binding = this.requireBinding(action);
+    const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
+    const models = await this.getModelOptions();
+    await this.sendCardToTarget(
+      this.targetForBinding(binding, action.chatId),
+      this.cards.taskSettingsCard({
+        bindingId: binding.id,
+        title: binding.title ?? "Codex 任务",
+        projectName: project?.name ?? "未归类项目",
+        currentModel: resolveBindingModel(binding, project, this.config),
+        currentReasoningEffort: resolveBindingReasoningEffort(binding, project, this.config),
+        currentNotificationLevel: this.repo.getNotificationPreference("session", binding.id, null)?.level ?? resolveProjectNotificationLevel(project),
+        modelOptions: prioritizeModels(models, resolveBindingModel(binding, project, this.config)),
+        reasoningOptions: prioritizeReasoningOptions(
+          models,
+          resolveBindingModel(binding, project, this.config),
+          resolveBindingReasoningEffort(binding, project, this.config)
+        )
+      })
+    );
+  }
+
+  private async updateTaskSettingModel(action: FeishuCardAction): Promise<void> {
+    const binding = this.requireBinding(action);
+    const model = String(action.payload.model ?? "").trim();
+    if (!model) throw new Error("缺少模型参数");
+    this.repo.updateBindingSettings({ bindingId: binding.id, selectedModel: model });
+    this.repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      eventType: "task.settings_updated",
+      eventPayload: { selectedModel: model }
+    });
+    await this.updateTaskCard(binding.id);
+  }
+
+  private async updateTaskSettingReasoning(action: FeishuCardAction): Promise<void> {
+    const binding = this.requireBinding(action);
+    const reasoningEffort = String(action.payload.reasoningEffort ?? "").trim();
+    if (!reasoningEffort) throw new Error("缺少思考强度参数");
+    this.repo.updateBindingSettings({ bindingId: binding.id, selectedReasoningEffort: reasoningEffort });
+    this.repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      eventType: "task.settings_updated",
+      eventPayload: { selectedReasoningEffort: reasoningEffort }
+    });
+    await this.updateTaskCard(binding.id);
   }
 
   private async sendApprovalList(action: FeishuCardAction): Promise<void> {
@@ -1068,6 +1553,23 @@ export class TaskService {
       this.logger.warn("codex thread archive failed", { bindingId, threadId: binding.codexThreadId, error: String(error) });
     });
     await this.updateTaskTitle(binding.id, "archived", binding.title ?? "Codex 任务");
+    await this.updateTaskCard(binding.id);
+  }
+
+  private async unarchiveTask(bindingId: string): Promise<void> {
+    const binding = this.repo.findBindingById(bindingId);
+    if (!binding) throw new Error("任务不存在");
+    await this.codex.unarchiveThread(binding.codexThreadId).catch((error) => {
+      this.logger.warn("codex thread unarchive failed", { bindingId, threadId: binding.codexThreadId, error: String(error) });
+    });
+    this.repo.updateBindingStatus(binding.id, "idle");
+    this.repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      eventType: "task.unarchived",
+      eventPayload: {}
+    });
+    await this.updateTaskTitle(binding.id, "idle", binding.title ?? "Codex 任务");
     await this.updateTaskCard(binding.id);
   }
 
@@ -1245,6 +1747,12 @@ export class TaskService {
       riskLevel: method.includes("commandExecution") ? classifyCommandRisk(command) : "medium"
     });
     this.repo.updateBindingStatus(binding.id, "waiting_for_approval", asString(params.turnId));
+    this.repo.upsertThreadOwnership({
+      codexThreadId: threadId,
+      ownerKind: "app_server",
+      ownerClientId: this.config.machine.id,
+      confidence: "medium"
+    });
     const event = this.repo.insertEvent({
       sessionBindingId: binding.id,
       codexThreadId: threadId,
@@ -1284,7 +1792,14 @@ export class TaskService {
     if (method === "turn/started") {
       const turn = params.turn && typeof params.turn === "object" ? (params.turn as Record<string, unknown>) : {};
       const turnId = asString(turn.id);
+      this.resetProgressState(binding.id);
       this.repo.updateBindingStatus(binding.id, "running", turnId);
+      this.repo.upsertThreadOwnership({
+        codexThreadId: threadId,
+        ownerKind: "app_server",
+        ownerClientId: this.config.machine.id,
+        confidence: "medium"
+      });
       this.repo.insertEvent({
         sessionBindingId: binding.id,
         codexThreadId: threadId,
@@ -1300,6 +1815,7 @@ export class TaskService {
       if (!turnId) throw new Error("turn/completed notification missing turn.id");
       const status = normalizeTurnStatus(turn.status);
       this.repo.updateBindingStatus(binding.id, status, turnId);
+      const endCheckpoint = await this.captureCheckpoint(binding.id, "turn_end", turnId, `任务${taskStatusText(status)}`);
       const detail = await this.codex.readThread(threadId, true).catch(() => null);
       const report =
         status === "completed"
@@ -1326,6 +1842,7 @@ export class TaskService {
           text: summaryText,
           reasoningSummary,
           finalResult,
+          workspaceCheckpointId: endCheckpoint?.id ?? null,
           turn
         }
       });
@@ -1354,6 +1871,7 @@ export class TaskService {
           binding,
           report,
           status,
+          this.repo.listEventsForBinding(binding.id, 200),
           binding.projectId ? this.repo.getProject(binding.projectId)?.name ?? null : null
         );
         this.repo.enqueueOutbox({
@@ -1365,11 +1883,12 @@ export class TaskService {
           feishuThreadId: binding.feishuThreadId,
           payload: {
             card: this.cards.taskReportCard(formattedReport),
-            ...(formattedReport.finalResultTruncated ? { text: formatFullFinalResult(report) } : {})
+            ...(shouldSendFullFinalResult(formattedReport) ? { text: formatFullFinalResult(report) } : {})
           },
           dedupeKey: `turn:${threadId}:${turnId}:result`
         });
       }
+      this.clearProgressCard(binding.id);
       await this.deliverNextQueuedMessage(binding.id);
     }
     if (method === "item/completed") {
@@ -1617,16 +2136,81 @@ export class TaskService {
     const [next] = this.repo.listQueuedMessages(bindingId);
     if (!next) return;
     this.repo.markQueuedDelivered(next.id);
+    this.resetProgressState(binding.id);
     this.repo.updateBindingStatus(binding.id, "running");
     await this.updateTaskTitle(binding.id, "running", binding.title ?? "Codex 任务");
     await this.updateTaskCard(binding.id);
     await this.codex.resumeThread(binding.codexThreadId);
     const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
+    const startCheckpoint = await this.captureCheckpoint(binding.id, "turn_start", null, "队列消息开始前");
     await this.codex.startTurn(binding.codexThreadId, next.text, {
       cwd: binding.cwd,
-      model: projectModel(project, this.config),
-      reasoningEffort: projectReasoningEffort(project, this.config)
+      model: resolveBindingModel(binding, project, this.config),
+      reasoningEffort: resolveBindingReasoningEffort(binding, project, this.config)
+    }).then((turn) => {
+      const turnId = extractTurnId(turn);
+      if (startCheckpoint && turnId) this.repo.updateWorkspaceCheckpointTurnId(startCheckpoint.id, turnId);
+      if (turnId) this.repo.updateBindingStatus(binding.id, "running", turnId);
+      return turn;
     });
+  }
+
+  private async captureCheckpoint(
+    bindingId: string,
+    kind: WorkspaceCheckpointKind,
+    turnId: string | null,
+    note: string
+  ): Promise<WorkspaceCheckpoint | null> {
+    const binding = this.repo.findBindingById(bindingId);
+    if (!binding?.cwd) return null;
+    return this.captureCheckpointForWorkspace({
+      binding,
+      codexThreadId: binding.codexThreadId,
+      workspaceRoot: binding.cwd,
+      kind,
+      turnId,
+      note
+    });
+  }
+
+  private async captureCheckpointForWorkspace(input: {
+    binding: SessionBinding;
+    codexThreadId: string;
+    workspaceRoot: string | null;
+    kind: WorkspaceCheckpointKind;
+    turnId: string | null;
+    note: string;
+  }): Promise<WorkspaceCheckpoint | null> {
+    if (!input.workspaceRoot) return null;
+    try {
+      return this.repo.createWorkspaceCheckpoint({
+        sessionBindingId: input.binding.id,
+        codexThreadId: input.codexThreadId,
+        turnId: input.turnId,
+        workspaceRoot: input.workspaceRoot,
+        checkpointRef: `${input.kind}:${input.codexThreadId}:${input.turnId ?? Date.now().toString(36)}`,
+        snapshotNote: input.note,
+        kind: input.kind,
+        manifest: captureWorkspaceManifest(input.workspaceRoot)
+      });
+    } catch (error) {
+      this.logger.warn("workspace checkpoint capture failed", {
+        bindingId: input.binding.id,
+        kind: input.kind,
+        turnId: input.turnId,
+        cwd: input.workspaceRoot,
+        error: String(error)
+      });
+      return null;
+    }
+  }
+
+  private workspaceCheckpointPair(binding: SessionBinding): {
+    start: WorkspaceCheckpoint | null;
+    end: WorkspaceCheckpoint | null;
+  } {
+    const pair = this.repo.findWorkspaceCheckpointPair(binding.id, binding.lastTurnId);
+    return pair.end ? pair : this.repo.findWorkspaceCheckpointPair(binding.id);
   }
 
   private async updateTaskCard(bindingId: string): Promise<void> {
@@ -1708,6 +2292,8 @@ export class TaskService {
     runningCount: number;
     pendingApprovals: number;
     completedCount: number;
+    defaultModel: string;
+    defaultReasoningEffort: string;
   } {
     const bindings = this.repo.listBindings(500).filter((binding) => binding.projectId === project.id);
     const runningCount = bindings.filter((binding) => binding.status === "running").length;
@@ -1719,8 +2305,76 @@ export class TaskService {
       rootPath: project.rootPath,
       runningCount,
       pendingApprovals,
-      completedCount
+      completedCount,
+      defaultModel: projectModel(project, this.config),
+      defaultReasoningEffort: projectReasoningEffort(project, this.config)
     };
+  }
+
+  private resetProgressState(bindingId: string): void {
+    for (const key of [...this.progressState.keys()]) {
+      if (key.startsWith(`${bindingId}:`)) this.progressState.delete(key);
+    }
+    const current = this.progressCards.get(bindingId);
+    if (current) {
+      current.sections.clear();
+      current.lastUpdatedAt = Date.now();
+      this.progressCards.set(bindingId, current);
+    }
+  }
+
+  private clearProgressCard(bindingId: string): void {
+    const current = this.progressCards.get(bindingId);
+    if (current) {
+      current.sections.clear();
+      current.lastUpdatedAt = Date.now();
+      this.progressCards.set(bindingId, current);
+    }
+  }
+
+  private listTaskSummaries(kind: TaskListKind, limit: number): Array<{
+    bindingId: string;
+    title: string;
+    status: string;
+    projectName: string;
+    model: string | null;
+    reasoningEffort: string | null;
+  }> {
+    const bindings =
+      kind === "recent"
+        ? this.repo.listBindings(limit)
+        : this.repo.listBindingsByStatuses(taskListStatuses(kind), limit);
+    return bindings.map((binding) => {
+      const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
+      return {
+        bindingId: binding.id,
+        title: binding.title ?? "Codex 任务",
+        status: binding.status,
+        projectName: project?.name ?? "未归类项目",
+        model: resolveBindingModel(binding, project, this.config),
+        reasoningEffort: resolveBindingReasoningEffort(binding, project, this.config)
+      };
+    });
+  }
+
+  private async getModelOptions(): Promise<CodexModelSummary[]> {
+    try {
+      const models = await this.codex.listModels(20);
+      return models.length > 0 ? models : fallbackModelOptions(this.config);
+    } catch (error) {
+      this.logger.warn("codex model list failed, fallback to defaults", { error: String(error) });
+      return fallbackModelOptions(this.config);
+    }
+  }
+
+  private localTaskDetailUrl(bindingId: string): string | null {
+    const httpStartedByConfig =
+      this.config.server.mode === "enabled" ||
+      (this.config.server.mode === "auto" &&
+        (this.config.feishu.messageTransport === "http_callback" || this.config.feishu.cardActionTransport === "http_callback"));
+    if (!httpStartedByConfig || !this.config.server.host) return null;
+    const host = this.config.server.host === "0.0.0.0" || this.config.server.host === "::" ? "127.0.0.1" : this.config.server.host;
+    return `http://${host}:${this.config.server.port}/task/${encodeURIComponent(bindingId)}?token=${encodeURIComponent(this.config.server.adminToken)}`;
   }
 }
 
@@ -1766,6 +2420,69 @@ const projectModel = (project: Project | null, config: BridgeConfig): string =>
 const projectReasoningEffort = (project: Project | null, config: BridgeConfig): string =>
   project?.defaultReasoningEffort ?? config.codex.defaultReasoningEffort;
 
+const resolveBindingModel = (binding: SessionBinding, project: Project | null, config: BridgeConfig): string =>
+  binding.selectedModel ?? projectModel(project, config);
+
+const resolveBindingReasoningEffort = (binding: SessionBinding, project: Project | null, config: BridgeConfig): string =>
+  binding.selectedReasoningEffort ?? projectReasoningEffort(project, config);
+
+const resolveProjectNotificationLevel = (project: Project | null): NotificationLevel =>
+  normalizeNotificationLevel(project?.notificationPolicy);
+
+const normalizeNotificationLevel = (value: string | null | undefined): NotificationLevel => {
+  if (value === "all" || value === "important" || value === "errors" || value === "muted") return value;
+  return "important";
+};
+
+const taskListStatuses = (kind: TaskListKind): TaskStatus[] => {
+  switch (kind) {
+    case "running":
+      return ["running", "waiting_for_approval"];
+    case "completed":
+      return ["completed"];
+    case "failed":
+      return ["failed", "interrupted"];
+    case "archived":
+      return ["archived"];
+    default:
+      return [];
+  }
+};
+
+const fallbackModelOptions = (config: BridgeConfig): CodexModelSummary[] => [
+  {
+    id: config.codex.defaultModel,
+    model: config.codex.defaultModel,
+    displayName: config.codex.defaultModel,
+    defaultReasoningEffort: config.codex.defaultReasoningEffort,
+    supportedReasoningEfforts: ["minimal", "low", "medium", "high", "xhigh"],
+    isDefault: true
+  }
+];
+
+const prioritizeModels = (models: CodexModelSummary[], currentModel: string): string[] => {
+  const ordered = [...models]
+    .sort((left, right) => {
+      if (left.model === currentModel) return -1;
+      if (right.model === currentModel) return 1;
+      if (left.isDefault && !right.isDefault) return -1;
+      if (!left.isDefault && right.isDefault) return 1;
+      return left.model.localeCompare(right.model);
+    })
+    .map((model) => model.model);
+  return [...new Set([currentModel, ...ordered])].slice(0, 8);
+};
+
+const prioritizeReasoningOptions = (
+  models: CodexModelSummary[],
+  currentModel: string,
+  currentReasoningEffort: string
+): string[] => {
+  const current = models.find((model) => model.model === currentModel);
+  const supported = current?.supportedReasoningEfforts ?? ["minimal", "low", "medium", "high", "xhigh"];
+  return [...new Set([currentReasoningEffort, ...supported])].slice(0, 8);
+};
+
 const taskStatusText = (status: TaskStatus): string =>
   ({
     draft: "草稿",
@@ -1792,7 +2509,7 @@ const isTerminalStatus = (status: TaskStatus): boolean =>
 
 const isCommandText = (text: string): boolean =>
   text.startsWith("/") ||
-  ["项目列表", "查看进度", "查看日志", "处理记录", "查看队列", "通知历史", "发送测试通知", "未归类任务"].includes(text);
+  ["项目列表", "查看进度", "查看日志", "处理记录", "查看队列", "通知历史", "发送测试通知", "未归类任务", "设置"].includes(text);
 
 const normalizeCommand = (value: string): string => {
   const lowered = value.trim().toLowerCase().replace(/^\/+/, "");
@@ -1810,6 +2527,14 @@ const normalizeCommand = (value: string): string => {
     "归入已有项目": "pick-project",
     "查看进度": "status",
     status: "status",
+    "详情": "detail",
+    detail: "detail",
+    "本次影响": "impact",
+    impact: "impact",
+    "搜索": "search",
+    search: "search",
+    settings: "settings",
+    "设置": "settings",
     "查看日志": "logs",
     "处理记录": "logs",
     logs: "logs",
@@ -1817,6 +2542,10 @@ const normalizeCommand = (value: string): string => {
     "查看队列": "queue",
     queue: "queue",
     claim: "claim",
+    recent: "recent",
+    running: "running",
+    completed: "completed",
+    failed: "failed",
     "通知历史": "notify history",
     "发送测试通知": "notify test",
     notify: "notify",
@@ -2036,15 +2765,30 @@ const buildCompletedItemEvent = (item: Record<string, unknown>): { eventType: st
   return null;
 };
 
-const formatThreadReport = (binding: SessionBinding, report: ThreadReport, status: TaskStatus, projectName: string | null) => {
+const formatThreadReport = (
+  binding: SessionBinding,
+  report: ThreadReport,
+  status: TaskStatus,
+  events: TaskEvent[],
+  projectName: string | null
+) => {
   const reasoningSummary = report.reasoningSummary ? truncatePlain(report.reasoningSummary, 1200) : null;
   const finalResult = report.finalResult ? truncatePlain(report.finalResult, 1800) : null;
+  const highlights = deriveHighlights(reasoningSummary, finalResult, 3);
+  const changeItems = deriveChangeItems(events, reasoningSummary, finalResult, 3);
+  const verificationItems = deriveVerificationItems(events, reasoningSummary, finalResult, 3);
+  const nextSteps = deriveNextSteps(finalResult, 3);
   return {
     title: binding.title ?? "Codex 任务",
     status,
     projectName: projectName ?? "Playground",
     reasoningSummary,
     finalResult,
+    highlights,
+    changeItems,
+    verificationItems,
+    nextSteps,
+    fullFinalResult: report.finalResult,
     finalResultTruncated: Boolean(report.finalResult) && finalResult !== report.finalResult,
     updatedAt: new Date().toISOString()
   };
@@ -2057,6 +2801,11 @@ const formatFullFinalResult = (report: ThreadReport): string => {
   ];
   return lines.join("\n\n");
 };
+
+const shouldSendFullFinalResult = (projection: {
+  finalResultTruncated?: boolean;
+  fullFinalResult?: string | null;
+}): boolean => Boolean(projection.finalResultTruncated && projection.fullFinalResult && projection.fullFinalResult.trim().length > 0);
 
 const firstSanitized = (items: string[]): string | null => {
   for (const item of items) {
@@ -2219,6 +2968,73 @@ const sanitizeProgressText = (text: string): string => {
 const sanitizeProcessText = (text: string, maxLength = 1800): string => {
   const sanitized = sanitizeAssistantSummary(text, maxLength);
   return sanitized.length > maxLength ? truncatePlain(sanitized, maxLength) : sanitized;
+};
+
+const deriveHighlights = (reasoningSummary: string | null, finalResult: string | null, limit: number): string[] => {
+  const source = [finalResult, reasoningSummary].filter(Boolean).join("\n");
+  if (!source.trim()) return [];
+  return splitIntoBulletCandidates(source)
+    .slice(0, limit)
+    .map((line) => truncatePlain(line, 120));
+};
+
+const deriveNextSteps = (finalResult: string | null, limit: number): string[] => {
+  if (!finalResult) return [];
+  const lines = splitIntoBulletCandidates(finalResult).filter((line) =>
+    /(建议|后续|下一步|可以|需要|应当|推荐|继续)/.test(line)
+  );
+  return lines.slice(0, limit).map((line) => truncatePlain(line, 120));
+};
+
+const deriveChangeItems = (events: TaskEvent[], reasoningSummary: string | null, finalResult: string | null, limit: number): string[] => {
+  const eventItems = deriveItemsFromEvents(
+    events,
+    ["codex.plan", "codex.plan_updated", "codex.plan_delta", "codex.agent_message", "codex.agent_delta"],
+    /(修改|新增|调整|修复|更新|重构|处理了|实现了)/
+  );
+  if (eventItems.length > 0) return eventItems.slice(0, limit).map((line) => truncatePlain(line, 120));
+  const source = [reasoningSummary, finalResult].filter(Boolean).join("\n");
+  if (!source) return [];
+  return splitIntoBulletCandidates(source)
+    .filter((line) => /(修改|新增|调整|修复|更新|重构|处理了|实现了)/.test(line))
+    .slice(0, limit)
+    .map((line) => truncatePlain(line, 120));
+};
+
+const deriveVerificationItems = (events: TaskEvent[], reasoningSummary: string | null, finalResult: string | null, limit: number): string[] => {
+  const eventItems = deriveItemsFromEvents(
+    events,
+    ["codex.agent_message", "codex.agent_delta", "codex.plan", "codex.plan_updated", "codex.tool_progress"],
+    /(测试|验证|通过|失败|检查|确认|运行)/
+  );
+  if (eventItems.length > 0) return eventItems.slice(0, limit).map((line) => truncatePlain(line, 120));
+  const source = [finalResult, reasoningSummary].filter(Boolean).join("\n");
+  if (!source) return [];
+  return splitIntoBulletCandidates(source)
+    .filter((line) => /(测试|验证|通过|失败|检查|确认|运行)/.test(line))
+    .slice(0, limit)
+    .map((line) => truncatePlain(line, 120));
+};
+
+const splitIntoBulletCandidates = (value: string): string[] =>
+  value
+    .split(/[\r\n。；;]+/)
+    .map((line) => line.replace(/^\s*[-*•\d.]+\s*/, "").trim())
+    .filter((line) => line.length >= 6);
+
+const deriveItemsFromEvents = (events: TaskEvent[], eventTypes: string[], matcher: RegExp): string[] => {
+  const wanted = new Set(eventTypes);
+  const results: string[] = [];
+  for (const event of events) {
+    if (!wanted.has(event.eventType)) continue;
+    const text = asString(event.eventPayload.text);
+    if (!text) continue;
+    for (const line of splitIntoBulletCandidates(text)) {
+      if (!matcher.test(line)) continue;
+      if (!results.includes(line)) results.push(line);
+    }
+  }
+  return results;
 };
 
 const inferProjectName = (cwd: string, fallback: string): string => {

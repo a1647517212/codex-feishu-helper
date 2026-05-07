@@ -36,7 +36,7 @@ export const makeTempRepo = (): {
 export const makeConfig = (dir: string): BridgeConfig => ({
   configPath: join(dir, "config.json"),
   machine: { id: "test-machine", name: "Test Machine" },
-  server: { host: "127.0.0.1", port: 0, adminToken: "test-token" },
+  server: { host: "127.0.0.1", port: 0, mode: "auto", adminToken: "test-token" },
   codex: {
     command: "codex",
     args: ["app-server"],

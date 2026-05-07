@@ -1,5 +1,5 @@
 import type { BridgeConfig } from "../config.js";
-import type { NotificationOutboxItem } from "../core/types.js";
+import type { NotificationLevel, NotificationOutboxItem, Project, SessionBinding } from "../core/types.js";
 import type { Repository } from "../db/repo.js";
 import type { FeishuSender } from "../feishu/client.js";
 import type { Logger } from "../logger.js";
@@ -35,6 +35,10 @@ export class OutboxWorker {
 
   private async deliver(item: NotificationOutboxItem): Promise<void> {
     try {
+      if (!this.shouldDeliver(item)) {
+        this.repo.updateOutbox(item.id, "sent", item.attempts + 1, null, null);
+        return;
+      }
       const card = item.payload.card as Record<string, unknown> | undefined;
       const cards = Array.isArray(item.payload.cards)
         ? item.payload.cards.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object" && !Array.isArray(entry))
@@ -94,7 +98,41 @@ export class OutboxWorker {
       return this.feishu.sendCard(item.feishuChatId, card, dedicatedChat ? null : item.feishuTopicRootMessageId);
     }
   }
+
+  private shouldDeliver(item: NotificationOutboxItem): boolean {
+    if (item.notificationType === "console" || item.notificationType === "task_status") return true;
+    if (item.notificationType === "approval_required") return true;
+    const binding = item.sessionBindingId ? this.repo.findBindingById(item.sessionBindingId) : null;
+    const project = binding?.projectId ? this.repo.getProject(binding.projectId) : null;
+    const level = this.resolveNotificationLevel(binding, project);
+    const severity = notificationSeverity(item.notificationType);
+    if (level === "all") return true;
+    if (level === "important") return severity === "important" || severity === "error";
+    if (level === "errors") return severity === "error";
+    return false;
+  }
+
+  private resolveNotificationLevel(binding: SessionBinding | null, project: Project | null): NotificationLevel {
+    if (binding) {
+      const sessionPreference = this.repo.getNotificationPreference("session", binding.id, null)?.level;
+      if (sessionPreference) return sessionPreference;
+    }
+    if (project) {
+      const projectPreference = this.repo.getNotificationPreference("project", project.id, null)?.level;
+      if (projectPreference) return projectPreference;
+      if (project.notificationPolicy === "all" || project.notificationPolicy === "important" || project.notificationPolicy === "errors" || project.notificationPolicy === "muted") {
+        return project.notificationPolicy;
+      }
+    }
+    return this.repo.getNotificationPreference("global", "bridge", null)?.level ?? "important";
+  }
 }
+
+const notificationSeverity = (type: NotificationOutboxItem["notificationType"]): "info" | "important" | "error" => {
+  if (type === "task_failed" || type === "task_interrupted" || type === "bridge_unavailable") return "error";
+  if (type === "task_completed" || type === "project_unclassified" || type === "diagnostic") return "important";
+  return "info";
+};
 
 const splitFeishuText = (text: string, maxLength: number): string[] => {
   const limit = Math.max(500, maxLength);

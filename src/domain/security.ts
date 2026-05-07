@@ -27,13 +27,15 @@ export class SecurityPolicy {
   assertFeishuAllowed(userId: string, chatId: string): void {
     const allowedUsers = this.config.feishu.allowedUserIds ?? [];
     const allowedChats = this.config.feishu.allowedChatIds ?? [];
-    if (allowedUsers.length > 0 && !allowedUsers.includes(userId)) {
+    const trustedSubject = this.repo?.findTrustedFeishuSubject(chatId, userId) ?? null;
+    if (allowedUsers.length > 0 && !allowedUsers.includes(userId) && !trustedSubject?.userId) {
       throw new Error("Feishu user is not allowed to control this bridge.");
     }
-    if (allowedChats.length > 0 && !allowedChats.includes(chatId)) {
+    if (allowedChats.length > 0 && !allowedChats.includes(chatId) && !trustedSubject?.chatId) {
       if (this.repo?.findBindingByChatId(chatId)) return;
       throw new Error("Feishu chat is not allowed to control this bridge.");
     }
+    this.repo?.touchTrustedFeishuSubject(chatId, userId);
   }
 
   resolveInsideProject(projectRoot: string, requestedPath = "."): string {

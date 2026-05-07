@@ -18,6 +18,8 @@ export class BridgeDatabase {
     ensureColumn(this.db, "session_bindings", "feishu_task_card_message_id", "TEXT");
     ensureColumn(this.db, "session_bindings", "feishu_container_kind", "TEXT NOT NULL DEFAULT 'topic'");
     ensureColumn(this.db, "session_bindings", "feishu_control_chat_id", "TEXT");
+    ensureColumn(this.db, "session_bindings", "selected_model", "TEXT");
+    ensureColumn(this.db, "session_bindings", "selected_reasoning_effort", "TEXT");
     ensureColumn(this.db, "notification_outbox", "feishu_thread_id", "TEXT");
   }
 
@@ -66,6 +68,8 @@ CREATE TABLE IF NOT EXISTS session_bindings (
   feishu_control_chat_id TEXT,
   title TEXT,
   cwd TEXT,
+  selected_model TEXT,
+  selected_reasoning_effort TEXT,
   status TEXT NOT NULL,
   last_turn_id TEXT,
   last_event_cursor TEXT,
@@ -238,6 +242,22 @@ CREATE TABLE IF NOT EXISTS thread_ownership (
   observed_at TEXT NOT NULL,
   confidence TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS workspace_checkpoints (
+  id TEXT PRIMARY KEY,
+  session_binding_id TEXT NOT NULL,
+  codex_thread_id TEXT NOT NULL,
+  turn_id TEXT,
+  workspace_root TEXT NOT NULL,
+  checkpoint_ref TEXT NOT NULL,
+  snapshot_note TEXT,
+  kind TEXT NOT NULL,
+  manifest_json TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_checkpoints_binding ON workspace_checkpoints(session_binding_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_workspace_checkpoints_turn ON workspace_checkpoints(session_binding_id, turn_id, kind);
 `;
 
 const ensureColumn = (db: DatabaseSync, table: string, column: string, definition: string): void => {

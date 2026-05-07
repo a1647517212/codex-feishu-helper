@@ -41,6 +41,9 @@ export class DiagnosticsService {
   }
 
   async snapshot(): Promise<DiagnosticSnapshot> {
+    const devices = this.repo.listBridgeDevices(5);
+    const currentDevice = devices.find((device) => device.id === this.config.machine.id) ?? null;
+    const trustedSubjects = this.repo.listTrustedFeishuSubjects(5);
     return {
       uptimeSeconds: Math.floor((Date.now() - this.startedAt) / 1000),
       machineName: this.config.machine.name || hostname(),
@@ -62,6 +65,11 @@ export class DiagnosticsService {
       runningTasksCount: this.repo.count("session_bindings", "status = 'running'"),
       pendingOutboxCount: this.repo.count("notification_outbox", "status = 'pending'"),
       pendingApprovalsCount: this.repo.count("pending_approvals", "status = 'pending'"),
+      notificationPreferenceCount: this.repo.count("notification_preferences"),
+      trustedSubjectsCount: this.repo.count("trusted_feishu_subjects"),
+      bridgeDevicesCount: this.repo.count("bridge_devices"),
+      currentDevice,
+      trustedSubjects,
       lastFeishuMessageAt: this.lastFeishuMessageAt,
       lastFeishuMessageId: this.lastFeishuMessageId,
       lastFeishuCardActionAt: this.lastFeishuCardActionAt,
