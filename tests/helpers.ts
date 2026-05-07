@@ -46,6 +46,7 @@ export const makeConfig = (dir: string): BridgeConfig => ({
     defaultSandboxMode: "danger-full-access",
     defaultApprovalPolicy: "never",
     autoArchiveOnCompletion: false,
+    appStatePath: join(dir, "missing-codex-state.json"),
     serviceName: "feishu_codex_bridge_test"
   },
   feishu: {

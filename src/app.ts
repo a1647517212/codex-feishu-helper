@@ -39,8 +39,9 @@ export class BridgeApp {
   }
 
   async start(): Promise<void> {
-    await this.tasks.bootstrapProjectsFromConfig();
+    await this.tasks.bootstrapProjectsFromConfig({ reconcile: false });
     await this.codex.start();
+    await this.tasks.bootstrapRuntimeState();
     this.outbox.start();
     if (this.http.shouldStart()) {
       await this.http.start();

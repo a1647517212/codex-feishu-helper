@@ -50,6 +50,7 @@ const ConfigSchema = z.object({
       defaultSandboxMode: SandboxModeSchema.default("danger-full-access"),
       defaultApprovalPolicy: ApprovalPolicySchema.default("never"),
       autoArchiveOnCompletion: z.boolean().default(false),
+      appStatePath: z.string().default("~/.codex/.codex-global-state.json"),
       serviceName: z.string().default("feishu_codex_bridge")
     })
     .default({
@@ -61,6 +62,7 @@ const ConfigSchema = z.object({
       defaultSandboxMode: "danger-full-access",
       defaultApprovalPolicy: "never",
       autoArchiveOnCompletion: false,
+      appStatePath: "~/.codex/.codex-global-state.json",
       serviceName: "feishu_codex_bridge"
     }),
   feishu: z
@@ -185,11 +187,13 @@ export const loadConfig = (override?: string): BridgeConfig => {
   const homeDir = expandPath(parsed.storage.homeDir);
   const databasePath = expandPath(parsed.storage.databasePath);
   const logPath = expandPath(parsed.storage.logPath);
+  const appStatePath = expandPath(parsed.codex.appStatePath);
   mkdirSync(homeDir, { recursive: true });
   mkdirSync(dirname(databasePath), { recursive: true });
   mkdirSync(dirname(logPath), { recursive: true });
   return {
     ...parsed,
+    codex: { ...parsed.codex, appStatePath },
     feishu: {
       ...parsed.feishu,
       messageTransport: parsed.feishu.messageTransport ?? parsed.feishu.transport ?? "long_connection",

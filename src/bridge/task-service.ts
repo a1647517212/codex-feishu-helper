@@ -1,4 +1,7 @@
 import type { BridgeConfig } from "../config.js";
+import { existsSync, readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { basename, resolve } from "node:path";
 import { newId } from "../core/ids.js";
 import { asString } from "../core/json.js";
 import type {
@@ -52,6 +55,13 @@ type ProgressSection = {
 
 type TaskListKind = "recent" | "running" | "completed" | "failed" | "archived";
 
+type WorkspaceImportSummary = {
+  imported: number;
+  matched: number;
+  skipped: number;
+  sources: string[];
+};
+
 export class TaskService {
   private readonly cards: CardRenderer;
   private readonly projection: ProjectionBuilder;
@@ -74,7 +84,7 @@ export class TaskService {
     this.codex.on("serverRequest", (message) => this.handleCodexServerRequest(message).catch((error) => this.logger.error("codex server request handling failed", { error: String(error), message })));
   }
 
-  async bootstrapProjectsFromConfig(): Promise<void> {
+  async bootstrapProjectsFromConfig(options: { reconcile?: boolean } = {}): Promise<void> {
     this.repo.upsertBridgeDevice({
       id: this.config.machine.id,
       machineName: this.config.machine.name,
@@ -100,7 +110,83 @@ export class TaskService {
         sandboxPolicy: project.sandboxPolicy
       });
     }
+    if (options.reconcile !== false) {
+      await this.reconcilePersistedBindings();
+    }
+  }
+
+  async bootstrapRuntimeState(): Promise<void> {
+    await this.syncCodexAppWorkspaces();
     await this.reconcilePersistedBindings();
+  }
+
+  async syncCodexAppWorkspaces(): Promise<WorkspaceImportSummary> {
+    const candidates = await this.discoverCodexAppWorkspaces();
+    const knownBefore = this.repo.listProjects();
+    const knownRoots = new Set(knownBefore.map((project) => normalizeWorkspacePath(project.rootPath)));
+    let imported = 0;
+    let matched = 0;
+    let skipped = 0;
+    for (const candidate of candidates) {
+      const normalized = normalizeWorkspacePath(candidate.rootPath);
+      if (!normalized || knownRoots.has(normalized)) {
+        if (normalized) matched += 1;
+        else skipped += 1;
+        continue;
+      }
+      const project = this.repo.upsertProject({
+        name: candidate.name,
+        rootPath: candidate.rootPath,
+        feishuChatId: this.config.feishu.defaultChatId ?? null,
+        defaultModel: this.config.codex.defaultModel,
+        defaultReasoningEffort: this.config.codex.defaultReasoningEffort,
+        approvalPolicy: this.config.codex.defaultApprovalPolicy,
+        sandboxPolicy: this.config.codex.defaultSandboxMode
+      });
+      this.repo.addProjectMatchRule({
+        projectId: project.id,
+        ruleType: "cwd_prefix",
+        ruleValue: candidate.rootPath
+      });
+      knownRoots.add(normalized);
+      imported += 1;
+    }
+    this.logger.info("codex app workspace sync completed", {
+      discovered: candidates.length,
+      imported,
+      matched,
+      skipped,
+      sources: [...new Set(candidates.map((candidate) => candidate.source))]
+    });
+    return {
+      imported,
+      matched,
+      skipped,
+      sources: [...new Set(candidates.map((candidate) => candidate.source))]
+    };
+  }
+
+  private async discoverCodexAppWorkspaces(): Promise<Array<{ name: string; rootPath: string; source: string }>> {
+    const seen = new Set<string>();
+    const candidates: Array<{ name: string; rootPath: string; source: string }> = [];
+    const push = (rootPath: string | null | undefined, source: string): void => {
+      if (!rootPath) return;
+      const resolved = resolveWorkspacePath(rootPath);
+      const normalized = normalizeWorkspacePath(resolved);
+      if (!normalized || seen.has(normalized)) return;
+      if (!existsSync(resolved)) return;
+      seen.add(normalized);
+      candidates.push({
+        name: inferProjectName(resolved, basename(resolved)),
+        rootPath: resolved,
+        source
+      });
+    };
+
+    for (const entry of readCodexAppWorkspaceRoots(this.config.codex.appStatePath)) {
+      push(entry.rootPath, entry.source);
+    }
+    return candidates;
   }
 
   async reconcilePersistedBindings(): Promise<void> {
@@ -621,6 +707,9 @@ export class TaskService {
       case "project_list":
         await this.sendProjectList(action);
         return { ok: true };
+      case "project_open":
+        await this.sendProjectOpen(action);
+        return { ok: true };
       case "project_settings":
         await this.sendProjectSettings(action);
         return { ok: true };
@@ -633,12 +722,14 @@ export class TaskService {
       case "project_notification_level":
         await this.updateProjectNotificationLevel(action);
         return { ok: true, text: "项目通知级别已更新。" };
+      case "project_tasks":
+        await this.sendProjectTaskList(action, "recent");
+        return { ok: true };
       case "project_running":
-        await this.listClaimableSessions(
-          action.chatId || this.config.feishu.defaultChatId || "",
-          action.rootMessageId,
-          asString(action.payload.projectId)
-        );
+        await this.sendProjectTaskList(action, "running");
+        return { ok: true };
+      case "project_completed":
+        await this.sendProjectTaskList(action, "completed");
         return { ok: true };
       case "unclassified_threads":
         await this.sendUnclassifiedThreads(action);
@@ -1060,11 +1151,18 @@ export class TaskService {
 
   private async sendProjectList(action: FeishuCardAction): Promise<void> {
     const chatId = action.chatId || this.config.feishu.defaultChatId || "";
+    await this.syncCodexAppWorkspaces();
     const projects = this.repo.listProjects();
     await this.feishu.sendCard(chatId, this.cards.projectListCard(projects), action.rootMessageId);
-    for (const project of projects.slice(0, 3)) {
-      await this.feishu.sendCard(chatId, this.cards.projectCard(this.buildProjectCardInput(project)), action.rootMessageId);
-    }
+  }
+
+  private async sendProjectOpen(action: FeishuCardAction): Promise<void> {
+    const project = this.requireProject(action);
+    await this.feishu.sendCard(
+      action.chatId || this.config.feishu.defaultChatId || "",
+      this.cards.projectCard(this.buildProjectCardInput(project)),
+      action.rootMessageId
+    );
   }
 
   private async sendProjectSettings(action: FeishuCardAction): Promise<void> {
@@ -1353,6 +1451,21 @@ export class TaskService {
       return;
     }
     await this.feishu.sendCard(chatId, this.cards.taskListCard(titleMap[kind], this.listTaskSummaries(kind, 10)), action.rootMessageId);
+  }
+
+  private async sendProjectTaskList(action: FeishuCardAction, kind: "recent" | "running" | "completed"): Promise<void> {
+    const project = this.requireProject(action);
+    const chatId = action.chatId || this.config.feishu.defaultChatId || "";
+    const titleMap = {
+      recent: `${project.name}｜对话`,
+      running: `${project.name}｜运行中`,
+      completed: `${project.name}｜已完成`
+    };
+    await this.feishu.sendCard(
+      chatId,
+      this.cards.taskListCard(titleMap[kind], this.listTaskSummaries(kind, 20, project.id)),
+      action.rootMessageId
+    );
   }
 
   private async sendTaskSearch(action: FeishuCardAction): Promise<void> {
@@ -2332,7 +2445,7 @@ export class TaskService {
     }
   }
 
-  private listTaskSummaries(kind: TaskListKind, limit: number): Array<{
+  private listTaskSummaries(kind: TaskListKind, limit: number, projectId?: string | null): Array<{
     bindingId: string;
     title: string;
     status: string;
@@ -2340,11 +2453,12 @@ export class TaskService {
     model: string | null;
     reasoningEffort: string | null;
   }> {
+    const queryLimit = projectId ? Math.max(limit * 10, 100) : limit;
     const bindings =
       kind === "recent"
-        ? this.repo.listBindings(limit)
-        : this.repo.listBindingsByStatuses(taskListStatuses(kind), limit);
-    return bindings.map((binding) => {
+        ? this.repo.listBindings(queryLimit)
+        : this.repo.listBindingsByStatuses(taskListStatuses(kind), queryLimit);
+    return bindings.filter((binding) => !projectId || binding.projectId === projectId).slice(0, limit).map((binding) => {
       const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
       return {
         bindingId: binding.id,
@@ -3042,4 +3156,49 @@ const inferProjectName = (cwd: string, fallback: string): string => {
   const segments = normalized.split(/[\\/]/).filter(Boolean);
   const leaf = segments[segments.length - 1];
   return leaf && leaf.trim().length > 0 ? leaf.trim() : fallback;
+};
+
+const resolveWorkspacePath = (value: string): string => {
+  const trimmed = value.trim();
+  const withHome = trimmed.startsWith("~/") || trimmed.startsWith("~\\")
+    ? resolve(homedir(), trimmed.slice(2))
+    : trimmed;
+  return resolve(withHome);
+};
+
+const normalizeWorkspacePath = (value: string): string =>
+  value.trim().replace(/[\\/]+/g, "/").replace(/\/+$/g, "").toLowerCase();
+
+const readCodexAppWorkspaceRoots = (statePath: string): Array<{ rootPath: string; source: string }> => {
+  if (!existsSync(statePath)) return [];
+  try {
+    const raw = JSON.parse(readFileSync(statePath, "utf8")) as unknown;
+    const state = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : {};
+    const persisted = state["electron-persisted-atom-state"];
+    const object = persisted && typeof persisted === "object" ? (persisted as Record<string, unknown>) : {};
+    const ordered = [
+      ...workspaceRootsFromStateValue(state["project-order"], "codex_app_project_order"),
+      ...workspaceRootsFromStateValue(state["electron-saved-workspace-roots"], "codex_app_saved_workspace"),
+      ...workspaceRootsFromStateValue(state["active-workspace-roots"], "codex_app_active_workspace"),
+      ...workspaceRootsFromStateValue(object["project-order"], "codex_app_project_order"),
+      ...workspaceRootsFromStateValue(object["electron-saved-workspace-roots"], "codex_app_saved_workspace"),
+      ...workspaceRootsFromStateValue(object["active-workspace-roots"], "codex_app_active_workspace")
+    ];
+    const seen = new Set<string>();
+    return ordered.filter((entry) => {
+      const normalized = normalizeWorkspacePath(resolveWorkspacePath(entry.rootPath));
+      if (!normalized || seen.has(normalized)) return false;
+      seen.add(normalized);
+      return true;
+    });
+  } catch {
+    return [];
+  }
+};
+
+const workspaceRootsFromStateValue = (value: unknown, source: string): Array<{ rootPath: string; source: string }> => {
+  if (!Array.isArray(value)) return [];
+  return value
+    .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
+    .map((rootPath) => ({ rootPath, source }));
 };

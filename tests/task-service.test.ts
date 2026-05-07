@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { TaskService } from "../src/bridge/task-service.js";
 import { makeConfig, makeLogger, makeTempRepo, MockCodex, MockFeishu } from "./helpers.js";
 import { CardRenderer } from "../src/domain/cards.js";
@@ -1294,6 +1296,143 @@ test("unclassified create project action creates project and bind rules", async 
   }
 });
 
+test("runtime bootstrap auto imports Codex App workspace roots", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const firstWorkspace = join(dir, "workspace-one");
+    const secondWorkspace = join(dir, "workspace-two");
+    mkdirSync(firstWorkspace, { recursive: true });
+    mkdirSync(secondWorkspace, { recursive: true });
+    const appStatePath = join(dir, "codex-state.json");
+    writeFileSync(
+      appStatePath,
+      JSON.stringify({
+        "project-order": [secondWorkspace],
+        "electron-saved-workspace-roots": [secondWorkspace],
+        "electron-persisted-atom-state": {
+          "project-order": [firstWorkspace],
+          "electron-saved-workspace-roots": [firstWorkspace, secondWorkspace],
+          "active-workspace-roots": [secondWorkspace]
+        }
+      }),
+      "utf8"
+    );
+    const config = makeConfig(dir);
+    config.feishu.interactionMode = "hybrid";
+    config.codex.appStatePath = appStatePath;
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    await service.bootstrapRuntimeState();
+    const projects = repo.listProjects();
+    assert.equal(projects.length, 2);
+    assert.equal(projects.some((project) => project.rootPath === firstWorkspace), true);
+    assert.equal(projects.some((project) => project.rootPath === secondWorkspace), true);
+    assert.equal(repo.findProjectForContext({ cwd: join(firstWorkspace, "src") })?.rootPath, firstWorkspace);
+    assert.equal(repo.findProjectForContext({ cwd: join(secondWorkspace, "src") })?.rootPath, secondWorkspace);
+  } finally {
+    cleanup();
+  }
+});
+
+test("project list auto syncs Codex App workspace roots before rendering", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const workspace = join(dir, "workspace-list");
+    mkdirSync(workspace, { recursive: true });
+    const appStatePath = join(dir, "codex-state-list.json");
+    writeFileSync(
+      appStatePath,
+      JSON.stringify({
+        "electron-persisted-atom-state": {
+          "project-order": [workspace]
+        }
+      }),
+      "utf8"
+    );
+    const config = makeConfig(dir);
+    config.feishu.interactionMode = "hybrid";
+    config.codex.appStatePath = appStatePath;
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    await service.handleCardAction({
+      actionId: "act_project_list_auto_sync",
+      action: "project_list",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_project_list_auto_sync",
+      payload: {}
+    });
+    assert.equal(repo.listProjects().length, 1);
+    const payload = JSON.stringify(feishu.sent.find((entry) => entry.type === "card")?.payload ?? {});
+    assert.equal(payload.includes("workspace-list"), true);
+    assert.equal(collectButtons(feishu.sent.find((entry) => entry.type === "card")?.payload).some((button) => buttonAction(button) === "project_open"), true);
+    assert.equal(payload.includes("运行中 0"), false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("project navigation opens details and filters task lists by project", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.feishu.interactionMode = "hybrid";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const first = repo.upsertProject({ id: "proj_nav_1", name: "One", rootPath: join(dir, "one") });
+    const second = repo.upsertProject({ id: "proj_nav_2", name: "Two", rootPath: join(dir, "two") });
+    repo.createOrUpdateBinding({
+      projectId: first.id,
+      codexThreadId: "thr_one",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_one",
+      title: "Task in One",
+      cwd: first.rootPath,
+      status: "completed",
+      createdFrom: "manual_import"
+    });
+    repo.createOrUpdateBinding({
+      projectId: second.id,
+      codexThreadId: "thr_two",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_two",
+      title: "Task in Two",
+      cwd: second.rootPath,
+      status: "completed",
+      createdFrom: "manual_import"
+    });
+    await service.handleCardAction({
+      actionId: "act_project_open_nav",
+      action: "project_open",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_project_open_nav",
+      payload: { projectId: first.id }
+    });
+    const opened = JSON.stringify(feishu.sent[0]?.payload ?? {});
+    assert.equal(opened.includes("One"), true);
+    assert.equal(opened.includes("运行中"), true);
+    assert.equal(collectButtons(feishu.sent[0]?.payload).some((button) => buttonAction(button) === "project_tasks"), true);
+
+    await service.handleCardAction({
+      actionId: "act_project_tasks_nav",
+      action: "project_tasks",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_project_tasks_nav",
+      payload: { projectId: first.id }
+    });
+    const list = JSON.stringify(feishu.sent[1]?.payload ?? {});
+    assert.equal(list.includes("Task in One"), true);
+    assert.equal(list.includes("Task in Two"), false);
+  } finally {
+    cleanup();
+  }
+});
+
 test("assign project command binds future unclassified thread lookup to existing project", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
@@ -1983,8 +2122,10 @@ test("project card and settings card expose mobile-safe settings entry", () => {
   });
   const labels = collectButtons(projectCard).map((button) => String((button.text as Record<string, unknown>)?.content ?? ""));
   assert.equal(labels.includes("设置"), true);
+  assert.equal(labels.includes("对话"), true);
   assert.equal(labels.includes("运行中"), true);
   assert.equal(labels.includes("接管"), true);
+  assert.equal(labels.includes("返回项目"), true);
 
   const settingsCard = new CardRenderer("hybrid").projectSettingsCard({
     projectId: "proj_1",
@@ -2355,4 +2496,11 @@ const collectButtons = (value: unknown): Array<Record<string, unknown>> => {
   };
   visit(value);
   return found;
+};
+
+const buttonAction = (button: Record<string, unknown>): string | null => {
+  const behaviors = Array.isArray(button.behaviors) ? button.behaviors : [];
+  const first = behaviors[0] && typeof behaviors[0] === "object" ? behaviors[0] as Record<string, unknown> : {};
+  const value = first.value && typeof first.value === "object" ? first.value as Record<string, unknown> : {};
+  return typeof value.action === "string" ? value.action : null;
 };

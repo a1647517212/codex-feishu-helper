@@ -138,16 +138,19 @@ export class CardRenderer {
     return card("电脑上的 Codex 任务", elements.length > 0 ? elements : [text("没有发现可接管的本机 Codex 任务。")]);
   }
 
-  projectListCard(projects: Array<{ name: string; rootPath: string; feishuChatId: string | null }>): FeishuCard {
-    if (projects.length === 0) return card("项目列表", [text("尚未配置项目。")]);
-    return card(
-      "项目列表",
-      projects
-        .slice(0, 12)
-        .map((project) =>
-          text([`项目：${project.name}`, `目录：${project.rootPath}`, `飞书群：${project.feishuChatId ?? "默认控制台"}`].join("\n"))
-        )
-    );
+  projectListCard(projects: Array<{ id: string; name: string; rootPath: string; feishuChatId: string | null }>): FeishuCard {
+    if (projects.length === 0) return card("选择项目", [text("还没有发现 Codex App 工作区。请先在 Codex App 打开一个项目。")]);
+    const elements: Record<string, unknown>[] = [
+      text("选择一个项目后，可以查看这个项目里的对话、运行状态和项目设置。")
+    ];
+    for (const project of projects.slice(0, 12)) {
+      elements.push(text([`项目：${project.name}`, `目录：${project.rootPath}`].join("\n")));
+      pushActionRows(elements, this.interactionMode, [
+        button("进入", "project_open", { projectId: project.id }),
+        button("设置", "project_settings", { projectId: project.id })
+      ]);
+    }
+    return card("选择项目", elements);
   }
 
   projectCard(project: {
@@ -177,17 +180,19 @@ export class CardRenderer {
       this.interactionMode,
       [
         button("新任务", "new_task", { projectId: project.id }),
+        button("对话", "project_tasks", { projectId: project.id }),
         button("运行中", "project_running", { projectId: project.id }),
-        button("设置", "project_settings", { projectId: project.id }),
-        button("项目列表", "project_list")
+        button("设置", "project_settings", { projectId: project.id })
       ]
     );
     pushActionRows(
       elements,
       this.interactionMode,
       [
+        button("已完成", "project_completed", { projectId: project.id }),
         button("接管", "claim_sessions", { projectId: project.id }),
-        button("未归类", "unclassified_threads", { projectId: project.id })
+        button("未归类", "unclassified_threads", { projectId: project.id }),
+        button("返回项目", "project_list")
       ]
     );
     return card(project.name, elements);
