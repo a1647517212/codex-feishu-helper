@@ -218,6 +218,26 @@ export interface TaskStatusProjection {
   updatedAt: string;
 }
 
+export interface TaskProgressProjection {
+  title: string;
+  status: TaskStatus;
+  projectName: string;
+  updatedAt: string;
+  sections: Array<{
+    label: string;
+    text: string;
+  }>;
+}
+
+export interface TaskReportProjection {
+  title: string;
+  status: TaskStatus;
+  projectName: string;
+  reasoningSummary: string | null;
+  finalResult: string | null;
+  updatedAt: string;
+}
+
 export interface FeishuIncomingMessage {
   messageId: string;
   chatId: string;

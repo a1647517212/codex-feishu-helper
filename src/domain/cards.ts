@@ -4,6 +4,8 @@ import type {
   PendingApproval,
   QueuedMessage,
   TaskEvent,
+  TaskProgressProjection,
+  TaskReportProjection,
   TaskStatusProjection
 } from "../core/types.js";
 import type { InteractionMode } from "../config.js";
@@ -144,6 +146,47 @@ export class CardRenderer {
       )
     ].filter(Boolean) as Record<string, unknown>[];
     return card(projection.title, elements);
+  }
+
+  taskProgressCard(projection: TaskProgressProjection): FeishuCard {
+    const elements: Record<string, unknown>[] = [
+      text(
+        [
+          `状态：${statusText(projection.status)}`,
+          `项目：${projection.projectName}`,
+          `更新时间：${formatTime(projection.updatedAt)}`
+        ].join("\n")
+      )
+    ];
+    for (const section of projection.sections.slice(0, 4)) {
+      elements.push(divider());
+      elements.push(text(`**${section.label}**\n${section.text}`));
+    }
+    return card(`${projection.title}｜处理进度`, elements);
+  }
+
+  taskReportCard(projection: TaskReportProjection): FeishuCard {
+    const elements: Record<string, unknown>[] = [
+      text(
+        [
+          `状态：${statusText(projection.status)}`,
+          `项目：${projection.projectName}`,
+          `完成时间：${formatTime(projection.updatedAt)}`
+        ].join("\n")
+      )
+    ];
+    if (projection.reasoningSummary) {
+      elements.push(divider());
+      elements.push(text(`**处理摘要**\n${projection.reasoningSummary}`));
+    }
+    if (projection.finalResult) {
+      elements.push(divider());
+      elements.push(text(`**最终结论**\n${projection.finalResult}`));
+    }
+    if (!projection.reasoningSummary && !projection.finalResult) {
+      elements.push(text("未提取到可展示的结果内容，请发送 /logs 查看本地任务记录。"));
+    }
+    return card(`${projection.title}｜处理完成`, elements);
   }
 
   approvalCard(approval: PendingApproval): FeishuCard {
@@ -385,6 +428,8 @@ const text = (content: string): Record<string, unknown> => ({
   content: truncate(content, 3000)
 });
 
+const divider = (): Record<string, unknown> => ({ tag: "hr" });
+
 const actions = (items: Record<string, unknown>[]): Record<string, unknown> => ({
   tag: "column_set",
   horizontal_align: "left",
@@ -533,6 +578,8 @@ const statusText = (status: string): string => {
 };
 
 const riskText = (risk: string): string => ({ low: "低", medium: "中", high: "高" })[risk] ?? risk;
+
+const formatTime = (value: string): string => value.replace("T", " ").replace(/\.\d{3}Z$/, "");
 
 const interactionModeText = (mode: string): string =>
   ({ message_command: "消息命令", hybrid: "按钮+消息命令", card_callback: "卡片按钮" })[mode] ?? mode;

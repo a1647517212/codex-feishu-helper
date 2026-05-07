@@ -91,6 +91,7 @@ export class MockFeishu implements FeishuSender {
   }> = [];
   createdChats: Array<{ chatId: string; name: string; input: Record<string, unknown> }> = [];
   updatedChatNames: Array<{ chatId: string; name: string }> = [];
+  updatedCards: Array<{ messageId: string; card: FeishuCard }> = [];
   failNext = false;
 
   async sendText(chatId: string, text: string, rootMessageId?: string | null): Promise<SentMessage> {
@@ -147,7 +148,9 @@ export class MockFeishu implements FeishuSender {
     this.sent.push({ type: "text", chatId: "update", root: messageId, payload: text });
   }
 
-  async updateCard(): Promise<void> {}
+  async updateCard(messageId: string, card: FeishuCard): Promise<void> {
+    this.updatedCards.push({ messageId, card });
+  }
 
   async createTaskChat(input: Record<string, unknown>) {
     if (this.failNext) {

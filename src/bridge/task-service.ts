@@ -8,7 +8,7 @@ import { CardRenderer } from "../domain/cards.js";
 import { ProjectionBuilder } from "../domain/projection.js";
 import { SecurityPolicy } from "../domain/security.js";
 import type { CodexClient, CodexThreadSummary } from "../codex/client.js";
-import type { FeishuSender } from "../feishu/client.js";
+import type { FeishuSender, SentMessage } from "../feishu/client.js";
 import type { Logger } from "../logger.js";
 import { DiagnosticsService } from "./diagnostics.js";
 
@@ -27,11 +27,18 @@ type FeishuReplyTarget = {
   threadId?: string | null;
 };
 
+type ProgressSection = {
+  label: string;
+  text: string;
+  updatedAt: number;
+};
+
 export class TaskService {
   private readonly cards: CardRenderer;
   private readonly projection: ProjectionBuilder;
   private readonly security: SecurityPolicy;
   private readonly progressState = new Map<string, { text: string; lastSentLength: number; lastSentAt: number }>();
+  private readonly progressCards = new Map<string, { messageId: string; sections: Map<string, ProgressSection>; lastUpdatedAt: number }>();
 
   constructor(
     private readonly config: BridgeConfig,
@@ -1134,12 +1141,11 @@ export class TaskService {
     await this.feishu.sendText(target.chatId, text, target.rootMessageId);
   }
 
-  private async sendCardToTarget(target: FeishuReplyTarget, card: ReturnType<CardRenderer["taskStatusCard"]>): Promise<void> {
+  private async sendCardToTarget(target: FeishuReplyTarget, card: ReturnType<CardRenderer["taskStatusCard"]>): Promise<SentMessage> {
     if (target.threadId) {
-      await this.feishu.replyCardInThread(target.rootMessageId ?? target.threadId, card);
-      return;
+      return this.feishu.replyCardInThread(target.rootMessageId ?? target.threadId, card);
     }
-    await this.feishu.sendCard(target.chatId, card, target.rootMessageId);
+    return this.feishu.sendCard(target.chatId, card, target.rootMessageId);
   }
 
   private async resolveApproval(id: string, decision: "once" | "task" | "deny", userId: string): Promise<void> {
@@ -1303,7 +1309,10 @@ export class TaskService {
           feishuChatId: binding.feishuChatId,
           feishuTopicRootMessageId: binding.feishuTopicRootMessageId,
           feishuThreadId: binding.feishuThreadId,
-          payload: { text: formatThreadReport(report) },
+          payload: {
+            card: this.cards.taskReportCard(formatThreadReport(binding, report, status, binding.projectId ? this.repo.getProject(binding.projectId)?.name ?? null : null)),
+            text: formatFullFinalResult(report)
+          },
           dedupeKey: `turn:${threadId}:${turnId}:result`
         });
       }
@@ -1437,16 +1446,53 @@ export class TaskService {
       lastSentLength: visible.length,
       lastSentAt: now
     });
-    this.repo.enqueueOutbox({
-      sessionBindingId: binding.id,
-      eventSeq,
-      notificationType: "task_progress",
-      feishuChatId: binding.feishuChatId,
-      feishuTopicRootMessageId: binding.feishuTopicRootMessageId,
-      feishuThreadId: binding.feishuThreadId,
-      payload: { text: `进行中：${label}\n\n${visible}` },
-      dedupeKey: `progress:${binding.id}:${turnId ?? "no-turn"}:${itemId ?? label}:${label}:${eventSeq}`
+    this.updateProgressCard(binding, label, visible).catch((error) => {
+      this.logger.warn("feishu progress card update failed", {
+        bindingId: binding.id,
+        eventSeq,
+        label,
+        error: String(error)
+      });
     });
+  }
+
+  private async updateProgressCard(binding: SessionBinding, label: string, text: string): Promise<void> {
+    const current =
+      this.progressCards.get(binding.id) ?? {
+        messageId: "",
+        sections: new Map<string, ProgressSection>(),
+        lastUpdatedAt: 0
+      };
+    current.sections.set(label, { label, text, updatedAt: Date.now() });
+    const projection = this.buildProgressProjection(binding, current.sections);
+    if (current.messageId) {
+      await this.feishu.updateCard(current.messageId, this.cards.taskProgressCard(projection));
+    } else {
+      const sent = await this.sendCardToTarget(
+        this.targetForBinding(binding, binding.feishuChatId),
+        this.cards.taskProgressCard(projection)
+      );
+      current.messageId = sent.messageId;
+    }
+    current.lastUpdatedAt = Date.now();
+    this.progressCards.set(binding.id, current);
+  }
+
+  private buildProgressProjection(binding: SessionBinding, sections: Map<string, ProgressSection>) {
+    const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
+    return {
+      title: binding.title ?? "Codex 任务",
+      status: binding.status,
+      projectName: project?.name ?? "未归类项目",
+      updatedAt: new Date().toISOString(),
+      sections: [...sections.values()]
+        .sort((left, right) => right.updatedAt - left.updatedAt)
+        .slice(0, 4)
+        .map((section) => ({
+          label: section.label,
+          text: section.text
+        }))
+    };
   }
 
   private recordProtocolFailure(message: Record<string, unknown>, error: unknown): void {
@@ -1891,11 +1937,19 @@ const buildCompletedItemEvent = (item: Record<string, unknown>): { eventType: st
   return null;
 };
 
-const formatThreadReport = (report: ThreadReport): string => {
+const formatThreadReport = (binding: SessionBinding, report: ThreadReport, status: TaskStatus, projectName: string | null) => ({
+  title: binding.title ?? "Codex 任务",
+  status,
+  projectName: projectName ?? "Playground",
+  reasoningSummary: report.reasoningSummary ? truncatePlain(report.reasoningSummary, 1200) : null,
+  finalResult: report.finalResult ? truncatePlain(report.finalResult, 1800) : null,
+  updatedAt: new Date().toISOString()
+});
+
+const formatFullFinalResult = (report: ThreadReport): string => {
   const lines = [
-    "处理完成",
-    report.reasoningSummary ? `处理摘要：\n${report.reasoningSummary}` : "处理摘要：未提取到可展示的步骤摘要。",
-    report.finalResult ? `最终结论：\n${report.finalResult}` : "最终结论：未提取到最终回复文本，请发送 /logs 查看本地任务记录。"
+    "完整最终结论",
+    report.finalResult ?? "未提取到最终回复文本，请发送 /logs 查看本地任务记录。"
   ];
   return lines.join("\n\n");
 };

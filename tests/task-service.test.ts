@@ -319,8 +319,8 @@ test("new task emits one running status and one completion notification", async 
     const outbox = repo.listDueOutbox(10);
     assert.equal(outbox.filter((item) => item.notificationType === "task_status").length <= 1, true);
     assert.equal(outbox.filter((item) => item.notificationType === "task_completed").length, 2);
-    assert.equal(outbox.some((item) => String(item.payload.text ?? "").includes("处理摘要")), true);
-    assert.equal(outbox.some((item) => String(item.payload.text ?? "").includes("最终结论")), true);
+    assert.equal(outbox.some((item) => JSON.stringify(item.payload.card ?? {}).includes("处理摘要")), true);
+    assert.equal(outbox.some((item) => JSON.stringify(item.payload.card ?? {}).includes("最终结论")), true);
     assert.deepEqual(codex.archived, ["thr_new"]);
   } finally {
     cleanup();
@@ -389,11 +389,12 @@ test("completed notification sends result from completed item when thread read h
         }
       }
     });
-    const result = repo.listDueOutbox(10).find((item) => item.notificationType === "task_completed" && typeof item.payload.text === "string");
+    const result = repo.listDueOutbox(10).find((item) => item.notificationType === "task_completed" && JSON.stringify(item.payload.card ?? {}).includes("处理完成"));
     assert.ok(result);
-    assert.equal(String(result.payload.text).includes("处理摘要"), true);
-    assert.equal(String(result.payload.text).includes("先检查输入，再整理结论。"), true);
-    assert.equal(String(result.payload.text).includes("最终结论已经整理完成。"), true);
+    const payload = JSON.stringify(result.payload);
+    assert.equal(payload.includes("处理摘要"), true);
+    assert.equal(payload.includes("先检查输入，再整理结论。"), true);
+    assert.equal(payload.includes("最终结论已经整理完成。"), true);
   } finally {
     cleanup();
   }
@@ -452,10 +453,11 @@ test("completed notification sends result from streamed deltas when read and tur
         }
       }
     });
-    const result = repo.listDueOutbox(10).find((item) => item.notificationType === "task_completed" && typeof item.payload.text === "string");
+    const result = repo.listDueOutbox(10).find((item) => item.notificationType === "task_completed" && JSON.stringify(item.payload.card ?? {}).includes("处理完成"));
     assert.ok(result);
-    assert.equal(String(result.payload.text).includes("先确认目标，再输出结果。"), true);
-    assert.equal(String(result.payload.text).includes("已完成并给出结论。"), true);
+    const payload = JSON.stringify(result.payload);
+    assert.equal(payload.includes("先确认目标，再输出结果。"), true);
+    assert.equal(payload.includes("已完成并给出结论。"), true);
   } finally {
     cleanup();
   }
@@ -466,7 +468,8 @@ test("running deltas enqueue readable progress updates for Feishu", async () => 
   try {
     const config = makeConfig(dir);
     const codex = new MockCodex();
-    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const feishu = new MockFeishu();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
     const binding = repo.createOrUpdateBinding({
       codexThreadId: "thr_progress",
       feishuChatId: "task_chat_1",
@@ -494,11 +497,11 @@ test("running deltas enqueue readable progress updates for Feishu", async () => 
         delta: "已经定位到事件只写入本地记录，没有进入飞书发送队列。"
       }
     });
-    const progress = repo.listDueOutbox(10).filter((item) => item.notificationType === "task_progress");
-    assert.equal(progress.length, 2);
-    assert.equal(progress.some((item) => String(item.payload.text).includes("进行中：处理步骤")), true);
-    assert.equal(progress.some((item) => String(item.payload.text).includes("进行中：处理摘要")), true);
-    assert.equal(progress.every((item) => item.feishuChatId === "task_chat_1"), true);
+    assert.equal(repo.listDueOutbox(10).filter((item) => item.notificationType === "task_progress").length, 0);
+    assert.equal(feishu.sent.filter((entry) => entry.type === "card" && entry.chatId === "task_chat_1").length, 1);
+    assert.equal(feishu.updatedCards.length, 1);
+    assert.equal(JSON.stringify(feishu.updatedCards[0]?.card).includes("处理摘要"), true);
+    assert.equal(JSON.stringify(feishu.updatedCards[0]?.card).includes("处理步骤"), true);
   } finally {
     cleanup();
   }
@@ -551,8 +554,9 @@ test("completed notification keeps long final result for outbox chunking", async
         }
       }
     });
-    const result = repo.listDueOutbox(10).find((item) => typeof item.payload.text === "string");
+    const result = repo.listDueOutbox(10).find((item) => item.notificationType === "task_completed" && JSON.stringify(item.payload.card ?? {}).includes("处理完成"));
     assert.ok(result);
+    assert.equal(JSON.stringify(result.payload.card).includes("最终结论"), true);
     assert.equal(String(result.payload.text).includes("第80条建议"), true);
     assert.equal(String(result.payload.text).includes("...(已截断)"), false);
   } finally {

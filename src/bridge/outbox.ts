@@ -36,16 +36,20 @@ export class OutboxWorker {
   private async deliver(item: NotificationOutboxItem): Promise<void> {
     try {
       const card = item.payload.card as Record<string, unknown> | undefined;
+      const cards = Array.isArray(item.payload.cards)
+        ? item.payload.cards.filter((entry): entry is Record<string, unknown> => Boolean(entry) && typeof entry === "object" && !Array.isArray(entry))
+        : [];
       const text = typeof item.payload.text === "string" ? item.payload.text : null;
       const binding = item.sessionBindingId ? this.repo.findBindingById(item.sessionBindingId) : null;
       const dedicatedChat = binding?.feishuContainerKind === "dedicated_chat";
-      if (card) {
-        if (!dedicatedChat && item.feishuThreadId) {
-          await this.feishu.replyCardInThread(item.feishuTopicRootMessageId ?? item.feishuThreadId, card);
-        } else {
-          await this.feishu.sendCard(item.feishuChatId, card, dedicatedChat ? null : item.feishuTopicRootMessageId);
+      if (cards.length > 0) {
+        for (const entry of cards) {
+          await this.sendCard(item, entry, dedicatedChat);
         }
-      } else if (text) {
+      } else if (card) {
+        await this.sendCard(item, card, dedicatedChat);
+      }
+      if (text) {
         const chunks = splitFeishuText(text, this.config.bridge.maxFeishuTextLength);
         for (const chunk of chunks) {
           if (!dedicatedChat && item.feishuThreadId) {
@@ -54,7 +58,8 @@ export class OutboxWorker {
             await this.feishu.sendText(item.feishuChatId, chunk, dedicatedChat ? null : item.feishuTopicRootMessageId);
           }
         }
-      } else {
+      }
+      if (cards.length === 0 && !card && !text) {
         throw new Error("outbox payload must include card or text");
       }
       this.repo.updateOutbox(item.id, "sent", item.attempts + 1, null, null);
@@ -70,6 +75,14 @@ export class OutboxWorker {
         dead ? null : new Date(Date.now() + delayMs).toISOString()
       );
       this.logger.warn("outbox delivery failed", { id: item.id, attempts, error: String(error) });
+    }
+  }
+
+  private async sendCard(item: NotificationOutboxItem, card: Record<string, unknown>, dedicatedChat: boolean): Promise<void> {
+    if (!dedicatedChat && item.feishuThreadId) {
+      await this.feishu.replyCardInThread(item.feishuTopicRootMessageId ?? item.feishuThreadId, card);
+    } else {
+      await this.feishu.sendCard(item.feishuChatId, card, dedicatedChat ? null : item.feishuTopicRootMessageId);
     }
   }
 }
