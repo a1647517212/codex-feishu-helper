@@ -641,7 +641,7 @@ test("completed notification sends result from completed item when thread read h
         }
       }
     });
-    const result = repo.listDueOutbox(10).find((item) => item.notificationType === "task_completed" && JSON.stringify(item.payload.card ?? {}).includes("处理完成"));
+    const result = findTaskReportOutbox(repo.listDueOutbox(10));
     assert.ok(result);
     const payload = JSON.stringify(result.payload);
     assert.equal(payload.includes("处理摘要"), true);
@@ -705,7 +705,7 @@ test("completed notification sends result from streamed deltas when read and tur
         }
       }
     });
-    const result = repo.listDueOutbox(10).find((item) => item.notificationType === "task_completed" && JSON.stringify(item.payload.card ?? {}).includes("处理完成"));
+    const result = findTaskReportOutbox(repo.listDueOutbox(10));
     assert.ok(result);
     const payload = JSON.stringify(result.payload);
     assert.equal(payload.includes("先确认目标，再输出结果。"), true);
@@ -760,7 +760,7 @@ test("running deltas enqueue readable progress updates for Feishu", async () => 
   }
 });
 
-test("completed notification keeps long final result for outbox chunking", async () => {
+test("completed notification does not resend full final result when card can show it", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
@@ -807,10 +807,68 @@ test("completed notification keeps long final result for outbox chunking", async
         }
       }
     });
-    const result = repo.listDueOutbox(10).find((item) => item.notificationType === "task_completed" && JSON.stringify(item.payload.card ?? {}).includes("处理完成"));
+    const result = findTaskReportOutbox(repo.listDueOutbox(10));
+    assert.ok(result);
+    assert.equal(JSON.stringify(result.payload.card).includes("最终结论"), true);
+    assert.equal(JSON.stringify(result.payload.card).includes("第80条建议"), true);
+    assert.equal("text" in result.payload, false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("completed notification resends full final result only when card content is capped", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    const longFinal = Array.from({ length: 360 }, (_, index) => `第${index + 1}条建议：这部分最终结论需要完整回传到飞书，避免卡片长度限制导致用户看不到完整答案。`).join("\n");
+    codex.threads = [
+      {
+        id: "thr_capped_result",
+        name: "Capped result",
+        preview: "Capped result",
+        cwd: dir,
+        status: { type: "idle" },
+        turns: [
+          {
+            id: "turn_capped_result",
+            status: "completed",
+            items: [
+              { type: "reasoning", summary: ["整理长结论并保留完整文本。"], content: [] },
+              { type: "agentMessage", text: longFinal }
+            ]
+          }
+        ],
+        updatedAt: Date.now()
+      }
+    ];
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_capped_result",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Capped result",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: {
+          id: "turn_capped_result",
+          status: "completed",
+          items: []
+        }
+      }
+    });
+    const result = findTaskReportOutbox(repo.listDueOutbox(10));
     assert.ok(result);
     assert.equal(JSON.stringify(result.payload.card).includes("最终结论"), true);
     assert.equal("text" in result.payload, true);
+    assert.equal(String(result.payload.text).includes("第360条建议"), true);
     assert.equal(String(result.payload.text).includes("第80条建议"), true);
     assert.equal(String(result.payload.text).includes("...(已截断)"), false);
   } finally {
@@ -2174,6 +2232,118 @@ test("task report card renders highlights and next steps blocks", () => {
   assert.equal(content.includes("补强归档流程体验"), true);
 });
 
+test("task report card preserves markdown structure in final result", () => {
+  const finalResult = [
+    "## 推荐结论",
+    "",
+    "建议优先选择下面两项：",
+    "",
+    "1. 米家 501：适合预算敏感场景。",
+    "2. 米家 636：适合更看重容量和体验的场景。",
+    "",
+    "| 机型 | 价格 | 结论 |",
+    "| --- | --- | --- |",
+    "| 米家 501 | 1799 | 优先推荐 |",
+    "| 米家 636 | 2299 | 备选升级 |",
+    "",
+    "### 下一步",
+    "",
+    "- 确认摆放尺寸",
+    "- 对比售后政策"
+  ].join("\n");
+  const card = new CardRenderer("hybrid").taskReportCard({
+    title: "Markdown report",
+    status: "completed",
+    projectName: "Playground",
+    reasoningSummary: "已完成对比。",
+    finalResult,
+    finalResultTruncated: false,
+    updatedAt: new Date().toISOString()
+  });
+  const content = JSON.stringify(card);
+  assert.equal(content.includes("## 推荐结论"), true);
+  assert.equal(content.includes("\\n\\n建议优先选择下面两项"), true);
+  assert.equal(content.includes("1. 米家 501"), true);
+  assert.equal(content.includes("| 机型 | 价格 | 结论 |"), true);
+  assert.equal(content.includes("- 确认摆放尺寸"), true);
+});
+
+test("completed notification preserves markdown final result from Codex thread", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const markdownFinal = [
+      "## 最终结论",
+      "",
+      "这次建议按下面顺序处理：",
+      "",
+      "1. 先修复飞书卡片排版。",
+      "2. 再验证长结论是否需要补发完整文本。",
+      "",
+      "| 项目 | 状态 |",
+      "| --- | --- |",
+      "| Markdown 保留 | 已完成 |",
+      "| 表格展示 | 已完成 |",
+      "",
+      "### 验证",
+      "",
+      "- npm run check"
+    ].join("\n");
+    const codex = new MockCodex();
+    codex.threads = [
+      {
+        id: "thr_markdown_report",
+        name: "Markdown report",
+        preview: "Markdown report",
+        cwd: dir,
+        status: { type: "idle" },
+        turns: [
+          {
+            id: "turn_markdown_report",
+            status: "completed",
+            items: [
+              { type: "reasoning", summary: ["读取 Codex 输出并保留结构化结论。"], content: [] },
+              { type: "agentMessage", text: markdownFinal }
+            ]
+          }
+        ],
+        updatedAt: Date.now()
+      }
+    ];
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_markdown_report",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Markdown report",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: {
+          id: "turn_markdown_report",
+          status: "completed",
+          items: []
+        }
+      }
+    });
+    const result = findTaskReportOutbox(repo.listDueOutbox(10));
+    assert.ok(result);
+    const payload = JSON.stringify(result.payload.card);
+    assert.equal(payload.includes("## 最终结论"), true);
+    assert.equal(payload.includes("\\n\\n这次建议按下面顺序处理"), true);
+    assert.equal(payload.includes("1. 先修复飞书卡片排版。"), true);
+    assert.equal(payload.includes("| 项目 | 状态 |"), true);
+    assert.equal(payload.includes("- npm run check"), true);
+  } finally {
+    cleanup();
+  }
+});
+
 test("project card and settings card expose mobile-safe settings entry", () => {
   const projectCard = new CardRenderer("hybrid").projectCard({
     id: "proj_1",
@@ -2562,6 +2732,12 @@ const collectButtons = (value: unknown): Array<Record<string, unknown>> => {
   visit(value);
   return found;
 };
+
+const findTaskReportOutbox = (items: Array<{ notificationType: string; payload: Record<string, unknown> }>) =>
+  items.find((item) => {
+    const content = JSON.stringify(item.payload.card ?? {});
+    return item.notificationType === "task_completed" && content.includes("处理完成") && content.includes("最终结论");
+  });
 
 const buttonAction = (button: Record<string, unknown>): string | null => {
   const behaviors = Array.isArray(button.behaviors) ? button.behaviors : [];

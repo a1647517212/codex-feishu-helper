@@ -2856,7 +2856,7 @@ const extractThreadReport = (detail: Record<string, unknown>): ThreadReport | nu
     }
     if (finalMessages.length > 0) break;
   }
-  const finalResult = firstSanitized(finalMessages);
+  const finalResult = firstSanitized(finalMessages, 50000);
   const reasoningSummary = firstSanitized(reasoning) ?? firstSanitized(plans);
   if (!finalResult && !reasoningSummary) return null;
   return { reasoningSummary, finalResult };
@@ -2893,7 +2893,7 @@ const extractReportFromItems = (items: unknown[]): ThreadReport | null => {
       if (text) plans.push(text);
     }
   }
-  const finalResult = firstSanitized(finalMessages);
+  const finalResult = firstSanitized(finalMessages, 50000);
   const reasoningSummary = firstSanitized(reasoning) ?? firstSanitized(plans);
   if (!finalResult && !reasoningSummary) return null;
   return { reasoningSummary, finalResult };
@@ -2901,8 +2901,8 @@ const extractReportFromItems = (items: unknown[]): ThreadReport | null => {
 
 const extractEventReport = (events: Array<{ codexTurnId: string | null; eventType: string; eventPayload: Record<string, unknown>; seq: number }>, turnId: string): ThreadReport | null => {
   const currentTurnEvents = events.filter((event) => !event.codexTurnId || event.codexTurnId === turnId);
-  const completedAgent = latestSanitizedEventText(currentTurnEvents, "codex.agent_message");
-  const agentDelta = firstSanitized([joinDeltaEvents(currentTurnEvents, "codex.agent_delta")].filter(Boolean) as string[]);
+  const completedAgent = latestSanitizedEventText(currentTurnEvents, "codex.agent_message", 50000);
+  const agentDelta = firstSanitized([joinDeltaEvents(currentTurnEvents, "codex.agent_delta")].filter(Boolean) as string[], 50000);
   const reasoningCompleted =
     latestSanitizedEventText(currentTurnEvents, "codex.reasoning_summary") ??
     latestSanitizedEventText(currentTurnEvents, "codex.reasoning");
@@ -2947,8 +2947,9 @@ const formatThreadReport = (
   events: TaskEvent[],
   projectName: string | null
 ) => {
-  const reasoningSummary = report.reasoningSummary ? truncatePlain(report.reasoningSummary, 1200) : null;
-  const finalResult = report.finalResult ? truncatePlain(report.finalResult, 1800) : null;
+  const reasoningSummary = report.reasoningSummary ? sanitizeAssistantMarkdown(report.reasoningSummary, 1800) : null;
+  const fullFinalResult = report.finalResult ? sanitizeAssistantMarkdown(report.finalResult, 50000) : null;
+  const finalResult = report.finalResult ? sanitizeAssistantMarkdown(report.finalResult, 8600) : null;
   const highlights = deriveHighlights(reasoningSummary, finalResult, 3);
   const changeItems = deriveChangeItems(events, reasoningSummary, finalResult, 3);
   const verificationItems = deriveVerificationItems(events, reasoningSummary, finalResult, 3);
@@ -2963,8 +2964,8 @@ const formatThreadReport = (
     changeItems,
     verificationItems,
     nextSteps,
-    fullFinalResult: report.finalResult,
-    finalResultTruncated: Boolean(report.finalResult) && finalResult !== report.finalResult,
+    fullFinalResult,
+    finalResultTruncated: Boolean(finalResult && fullFinalResult && finalResult !== fullFinalResult),
     updatedAt: new Date().toISOString()
   };
 };
@@ -2972,7 +2973,7 @@ const formatThreadReport = (
 const formatFullFinalResult = (report: ThreadReport): string => {
   const lines = [
     "完整最终结论",
-    report.finalResult ?? "未提取到最终回复文本，请发送 /logs 查看本地任务记录。"
+    report.finalResult ? sanitizeAssistantMarkdown(report.finalResult, 50000) : "未提取到最终回复文本，请发送 /logs 查看本地任务记录。"
   ];
   return lines.join("\n\n");
 };
@@ -2982,9 +2983,9 @@ const shouldSendFullFinalResult = (projection: {
   fullFinalResult?: string | null;
 }): boolean => Boolean(projection.finalResultTruncated && projection.fullFinalResult && projection.fullFinalResult.trim().length > 0);
 
-const firstSanitized = (items: string[]): string | null => {
+const firstSanitized = (items: string[], maxLength = 6000): string | null => {
   for (const item of items) {
-    const sanitized = sanitizeAssistantSummary(item);
+    const sanitized = sanitizeAssistantMarkdown(item, maxLength);
     if (sanitized && sanitized !== "有输出，原始内容已保留在本地记录中。") return sanitized;
   }
   return null;
@@ -2999,7 +3000,8 @@ const firstPresent = (items: Array<string | null>): string | null => {
 
 const latestSanitizedEventText = (
   events: Array<{ eventType: string; eventPayload: Record<string, unknown>; seq: number }>,
-  eventType: string
+  eventType: string,
+  maxLength = 6000
 ): string | null => {
   const matched = [...events]
     .filter((event) => event.eventType === eventType)
@@ -3007,7 +3009,7 @@ const latestSanitizedEventText = (
   for (const event of matched) {
     const text = asString(event.eventPayload.text);
     if (!text) continue;
-    const sanitized = sanitizeAssistantSummary(text);
+    const sanitized = sanitizeAssistantMarkdown(text, maxLength);
     if (sanitized && sanitized !== "有输出，原始内容已保留在本地记录中。") return sanitized;
   }
   return null;
@@ -3103,18 +3105,40 @@ const sanitizeAssistantSummary = (text: string, maxLength = 6000): string => {
   const compact = withoutCodeBlocks
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter((line) => line && !looksLikeCommandLine(line))
+    .filter((line) => line && !looksLikeSummaryNoiseLine(line))
     .join(" ")
     .replace(/\s+/g, " ")
     .trim();
   return truncate(compact || "有输出，原始内容已保留在本地记录中。", maxLength);
 };
 
+// Preserve Codex-style Markdown for Feishu report cards while removing noisy shell-only lines.
+const sanitizeAssistantMarkdown = (text: string, maxLength = 6000): string => {
+  const withoutCodeBlocks = text.replace(/```[\s\S]*?```/g, "\n[代码块已省略]\n");
+  const lines = withoutCodeBlocks
+    .replace(/\r\n?/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+$/g, ""));
+  const filtered: string[] = [];
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (trimmed && looksLikeCommandLine(trimmed)) continue;
+    filtered.push(line);
+  }
+  const normalized = filtered
+    .join("\n")
+    .replace(/\n{4,}/g, "\n\n\n")
+    .trim();
+  return truncate(normalized || "有输出，原始内容已保留在本地记录中。", maxLength);
+};
+
 const singleLine = (text: string): string => text.replace(/\s+/g, " ").trim();
 
 const looksLikeCommandLine = (line: string): boolean =>
-  /(?:powershell|pwsh|cmd\.exe|node|npm|pnpm|yarn|python|git|rg|Get-Content|Get-ChildItem|Select-String)/i.test(line) ||
-  line.length > 180;
+  /^\s*(?:PS\s+[^>]+>\s*|[$>]\s*)?(?:powershell|pwsh|cmd\.exe|node|npm|pnpm|yarn|python|git|rg|Get-Content|Get-ChildItem|Select-String)(?:\s|$)/i.test(line);
+
+const looksLikeSummaryNoiseLine = (line: string): boolean =>
+  looksLikeCommandLine(line) || line.length > 180;
 
 const formatPlanProgress = (value: unknown): string | null => {
   if (!Array.isArray(value)) return null;

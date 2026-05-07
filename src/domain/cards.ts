@@ -260,11 +260,11 @@ export class CardRenderer {
     }
     if (projection.reasoningSummary) {
       elements.push(divider());
-      elements.push(sectionBlock("处理摘要", projection.reasoningSummary));
+      pushMarkdownSections(elements, "处理摘要", projection.reasoningSummary, { maxChunkLength: 1800, maxSections: 2 });
     }
     if (projection.finalResult) {
       elements.push(divider());
-      elements.push(sectionBlock("最终结论", projection.finalResult));
+      pushMarkdownSections(elements, "最终结论", projection.finalResult, { maxChunkLength: 2200, maxSections: 4 });
       if (projection.finalResultTruncated) {
         elements.push(divider());
         elements.push(tipBlock("最终结论较长，系统会补发完整文本。"));
@@ -909,7 +909,84 @@ const text = (content: string): Record<string, unknown> => ({
 const kvLine = (label: string, value: string): string => `**${label}**  ${value}`;
 
 const sectionBlock = (title: string, body: string): Record<string, unknown> =>
-  text(`**${title}**\n${body}`);
+  text(`**${title}**\n\n${body}`);
+
+// Keep report Markdown readable by splitting on natural paragraph and line boundaries before Feishu truncates a block.
+const pushMarkdownSections = (
+  elements: Record<string, unknown>[],
+  title: string,
+  body: string,
+  options: { maxChunkLength: number; maxSections: number }
+): void => {
+  const chunks = splitMarkdownForCard(body, options.maxChunkLength).slice(0, options.maxSections);
+  chunks.forEach((chunk, index) => {
+    elements.push(sectionBlock(index === 0 ? title : `${title}（续 ${index + 1}）`, chunk));
+    if (index < chunks.length - 1) elements.push(divider());
+  });
+};
+
+const splitMarkdownForCard = (body: string, maxChunkLength: number): string[] => {
+  const normalized = body.replace(/\r\n?/g, "\n").replace(/\n{4,}/g, "\n\n\n").trim();
+  if (!normalized) return [];
+  if (normalized.length <= maxChunkLength) return [normalized];
+  const blocks = normalized.split(/\n{2,}/);
+  const chunks: string[] = [];
+  let current = "";
+  for (const block of blocks) {
+    const trimmed = block.trim();
+    if (!trimmed) continue;
+    if (trimmed.length > maxChunkLength) {
+      if (current) {
+        chunks.push(current.trim());
+        current = "";
+      }
+      chunks.push(...splitLongMarkdownBlock(trimmed, maxChunkLength));
+      continue;
+    }
+    const candidate = current ? `${current}\n\n${trimmed}` : trimmed;
+    if (candidate.length > maxChunkLength) {
+      if (current) chunks.push(current.trim());
+      current = trimmed;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current) chunks.push(current.trim());
+  return chunks;
+};
+
+const splitLongMarkdownBlock = (block: string, maxChunkLength: number): string[] => {
+  const lines = block.split("\n");
+  const chunks: string[] = [];
+  let current = "";
+  for (const line of lines) {
+    const candidate = current ? `${current}\n${line}` : line;
+    if (candidate.length > maxChunkLength && current) {
+      chunks.push(current.trim());
+      current = line;
+      continue;
+    }
+    if (candidate.length > maxChunkLength) {
+      chunks.push(...hardSplitMarkdown(line, maxChunkLength));
+      current = "";
+      continue;
+    }
+    current = candidate;
+  }
+  if (current) chunks.push(current.trim());
+  return chunks;
+};
+
+const hardSplitMarkdown = (value: string, maxChunkLength: number): string[] => {
+  const chunks: string[] = [];
+  let offset = 0;
+  while (offset < value.length) {
+    const next = value.slice(offset, offset + maxChunkLength);
+    chunks.push(next.trim());
+    offset += maxChunkLength;
+  }
+  return chunks.filter(Boolean);
+};
 
 const tipBlock = (body: string): Record<string, unknown> =>
   text(`**操作提示**\n${body}`);
