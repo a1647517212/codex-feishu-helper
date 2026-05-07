@@ -292,6 +292,38 @@ test("continuing a dedicated task updates the existing status card instead of se
   }
 });
 
+test("open task action from control chat does not replay task status into the control chat", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_open_bound",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      feishuControlChatId: "chat_1",
+      title: "Open bound task",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    const result = await service.handleCardAction({
+      actionId: "act_open_bound",
+      action: "open_bound_topic",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_control",
+      payload: { bindingId: binding.id }
+    });
+    assert.equal(String(result.text).includes("主控群"), true);
+    assert.equal(feishu.sent.filter((entry) => entry.type === "card").length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
 test("replying to the task status card message still finds the bound topic", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
@@ -967,6 +999,38 @@ test("claim sessions card can bind an existing Codex thread", async () => {
   }
 });
 
+test("claiming an already bound dedicated task does not send task content back to control chat", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    repo.createOrUpdateBinding({
+      codexThreadId: "thr_bound_existing",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      feishuControlChatId: "chat_1",
+      title: "Bound existing task",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    const result = await service.handleCardAction({
+      actionId: "act_claim_existing",
+      action: "claim_thread",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_existing",
+      payload: { codexThreadId: "thr_bound_existing" }
+    });
+    assert.equal(String(result.text).includes("主控群"), true);
+    assert.equal(feishu.sent.filter((entry) => entry.type === "card").length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
 test("message command can claim an existing Codex thread without card callback", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
@@ -1093,6 +1157,41 @@ test("claim summary and ignore commands work without card callback", async () =>
     assert.equal(feishu.sent.some((entry) => String(entry.payload).includes("最近执行步骤：1 个")), true);
     assert.equal(feishu.sent.some((entry) => String(entry.payload).includes("npm test")), false);
     assert.equal(repo.findIgnoredThread("thr_summary")?.codexThreadId, "thr_summary");
+  } finally {
+    cleanup();
+  }
+});
+
+test("claim summary for an already bound dedicated task stays as a control-group hint", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    repo.createOrUpdateBinding({
+      codexThreadId: "thr_bound_summary",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      feishuControlChatId: "chat_1",
+      title: "Bound summary task",
+      status: "completed",
+      createdFrom: "manual_import"
+    });
+    await service.handleMessage({
+      messageId: "msg_claim_summary_bound",
+      chatId: "chat_1",
+      rootMessageId: "root_claim_summary_bound",
+      threadId: null,
+      userId: "user_1",
+      text: "/claim summary thr_bound_summary"
+    });
+    assert.equal(
+      feishu.sent.some((entry) => entry.type === "text" && String(entry.payload).includes("主控群不再展示子会话内容")),
+      true
+    );
+    assert.equal(feishu.sent.some((entry) => String(entry.payload).includes("任务摘要：")), false);
   } finally {
     cleanup();
   }

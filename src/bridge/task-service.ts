@@ -787,12 +787,13 @@ export class TaskService {
     if (!threadId) throw new Error("缺少 Codex 任务 ID");
     const existing = this.repo.findBindingByThreadId(threadId);
     if (existing) {
-      await this.feishu.sendCard(
-        action.chatId || existing.feishuChatId,
-        this.cards.taskStatusCard(this.projection.buildTaskStatus(existing.id)),
-        action.rootMessageId
-      );
-      return { ok: true, text: "这个任务已经可以在飞书继续，已回显当前状态。" };
+      return {
+        ok: true,
+        text:
+          existing.feishuContainerKind === "dedicated_chat"
+            ? "这个任务已经有独立会话，请直接去对应任务会话继续，不会再把内容回发到主控群。"
+            : "这个任务已经绑定到原话题，请直接去对应任务话题继续，不会再把内容回发到主控群。"
+      };
     }
     const detail = await this.codex.readThread(threadId, false);
     const thread = normalizeThreadFromDetail(threadId, detail);
@@ -885,6 +886,15 @@ export class TaskService {
   private async sendClaimSummary(action: FeishuCardAction): Promise<void> {
     const threadId = String(action.payload.codexThreadId ?? "");
     if (!threadId) throw new Error("缺少 Codex 任务 ID");
+    const existing = this.repo.findBindingByThreadId(threadId);
+    if (existing?.feishuContainerKind === "dedicated_chat") {
+      await this.feishu.sendText(
+        action.chatId || this.config.feishu.defaultChatId || "",
+        "这个任务已经进入独立会话，请在对应任务会话里查看处理记录；主控群不再展示子会话内容。",
+        action.rootMessageId
+      );
+      return;
+    }
     const detail = await this.codex.readThread(threadId, true);
     const thread = normalizeThreadFromDetail(threadId, detail);
     const summary = summarizeThreadDetail(detail);
@@ -991,12 +1001,11 @@ export class TaskService {
 
   private async openBoundTopic(action: FeishuCardAction): Promise<Record<string, unknown>> {
     const binding = this.requireBinding(action);
-    await this.sendCardToTarget(this.targetForBinding(binding, action.chatId), this.cards.taskStatusCard(this.projection.buildTaskStatus(binding.id)));
     return {
       ok: true,
       text: binding.feishuContainerKind === "dedicated_chat"
-        ? "已在这个任务独立会话里回发最新状态，可直接在那个会话继续。"
-        : "已在这个任务绑定的话题里回发最新状态，可直接在那条回复链继续。"
+        ? "这个任务已有独立会话，请直接去对应任务会话继续；主控群不再同步子会话内容。"
+        : "这个任务已绑定到原话题，请直接去对应任务话题继续；主控群不再同步详细内容。"
     };
   }
 

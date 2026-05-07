@@ -77,8 +77,7 @@ export class CardRenderer {
             button("打开任务", "open_bound_topic", {
               bindingId: thread.bindingId,
               rootMessageId: thread.rootMessageId ?? thread.bindingId
-            }),
-            button("查看摘要", "claim_summary", { codexThreadId: thread.id })
+            })
           ]
         : [
             button("在飞书继续", "claim_thread", { codexThreadId: thread.id }),
