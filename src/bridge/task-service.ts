@@ -1341,6 +1341,12 @@ export class TaskService {
         await this.updateTaskTitle(binding.id, status, binding.title ?? "Codex 任务");
       }
       if (status === "completed" && report) {
+        const formattedReport = formatThreadReport(
+          binding,
+          report,
+          status,
+          binding.projectId ? this.repo.getProject(binding.projectId)?.name ?? null : null
+        );
         this.repo.enqueueOutbox({
           sessionBindingId: binding.id,
           eventSeq: event.seq,
@@ -1349,8 +1355,8 @@ export class TaskService {
           feishuTopicRootMessageId: binding.feishuTopicRootMessageId,
           feishuThreadId: binding.feishuThreadId,
           payload: {
-            card: this.cards.taskReportCard(formatThreadReport(binding, report, status, binding.projectId ? this.repo.getProject(binding.projectId)?.name ?? null : null)),
-            text: formatFullFinalResult(report)
+            card: this.cards.taskReportCard(formattedReport),
+            ...(formattedReport.finalResultTruncated ? { text: formatFullFinalResult(report) } : {})
           },
           dedupeKey: `turn:${threadId}:${turnId}:result`
         });
@@ -2021,14 +2027,19 @@ const buildCompletedItemEvent = (item: Record<string, unknown>): { eventType: st
   return null;
 };
 
-const formatThreadReport = (binding: SessionBinding, report: ThreadReport, status: TaskStatus, projectName: string | null) => ({
-  title: binding.title ?? "Codex 任务",
-  status,
-  projectName: projectName ?? "Playground",
-  reasoningSummary: report.reasoningSummary ? truncatePlain(report.reasoningSummary, 1200) : null,
-  finalResult: report.finalResult ? truncatePlain(report.finalResult, 1800) : null,
-  updatedAt: new Date().toISOString()
-});
+const formatThreadReport = (binding: SessionBinding, report: ThreadReport, status: TaskStatus, projectName: string | null) => {
+  const reasoningSummary = report.reasoningSummary ? truncatePlain(report.reasoningSummary, 1200) : null;
+  const finalResult = report.finalResult ? truncatePlain(report.finalResult, 1800) : null;
+  return {
+    title: binding.title ?? "Codex 任务",
+    status,
+    projectName: projectName ?? "Playground",
+    reasoningSummary,
+    finalResult,
+    finalResultTruncated: Boolean(report.finalResult) && finalResult !== report.finalResult,
+    updatedAt: new Date().toISOString()
+  };
+};
 
 const formatFullFinalResult = (report: ThreadReport): string => {
   const lines = [

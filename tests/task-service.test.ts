@@ -544,6 +544,7 @@ test("completed notification sends result from streamed deltas when read and tur
     const payload = JSON.stringify(result.payload);
     assert.equal(payload.includes("先确认目标，再输出结果。"), true);
     assert.equal(payload.includes("已完成并给出结论。"), true);
+    assert.equal("text" in result.payload, false);
   } finally {
     cleanup();
   }
@@ -643,6 +644,7 @@ test("completed notification keeps long final result for outbox chunking", async
     const result = repo.listDueOutbox(10).find((item) => item.notificationType === "task_completed" && JSON.stringify(item.payload.card ?? {}).includes("处理完成"));
     assert.ok(result);
     assert.equal(JSON.stringify(result.payload.card).includes("最终结论"), true);
+    assert.equal("text" in result.payload, true);
     assert.equal(String(result.payload.text).includes("第80条建议"), true);
     assert.equal(String(result.payload.text).includes("...(已截断)"), false);
   } finally {

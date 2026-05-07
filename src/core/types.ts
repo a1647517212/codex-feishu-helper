@@ -235,6 +235,7 @@ export interface TaskReportProjection {
   projectName: string;
   reasoningSummary: string | null;
   finalResult: string | null;
+  finalResultTruncated?: boolean;
   updatedAt: string;
 }
 
