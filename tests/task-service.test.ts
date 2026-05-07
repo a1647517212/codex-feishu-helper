@@ -184,7 +184,8 @@ test("direct group message creates a dedicated Feishu task chat before starting 
     assert.equal(binding.feishuChatId, "task_chat_1");
     assert.equal(binding.feishuControlChatId, "chat_1");
     assert.equal(binding.feishuThreadId, null);
-    assert.equal(feishu.sent.some((entry) => entry.chatId === "chat_1" && String(entry.payload).includes("已创建独立任务会话")), true);
+    assert.equal(feishu.sent.some((entry) => entry.chatId === "chat_1" && String(entry.payload).includes("已创建独立任务会话")), false);
+    assert.equal(feishu.sent.some((entry) => entry.chatId === "task_chat_1" && String(entry.payload).includes("后续补充")), true);
     assert.equal(feishu.updatedChatNames.some((entry) => entry.chatId === "task_chat_1" && entry.name.includes("[运行中]")), true);
   } finally {
     cleanup();
@@ -606,9 +607,10 @@ test("console new task action creates a draft dedicated task chat", async () => 
       payload: {}
     });
     assert.equal(feishu.createdChats.length, 1);
-    assert.equal(feishu.sent.length, 2);
+    assert.equal(feishu.sent.length, 1);
     assert.equal(feishu.sent[0]?.type, "text");
-    assert.equal(feishu.sent[1]?.type, "text");
+    assert.equal(feishu.sent[0]?.chatId, "task_chat_1");
+    assert.equal(String(feishu.sent[0]?.payload).includes("请直接发送"), true);
     const draft = repo.listBindings().find((binding) => binding.status === "waiting_for_prompt");
     assert.ok(draft);
     assert.equal(draft.feishuContainerKind, "dedicated_chat");
@@ -681,7 +683,8 @@ test("claim sessions card can bind an existing Codex thread", async () => {
     assert.equal(binding.feishuThreadId, null);
     assert.equal(binding.createdFrom, "codex_app_claimed");
     assert.equal(feishu.createdChats.length, 1);
-    assert.equal(feishu.sent[0]?.type, "text");
+    assert.equal(feishu.sent.some((entry) => entry.chatId === "chat_1" && String(entry.payload).includes("已创建独立任务会话")), false);
+    assert.equal(repo.listDueOutbox(10).some((item) => item.feishuChatId === "task_chat_1" && item.notificationType === "task_status"), true);
   } finally {
     cleanup();
   }

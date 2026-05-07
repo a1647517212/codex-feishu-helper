@@ -303,11 +303,6 @@ export class TaskService {
       card: project ? this.cards.waitingForPromptCard(project) : this.cards.newTaskDraftCard()
     }, message);
     if (container.kind === "dedicated_chat") {
-      await this.feishu.sendText(
-        message.chatId,
-        `已创建独立任务会话：${buildTaskChatName(this.config, container.rootMessageId, title)}\n请在新会话里继续补充需求。`,
-        message.rootMessageId ?? message.messageId
-      );
       await this.feishu.sendText(container.chatId, `任务：${title}\n\n后续补充、/status、/logs、/archive 都在这个会话里发送。`);
       await this.repo.beginIncomingMessage({
         messageId: `system:${container.chatId}:${message.messageId}`,
@@ -657,7 +652,6 @@ export class TaskService {
       card
     }, { userId: action.userId });
     if (container.kind === "dedicated_chat") {
-      await this.feishu.sendText(chatId, `已创建独立任务会话：${buildTaskChatName(this.config, container.rootMessageId, "新任务")}\n请在新会话里发送任务描述。`, action.rootMessageId);
       await this.feishu.sendText(container.chatId, "请直接发送你希望 Codex 完成的事情。");
     }
     this.repo.createOrUpdateBinding({
@@ -781,9 +775,6 @@ export class TaskService {
         updatedAt: new Date().toISOString()
       })
     }, { userId: action.userId });
-    if (container.kind === "dedicated_chat") {
-      await this.feishu.sendText(chatId, `已创建独立任务会话：${buildTaskChatName(this.config, container.rootMessageId, title)}\n请在新会话里继续。`, action.rootMessageId);
-    }
     const binding = await this.claimThread({
       thread,
       chatId: container.chatId,
