@@ -260,6 +260,38 @@ test("continuing a completed dedicated task chat switches the chat title back to
   }
 });
 
+test("continuing a dedicated task updates the existing status card instead of sending a duplicate one", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_single_status_card",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Single status card",
+      status: "completed",
+      createdFrom: "manual_import"
+    });
+    repo.updateBindingTaskCardMessageId(binding.id, "msg_task_card_existing");
+    await service.handleMessage({
+      messageId: "msg_continue_single_card",
+      chatId: "task_chat_1",
+      rootMessageId: null,
+      threadId: null,
+      userId: "user_1",
+      text: "继续追问"
+    });
+    assert.equal(feishu.sent.filter((entry) => entry.type === "card" && entry.chatId === "task_chat_1").length, 0);
+    assert.equal(feishu.updatedCards.some((entry) => entry.messageId === "msg_task_card_existing"), true);
+  } finally {
+    cleanup();
+  }
+});
+
 test("replying to the task status card message still finds the bound topic", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {

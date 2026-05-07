@@ -47,7 +47,16 @@ export class OutboxWorker {
           await this.sendCard(item, entry, dedicatedChat);
         }
       } else if (card) {
-        await this.sendCard(item, card, dedicatedChat);
+        const sent = await this.sendCard(item, card, dedicatedChat);
+        if (
+          item.notificationType === "task_status" &&
+          item.sessionBindingId &&
+          binding &&
+          !binding.feishuTaskCardMessageId &&
+          sent.messageId
+        ) {
+          this.repo.updateBindingTaskCardMessageId(item.sessionBindingId, sent.messageId);
+        }
       }
       if (text) {
         const chunks = splitFeishuText(text, this.config.bridge.maxFeishuTextLength);
@@ -78,11 +87,11 @@ export class OutboxWorker {
     }
   }
 
-  private async sendCard(item: NotificationOutboxItem, card: Record<string, unknown>, dedicatedChat: boolean): Promise<void> {
+  private async sendCard(item: NotificationOutboxItem, card: Record<string, unknown>, dedicatedChat: boolean) {
     if (!dedicatedChat && item.feishuThreadId) {
-      await this.feishu.replyCardInThread(item.feishuTopicRootMessageId ?? item.feishuThreadId, card);
+      return this.feishu.replyCardInThread(item.feishuTopicRootMessageId ?? item.feishuThreadId, card);
     } else {
-      await this.feishu.sendCard(item.feishuChatId, card, dedicatedChat ? null : item.feishuTopicRootMessageId);
+      return this.feishu.sendCard(item.feishuChatId, card, dedicatedChat ? null : item.feishuTopicRootMessageId);
     }
   }
 }

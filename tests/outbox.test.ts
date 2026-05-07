@@ -106,3 +106,34 @@ test("outbox splits long text notifications instead of truncating them", async (
     cleanup();
   }
 });
+
+test("outbox stores first task status card message id for later updates", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const worker = new OutboxWorker(config, repo, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_status_card_bind",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Status card bind",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    repo.enqueueOutbox({
+      sessionBindingId: binding.id,
+      notificationType: "task_status",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      payload: { card: { schema: "2.0", header: { title: { tag: "plain_text", content: "test" } }, body: { elements: [] } } },
+      dedupeKey: "task-status-bind"
+    });
+    await worker.flush();
+    assert.equal(feishu.sent.length, 1);
+    assert.equal(repo.findBindingById(binding.id)?.feishuTaskCardMessageId, "msg_1");
+  } finally {
+    cleanup();
+  }
+});

@@ -273,6 +273,16 @@ export class Repository {
       );
   }
 
+  updateBindingTaskCardMessageId(bindingId: string, messageId: string | null): void {
+    this.database.db
+      .prepare(
+        `UPDATE session_bindings
+         SET feishu_task_card_message_id = ?, updated_at = ?
+         WHERE id = ?`
+      )
+      .run(messageId, nowIso(), bindingId);
+  }
+
   findBindingByTaskCardMessageId(chatId: string, messageId: string): SessionBinding | null {
     const row = this.database.db
       .prepare("SELECT * FROM session_bindings WHERE feishu_chat_id = ? AND feishu_task_card_message_id = ?")
