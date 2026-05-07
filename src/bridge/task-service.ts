@@ -2048,6 +2048,7 @@ export class TaskService {
           this.repo.listEventsForBinding(binding.id, 200),
           binding.projectId ? this.repo.getProject(binding.projectId)?.name ?? null : null
         );
+        const supplementalCards = this.cards.taskReportSupplementCards(formattedReport);
         this.repo.enqueueOutbox({
           sessionBindingId: binding.id,
           eventSeq: event.seq,
@@ -2057,7 +2058,8 @@ export class TaskService {
           feishuThreadId: binding.feishuThreadId,
           payload: {
             card: this.cards.taskReportCard(formattedReport),
-            ...(shouldSendFullFinalResult(formattedReport) ? { text: formatFullFinalResult(report) } : {})
+            ...(supplementalCards.length > 0 ? { cards: supplementalCards } : {}),
+            ...(this.cards.shouldSendTaskReportFullText(formattedReport) ? { text: formatFullFinalResult(report) } : {})
           },
           dedupeKey: `turn:${threadId}:${turnId}:result`
         });
@@ -2856,7 +2858,7 @@ const extractThreadReport = (detail: Record<string, unknown>): ThreadReport | nu
     }
     if (finalMessages.length > 0) break;
   }
-  const finalResult = firstSanitized(finalMessages, 50000);
+  const finalResult = firstSanitized(finalMessages, 200000);
   const reasoningSummary = firstSanitized(reasoning) ?? firstSanitized(plans);
   if (!finalResult && !reasoningSummary) return null;
   return { reasoningSummary, finalResult };
@@ -2893,7 +2895,7 @@ const extractReportFromItems = (items: unknown[]): ThreadReport | null => {
       if (text) plans.push(text);
     }
   }
-  const finalResult = firstSanitized(finalMessages, 50000);
+  const finalResult = firstSanitized(finalMessages, 200000);
   const reasoningSummary = firstSanitized(reasoning) ?? firstSanitized(plans);
   if (!finalResult && !reasoningSummary) return null;
   return { reasoningSummary, finalResult };
@@ -2901,8 +2903,8 @@ const extractReportFromItems = (items: unknown[]): ThreadReport | null => {
 
 const extractEventReport = (events: Array<{ codexTurnId: string | null; eventType: string; eventPayload: Record<string, unknown>; seq: number }>, turnId: string): ThreadReport | null => {
   const currentTurnEvents = events.filter((event) => !event.codexTurnId || event.codexTurnId === turnId);
-  const completedAgent = latestSanitizedEventText(currentTurnEvents, "codex.agent_message", 50000);
-  const agentDelta = firstSanitized([joinDeltaEvents(currentTurnEvents, "codex.agent_delta")].filter(Boolean) as string[], 50000);
+  const completedAgent = latestSanitizedEventText(currentTurnEvents, "codex.agent_message", 200000);
+  const agentDelta = firstSanitized([joinDeltaEvents(currentTurnEvents, "codex.agent_delta")].filter(Boolean) as string[], 200000);
   const reasoningCompleted =
     latestSanitizedEventText(currentTurnEvents, "codex.reasoning_summary") ??
     latestSanitizedEventText(currentTurnEvents, "codex.reasoning");
@@ -2948,7 +2950,7 @@ const formatThreadReport = (
   projectName: string | null
 ) => {
   const reasoningSummary = report.reasoningSummary ? sanitizeAssistantMarkdown(report.reasoningSummary, 1800) : null;
-  const fullFinalResult = report.finalResult ? sanitizeAssistantMarkdown(report.finalResult, 50000) : null;
+  const fullFinalResult = report.finalResult ? sanitizeAssistantMarkdown(report.finalResult, 200000) : null;
   const finalResult = report.finalResult ? sanitizeAssistantMarkdown(report.finalResult, 8600) : null;
   const highlights = deriveHighlights(reasoningSummary, finalResult, 3);
   const changeItems = deriveChangeItems(events, reasoningSummary, finalResult, 3);
@@ -2973,15 +2975,10 @@ const formatThreadReport = (
 const formatFullFinalResult = (report: ThreadReport): string => {
   const lines = [
     "完整最终结论",
-    report.finalResult ? sanitizeAssistantMarkdown(report.finalResult, 50000) : "未提取到最终回复文本，请发送 /logs 查看本地任务记录。"
+    report.finalResult ? sanitizeAssistantMarkdown(report.finalResult, 200000) : "未提取到最终回复文本，请发送 /logs 查看本地任务记录。"
   ];
   return lines.join("\n\n");
 };
-
-const shouldSendFullFinalResult = (projection: {
-  finalResultTruncated?: boolean;
-  fullFinalResult?: string | null;
-}): boolean => Boolean(projection.finalResultTruncated && projection.fullFinalResult && projection.fullFinalResult.trim().length > 0);
 
 const firstSanitized = (items: string[], maxLength = 6000): string | null => {
   for (const item of items) {

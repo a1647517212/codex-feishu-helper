@@ -262,23 +262,50 @@ export class CardRenderer {
       elements.push(divider());
       pushMarkdownSections(elements, "处理摘要", projection.reasoningSummary, { maxChunkLength: 1800, maxSections: 2 });
     }
-    if (projection.finalResult) {
+    const finalResult = projection.fullFinalResult ?? projection.finalResult;
+    if (finalResult) {
+      const finalChunks = splitTaskReportFinalResult(finalResult);
       elements.push(divider());
-      pushMarkdownSections(elements, "最终结论", projection.finalResult, { maxChunkLength: 2200, maxSections: 4 });
-      if (projection.finalResultTruncated) {
+      pushMarkdownChunks(elements, "最终结论", finalChunks.slice(0, TASK_REPORT_MAIN_FINAL_CHUNKS));
+      if (finalChunks.length > TASK_REPORT_MAIN_FINAL_CHUNKS) {
         elements.push(divider());
-        elements.push(tipBlock("最终结论较长，系统会补发完整文本。"));
+        elements.push(tipBlock(this.shouldSendTaskReportFullText(projection) ? "最终结论很长，系统会先补充卡片，再补发完整文本。" : "最终结论较长，系统会继续补充卡片。"));
       }
     }
     if (projection.nextSteps && projection.nextSteps.length > 0) {
       elements.push(divider());
       elements.push(sectionBlock("建议后续", projection.nextSteps.map((item, index) => `${index + 1}. ${item}`).join("\n")));
     }
-    if (!projection.reasoningSummary && !projection.finalResult) {
+    if (!projection.reasoningSummary && !finalResult) {
       elements.push(divider());
       elements.push(tipBlock("未提取到可展示的结果内容，请发送 /logs 查看本地任务记录。"));
     }
     return card(`${projection.title}｜处理完成`, elements);
+  }
+
+  taskReportSupplementCards(projection: TaskReportProjection): FeishuCard[] {
+    const finalResult = projection.fullFinalResult ?? projection.finalResult;
+    if (!finalResult) return [];
+    const overflow = splitTaskReportFinalResult(finalResult).slice(TASK_REPORT_MAIN_FINAL_CHUNKS);
+    if (overflow.length === 0) return [];
+    const groups = groupChunks(overflow, TASK_REPORT_SUPPLEMENT_CHUNKS_PER_CARD).slice(0, TASK_REPORT_MAX_SUPPLEMENT_CARDS);
+    return groups.map((chunks, index) => {
+      const elements: Record<string, unknown>[] = [
+        text(taskMetaLines(projection.status, projection.projectName, projection.updatedAt, "完成时间").join("\n"))
+      ];
+      pushMarkdownChunks(elements, `最终结论补充 ${index + 1}`, chunks);
+      if (index === groups.length - 1 && this.shouldSendTaskReportFullText(projection)) {
+        elements.push(divider());
+        elements.push(tipBlock("剩余内容仍较长，系统会补发完整文本。"));
+      }
+      return card(`${projection.title}｜最终结论补充 ${index + 1}/${groups.length}`, elements);
+    });
+  }
+
+  shouldSendTaskReportFullText(projection: TaskReportProjection): boolean {
+    const finalResult = projection.fullFinalResult ?? projection.finalResult;
+    if (!finalResult) return false;
+    return splitTaskReportFinalResult(finalResult).length > TASK_REPORT_TOTAL_CARD_FINAL_CHUNKS;
   }
 
   taskProcessCard(projection: TaskProcessProjection): FeishuCard {
@@ -906,6 +933,13 @@ const text = (content: string): Record<string, unknown> => ({
   content: truncate(content, 3000)
 });
 
+const TASK_REPORT_FINAL_CHUNK_LENGTH = 2200;
+const TASK_REPORT_MAIN_FINAL_CHUNKS = 2;
+const TASK_REPORT_SUPPLEMENT_CHUNKS_PER_CARD = 3;
+const TASK_REPORT_MAX_SUPPLEMENT_CARDS = 4;
+const TASK_REPORT_TOTAL_CARD_FINAL_CHUNKS =
+  TASK_REPORT_MAIN_FINAL_CHUNKS + TASK_REPORT_SUPPLEMENT_CHUNKS_PER_CARD * TASK_REPORT_MAX_SUPPLEMENT_CARDS;
+
 const kvLine = (label: string, value: string): string => `**${label}**  ${value}`;
 
 const sectionBlock = (title: string, body: string): Record<string, unknown> =>
@@ -923,6 +957,28 @@ const pushMarkdownSections = (
     elements.push(sectionBlock(index === 0 ? title : `${title}（续 ${index + 1}）`, chunk));
     if (index < chunks.length - 1) elements.push(divider());
   });
+};
+
+const splitTaskReportFinalResult = (body: string): string[] =>
+  splitMarkdownForCard(body, TASK_REPORT_FINAL_CHUNK_LENGTH);
+
+const pushMarkdownChunks = (
+  elements: Record<string, unknown>[],
+  title: string,
+  chunks: string[]
+): void => {
+  chunks.forEach((chunk, index) => {
+    if (index > 0) elements.push(divider());
+    elements.push(sectionBlock(index === 0 ? title : `${title}（续 ${index + 1}）`, chunk));
+  });
+};
+
+const groupChunks = <T>(items: T[], size: number): T[][] => {
+  const groups: T[][] = [];
+  for (let index = 0; index < items.length; index += size) {
+    groups.push(items.slice(index, index + size));
+  }
+  return groups;
 };
 
 const splitMarkdownForCard = (body: string, maxChunkLength: number): string[] => {

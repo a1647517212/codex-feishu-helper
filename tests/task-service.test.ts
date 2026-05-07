@@ -817,12 +817,12 @@ test("completed notification does not resend full final result when card can sho
   }
 });
 
-test("completed notification resends full final result only when card content is capped", async () => {
+test("completed notification sends supplemental cards before full text when final result is capped", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
     const codex = new MockCodex();
-    const longFinal = Array.from({ length: 360 }, (_, index) => `第${index + 1}条建议：这部分最终结论需要完整回传到飞书，避免卡片长度限制导致用户看不到完整答案。`).join("\n");
+    const longFinal = Array.from({ length: 220 }, (_, index) => `第${index + 1}条建议：这部分最终结论需要优先通过飞书补充卡片展示，避免用户阅读一大段纯文本。`).join("\n");
     codex.threads = [
       {
         id: "thr_capped_result",
@@ -867,9 +867,68 @@ test("completed notification resends full final result only when card content is
     const result = findTaskReportOutbox(repo.listDueOutbox(10));
     assert.ok(result);
     assert.equal(JSON.stringify(result.payload.card).includes("最终结论"), true);
+    assert.equal(Array.isArray(result.payload.cards), true);
+    assert.equal(JSON.stringify(result.payload.cards).includes("最终结论补充"), true);
+    assert.equal(JSON.stringify(result.payload.cards).includes("第220条建议"), true);
+    assert.equal("text" in result.payload, false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("completed notification sends full text only after supplemental cards are exhausted", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    const longFinal = Array.from({ length: 1200 }, (_, index) => `第${index + 1}条建议：这部分最终结论超出多张飞书补充卡片容量，因此需要完整文本作为兜底。`).join("\n");
+    codex.threads = [
+      {
+        id: "thr_text_fallback_result",
+        name: "Text fallback result",
+        preview: "Text fallback result",
+        cwd: dir,
+        status: { type: "idle" },
+        turns: [
+          {
+            id: "turn_text_fallback_result",
+            status: "completed",
+            items: [
+              { type: "reasoning", summary: ["整理极长结论并保留完整文本。"], content: [] },
+              { type: "agentMessage", text: longFinal }
+            ]
+          }
+        ],
+        updatedAt: Date.now()
+      }
+    ];
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_text_fallback_result",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Text fallback result",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: {
+          id: "turn_text_fallback_result",
+          status: "completed",
+          items: []
+        }
+      }
+    });
+    const result = findTaskReportOutbox(repo.listDueOutbox(10));
+    assert.ok(result);
+    assert.equal(Array.isArray(result.payload.cards), true);
+    assert.equal(JSON.stringify(result.payload.cards).includes("最终结论补充"), true);
     assert.equal("text" in result.payload, true);
-    assert.equal(String(result.payload.text).includes("第360条建议"), true);
-    assert.equal(String(result.payload.text).includes("第80条建议"), true);
+    assert.equal(String(result.payload.text).includes("第1200条建议"), true);
     assert.equal(String(result.payload.text).includes("...(已截断)"), false);
   } finally {
     cleanup();
@@ -2266,6 +2325,28 @@ test("task report card preserves markdown structure in final result", () => {
   assert.equal(content.includes("1. 米家 501"), true);
   assert.equal(content.includes("| 机型 | 价格 | 结论 |"), true);
   assert.equal(content.includes("- 确认摆放尺寸"), true);
+});
+
+test("task report supplement cards carry overflow markdown before text fallback", () => {
+  const finalResult = Array.from({ length: 180 }, (_, index) => `${index + 1}. 第${index + 1}条结构化结论：继续保持卡片排版。`).join("\n");
+  const renderer = new CardRenderer("hybrid");
+  const projection = {
+    title: "Supplement report",
+    status: "completed" as const,
+    projectName: "Playground",
+    reasoningSummary: "已完成整理。",
+    finalResult: finalResult.slice(0, 8600),
+    fullFinalResult: finalResult,
+    finalResultTruncated: true,
+    updatedAt: new Date().toISOString()
+  };
+  const card = renderer.taskReportCard(projection);
+  const supplements = renderer.taskReportSupplementCards(projection);
+  assert.equal(JSON.stringify(card).includes("最终结论较长，系统会继续补充卡片。"), true);
+  assert.equal(supplements.length > 0, true);
+  assert.equal(JSON.stringify(supplements).includes("最终结论补充"), true);
+  assert.equal(JSON.stringify(supplements).includes("第180条结构化结论"), true);
+  assert.equal(renderer.shouldSendTaskReportFullText(projection), false);
 });
 
 test("completed notification preserves markdown final result from Codex thread", async () => {
