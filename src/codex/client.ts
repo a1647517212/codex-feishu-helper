@@ -154,6 +154,11 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
     return result as Record<string, unknown>;
   }
 
+  async unarchiveThread(threadId: string): Promise<Record<string, unknown>> {
+    const result = await this.request("thread/unarchive", { threadId });
+    return result as Record<string, unknown>;
+  }
+
   async respondToServerRequest(requestId: string | number, result: Record<string, unknown>): Promise<void> {
     this.send({ id: requestId, result });
   }

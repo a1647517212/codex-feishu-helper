@@ -47,7 +47,7 @@ const ConfigSchema = z.object({
       defaultReasoningEffort: z.string().default("xhigh"),
       defaultSandboxMode: SandboxModeSchema.default("danger-full-access"),
       defaultApprovalPolicy: ApprovalPolicySchema.default("never"),
-      autoArchiveOnCompletion: z.boolean().default(true),
+      autoArchiveOnCompletion: z.boolean().default(false),
       serviceName: z.string().default("feishu_codex_bridge")
     })
     .default({
@@ -58,7 +58,7 @@ const ConfigSchema = z.object({
       defaultReasoningEffort: "xhigh",
       defaultSandboxMode: "danger-full-access",
       defaultApprovalPolicy: "never",
-      autoArchiveOnCompletion: true,
+      autoArchiveOnCompletion: false,
       serviceName: "feishu_codex_bridge"
     }),
   feishu: z

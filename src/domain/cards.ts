@@ -4,6 +4,7 @@ import type {
   PendingApproval,
   QueuedMessage,
   TaskEvent,
+  TaskProcessProjection,
   TaskProgressProjection,
   TaskReportProjection,
   TaskStatusProjection
@@ -187,6 +188,31 @@ export class CardRenderer {
       elements.push(text("未提取到可展示的结果内容，请发送 /logs 查看本地任务记录。"));
     }
     return card(`${projection.title}｜处理完成`, elements);
+  }
+
+  taskProcessCard(projection: TaskProcessProjection): FeishuCard {
+    const elements: Record<string, unknown>[] = [
+      text(
+        [
+          `状态：${statusText(projection.status)}`,
+          `项目：${projection.projectName}`,
+          `更新时间：${formatTime(projection.updatedAt)}`
+        ].join("\n")
+      )
+    ];
+    for (const section of projection.sections.slice(0, 6)) {
+      elements.push(divider());
+      elements.push(text(`**${section.label}**\n${section.text}`));
+    }
+    if (projection.sections.length === 0) {
+      elements.push(divider());
+      elements.push(text("暂时还没有可展示的处理记录。"));
+    }
+    return card(`${projection.title}｜处理记录`, elements);
+  }
+
+  taskProcessFallbackCard(title: string): FeishuCard {
+    return card(title, [text("暂时还没有可展示的处理记录。")]);
   }
 
   approvalCard(approval: PendingApproval): FeishuCard {
@@ -491,7 +517,7 @@ const taskButtons = (status: string): [string, string][] => {
       ];
     case "completed":
       return [
-        ["查看日志", "task_logs"],
+        ["处理记录", "task_logs"],
         ["继续处理", "task_continue"],
         ["新建相关任务", "new_related_task"],
         ["归档", "task_archive"]
@@ -500,14 +526,14 @@ const taskButtons = (status: string): [string, string][] => {
       return [
         ["重试", "task_retry"],
         ["分析原因", "task_analyze_failure"],
-        ["查看日志", "task_logs"],
+        ["处理记录", "task_logs"],
         ["停止", "task_stop"]
       ];
     default:
       return [
         ["继续处理", "task_continue"],
         ["跑测试", "task_run_tests"],
-        ["查看日志", "task_logs"],
+        ["处理记录", "task_logs"],
         ["归档", "task_archive"]
       ];
   }

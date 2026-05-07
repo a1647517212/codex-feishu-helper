@@ -45,7 +45,7 @@ export const makeConfig = (dir: string): BridgeConfig => ({
     defaultReasoningEffort: "xhigh",
     defaultSandboxMode: "danger-full-access",
     defaultApprovalPolicy: "never",
-    autoArchiveOnCompletion: true,
+    autoArchiveOnCompletion: false,
     serviceName: "feishu_codex_bridge_test"
   },
   feishu: {
@@ -192,6 +192,7 @@ export class MockCodex {
   responses: Array<{ requestId: string | number; result: Record<string, unknown> }> = [];
   interrupted: string[] = [];
   archived: string[] = [];
+  unarchived: string[] = [];
   threads: any[] = [];
   listCalls: Array<{ limit?: number; pageSize?: number; maxPages?: number }> = [];
   readFailures = new Map<string, Error>();
@@ -254,6 +255,11 @@ export class MockCodex {
 
   async archiveThread(threadId: string): Promise<Record<string, unknown>> {
     this.archived.push(threadId);
+    return {};
+  }
+
+  async unarchiveThread(threadId: string): Promise<Record<string, unknown>> {
+    this.unarchived.push(threadId);
     return {};
   }
 

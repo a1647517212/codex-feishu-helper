@@ -1,7 +1,16 @@
 import type { BridgeConfig } from "../config.js";
 import { newId } from "../core/ids.js";
 import { asString } from "../core/json.js";
-import type { FeishuCardAction, FeishuIncomingMessage, PendingApproval, Project, SessionBinding, TaskStatus } from "../core/types.js";
+import type {
+  FeishuCardAction,
+  FeishuIncomingMessage,
+  PendingApproval,
+  Project,
+  SessionBinding,
+  TaskEvent,
+  TaskProcessProjection,
+  TaskStatus
+} from "../core/types.js";
 import type { Repository } from "../db/repo.js";
 import { commandApprovalDecision, fileApprovalDecision, classifyCommandRisk } from "../domain/approval.js";
 import { CardRenderer } from "../domain/cards.js";
@@ -77,7 +86,7 @@ export class TaskService {
         continue;
       }
       try {
-        const detail = await this.codex.readThread(binding.codexThreadId, false);
+        const detail = await this.readThreadForReconcile(binding);
         const thread = normalizeThreadFromDetail(binding.codexThreadId, detail);
         const historyStatus = this.latestStateFromHistory(binding.id);
         if (thread.status === "idle" && historyStatus && isTerminalStatus(historyStatus)) {
@@ -119,6 +128,24 @@ export class TaskService {
           eventPayload: { error: String(error) }
         });
       }
+    }
+  }
+
+  private async readThreadForReconcile(binding: SessionBinding): Promise<Record<string, unknown>> {
+    try {
+      return await this.codex.readThread(binding.codexThreadId, false);
+    } catch (error) {
+      if (!isTerminalStatus(binding.status)) throw error;
+      const unarchive = (this.codex as unknown as { unarchiveThread?: (threadId: string) => Promise<Record<string, unknown>> }).unarchiveThread;
+      if (!unarchive) throw error;
+      await unarchive.call(this.codex, binding.codexThreadId);
+      this.repo.insertEvent({
+        sessionBindingId: binding.id,
+        codexThreadId: binding.codexThreadId,
+        eventType: "session.unarchived_codex_thread",
+        eventPayload: { reason: "restore_completed_thread_visibility" }
+      });
+      return this.codex.readThread(binding.codexThreadId, false);
     }
   }
 
@@ -432,6 +459,8 @@ export class TaskService {
       eventPayload: { text: message.text },
       feishuMessageId: message.messageId
     });
+    await this.updateTaskTitle(binding.id, "running", binding.title ?? "Codex 任务");
+    await this.updateTaskCard(binding.id);
     await this.codex.resumeThread(binding.codexThreadId);
     const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
     await this.codex.startTurn(binding.codexThreadId, message.text, {
@@ -492,8 +521,10 @@ export class TaskService {
         await this.sendNotificationHistory(action);
         return { ok: true };
       case "task_status":
+        await this.sendTaskStatus(action);
+        return { ok: true };
       case "task_logs":
-        await this.sendTaskEvents(action, action.action === "task_logs" ? "任务日志" : "任务进度");
+        await this.sendTaskProcess(action);
         return { ok: true };
       case "task_continue":
       case "task_append_hint":
@@ -979,11 +1010,19 @@ export class TaskService {
     await this.feishu.sendCard(chatId, this.cards.notificationHistoryCard(this.repo.listRecentOutbox(20)), action.rootMessageId);
   }
 
-  private async sendTaskEvents(action: FeishuCardAction, title: string): Promise<void> {
+  private async sendTaskStatus(action: FeishuCardAction): Promise<void> {
     const binding = this.requireBinding(action);
     await this.sendCardToTarget(
       this.targetForBinding(binding, action.chatId),
-      this.cards.eventListCard(title, this.repo.listEventsForBinding(binding.id, 20))
+      this.cards.taskStatusCard(this.projection.buildTaskStatus(binding.id))
+    );
+  }
+
+  private async sendTaskProcess(action: FeishuCardAction): Promise<void> {
+    const binding = this.requireBinding(action);
+    await this.sendCardToTarget(
+      this.targetForBinding(binding, action.chatId),
+      this.cards.taskProcessCard(this.buildTaskProcessProjection(binding))
     );
   }
 
@@ -1495,6 +1534,50 @@ export class TaskService {
     };
   }
 
+  private buildTaskProcessProjection(binding: SessionBinding): TaskProcessProjection {
+    const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
+    const events = this.repo.listEventsForBinding(binding.id, 200);
+    const sections: TaskProcessProjection["sections"] = [];
+    const pushSection = (label: string, value: string | null | undefined, maxLength = 1400): void => {
+      const text = sanitizeProcessText(value ?? "", maxLength);
+      if (text && !sections.some((section) => section.label === label && section.text === text)) {
+        sections.push({ label, text });
+      }
+    };
+    const originalPrompt = firstEventPayloadText(events, "task.created_from_feishu", "text");
+    const latestRequest = latestEventPayloadText(
+      events,
+      ["turn.requested_from_feishu", "turn.steer_requested_from_feishu"],
+      "text"
+    );
+    const taskLines = [
+      originalPrompt ? `任务：${sanitizeProcessText(originalPrompt, 900)}` : null,
+      latestRequest && latestRequest !== originalPrompt ? `最近补充：${sanitizeProcessText(latestRequest, 900)}` : null
+    ].filter(Boolean);
+    pushSection("任务", taskLines.join("\n"), 1400);
+    pushSection("处理步骤", latestProcessText(events, ["codex.plan_updated", "codex.plan", "codex.plan_delta"]), 1600);
+    pushSection(
+      "处理摘要",
+      latestProcessText(events, ["codex.reasoning_summary", "codex.reasoning_summary_delta", "codex.reasoning", "codex.reasoning_delta"]),
+      1600
+    );
+    pushSection("工具进度", latestProcessText(events, ["codex.tool_progress"]), 900);
+    const finalText =
+      latestEventPayloadText(events, ["task.completed", "task.failed", "task.interrupted"], "finalResult") ??
+      latestProcessText(events, ["codex.agent_message", "codex.agent_delta"]);
+    pushSection(isTerminalStatus(binding.status) ? "最终结论" : "阶段性回复", finalText, 2200);
+    if (sections.length === 0) {
+      pushSection("当前状态", `当前任务状态：${taskStatusText(binding.status)}。还没有收到可展示的处理摘要。`, 400);
+    }
+    return {
+      title: binding.title ?? "Codex 任务",
+      status: binding.status,
+      projectName: project?.name ?? "未归类项目",
+      updatedAt: new Date().toISOString(),
+      sections
+    };
+  }
+
   private recordProtocolFailure(message: Record<string, unknown>, error: unknown): void {
     const params = message.params && typeof message.params === "object" ? (message.params as Record<string, unknown>) : {};
     const threadId = asString(params.threadId);
@@ -1520,6 +1603,8 @@ export class TaskService {
     if (!next) return;
     this.repo.markQueuedDelivered(next.id);
     this.repo.updateBindingStatus(binding.id, "running");
+    await this.updateTaskTitle(binding.id, "running", binding.title ?? "Codex 任务");
+    await this.updateTaskCard(binding.id);
     await this.codex.resumeThread(binding.codexThreadId);
     const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
     await this.codex.startTurn(binding.codexThreadId, next.text, {
@@ -1630,10 +1715,8 @@ const summarizeTitle = (text: string): string => {
 };
 
 const buildTaskChatName = (config: BridgeConfig, key: string, title: string, status: TaskStatus = "running"): string => {
-  const prefix = config.feishu.taskChatNamePrefix || "C";
-  const index = key.replace(/[^a-z0-9]/gi, "").slice(-6).toUpperCase() || "TASK";
   const statusPrefix = taskStatusPrefix(status);
-  return truncatePlain(`${statusPrefix}${prefix}-${index} ${title}`, 60);
+  return truncatePlain(`${statusPrefix}${title}`, 60);
 };
 
 const buildTopicTitle = (title: string, status: TaskStatus): string =>
@@ -1694,7 +1777,7 @@ const isTerminalStatus = (status: TaskStatus): boolean =>
 
 const isCommandText = (text: string): boolean =>
   text.startsWith("/") ||
-  ["项目列表", "查看进度", "查看日志", "查看队列", "通知历史", "发送测试通知", "未归类任务"].includes(text);
+  ["项目列表", "查看进度", "查看日志", "处理记录", "查看队列", "通知历史", "发送测试通知", "未归类任务"].includes(text);
 
 const normalizeCommand = (value: string): string => {
   const lowered = value.trim().toLowerCase().replace(/^\/+/, "");
@@ -1713,6 +1796,7 @@ const normalizeCommand = (value: string): string => {
     "查看进度": "status",
     status: "status",
     "查看日志": "logs",
+    "处理记录": "logs",
     logs: "logs",
     log: "logs",
     "查看队列": "queue",
@@ -1985,6 +2069,45 @@ const latestSanitizedEventText = (
   return null;
 };
 
+const firstEventPayloadText = (events: TaskEvent[], eventType: string, field: string): string | null => {
+  for (const event of events) {
+    if (event.eventType !== eventType) continue;
+    const text = asString(event.eventPayload[field]);
+    if (!text) continue;
+    return text.trim();
+  }
+  return null;
+};
+
+const latestEventPayloadText = (events: TaskEvent[], eventTypes: string[], field: string): string | null => {
+  const wanted = new Set(eventTypes);
+  const matched = [...events].filter((event) => wanted.has(event.eventType)).sort((left, right) => right.seq - left.seq);
+  for (const event of matched) {
+    const text = asString(event.eventPayload[field]);
+    if (!text) continue;
+    return text.trim();
+  }
+  return null;
+};
+
+const latestProcessText = (events: TaskEvent[], eventTypes: string[]): string | null => {
+  for (const eventType of eventTypes) {
+    if (eventType.endsWith("_delta")) {
+      const joined = joinDeltaEvents(events, eventType);
+      const sanitized = sanitizeProcessText(joined ?? "", 2200);
+      if (sanitized && sanitized !== "有输出，原始内容已保留在本地记录中。") return sanitized;
+      continue;
+    }
+    const matched = [...events].filter((event) => event.eventType === eventType).sort((left, right) => right.seq - left.seq);
+    for (const event of matched) {
+      const text = asString(event.eventPayload.text);
+      const sanitized = sanitizeProcessText(text ?? "", 2200);
+      if (sanitized && sanitized !== "有输出，原始内容已保留在本地记录中。") return sanitized;
+    }
+  }
+  return null;
+};
+
 const joinDeltaEvents = (
   events: Array<{ eventType: string; eventPayload: Record<string, unknown>; seq: number }>,
   eventType: string
@@ -2071,6 +2194,11 @@ const formatPlanProgress = (value: unknown): string | null => {
 const sanitizeProgressText = (text: string): string => {
   const sanitized = sanitizeAssistantSummary(text, 900);
   return sanitized.length > 900 ? truncatePlain(sanitized, 900) : sanitized;
+};
+
+const sanitizeProcessText = (text: string, maxLength = 1800): string => {
+  const sanitized = sanitizeAssistantSummary(text, maxLength);
+  return sanitized.length > maxLength ? truncatePlain(sanitized, maxLength) : sanitized;
 };
 
 const inferProjectName = (cwd: string, fallback: string): string => {

@@ -187,6 +187,7 @@ test("direct group message creates a dedicated Feishu task chat before starting 
     assert.equal(feishu.sent.some((entry) => entry.chatId === "chat_1" && String(entry.payload).includes("已创建独立任务会话")), false);
     assert.equal(feishu.sent.some((entry) => entry.chatId === "task_chat_1" && String(entry.payload).includes("后续补充")), true);
     assert.equal(feishu.updatedChatNames.some((entry) => entry.chatId === "task_chat_1" && entry.name.includes("[运行中]")), true);
+    assert.equal(feishu.createdChats[0]?.name.includes("C-"), false);
   } finally {
     cleanup();
   }
@@ -219,6 +220,41 @@ test("dedicated task chat replies find the bound task even when chat allowlist o
     });
     assert.equal(codex.turns.length, 1);
     assert.equal(codex.turns[0]?.threadId, binding.codexThreadId);
+  } finally {
+    cleanup();
+  }
+});
+
+test("continuing a completed dedicated task chat switches the chat title back to running", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    repo.createOrUpdateBinding({
+      codexThreadId: "thr_resume_title",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      feishuControlChatId: "chat_1",
+      title: "恢复标题测试",
+      status: "completed",
+      createdFrom: "manual_import"
+    });
+    await service.handleMessage({
+      messageId: "msg_resume_title",
+      chatId: "task_chat_1",
+      rootMessageId: null,
+      threadId: null,
+      userId: "user_1",
+      text: "继续处理这个任务"
+    });
+    assert.equal(codex.turns.length, 1);
+    assert.equal(
+      feishu.updatedChatNames.some((entry) => entry.chatId === "task_chat_1" && entry.name === "[运行中] 恢复标题测试"),
+      true
+    );
   } finally {
     cleanup();
   }
@@ -321,7 +357,57 @@ test("new task emits one running status and one completion notification", async 
     assert.equal(outbox.filter((item) => item.notificationType === "task_completed").length, 2);
     assert.equal(outbox.some((item) => JSON.stringify(item.payload.card ?? {}).includes("处理摘要")), true);
     assert.equal(outbox.some((item) => JSON.stringify(item.payload.card ?? {}).includes("最终结论")), true);
-    assert.deepEqual(codex.archived, ["thr_new"]);
+    assert.deepEqual(codex.archived, []);
+  } finally {
+    cleanup();
+  }
+});
+
+test("completed notification can still auto archive when explicitly enabled", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.autoArchiveOnCompletion = true;
+    const codex = new MockCodex();
+    codex.threads = [
+      {
+        id: "thr_auto_archive",
+        name: "Auto archive",
+        preview: "Auto archive",
+        cwd: dir,
+        status: { type: "idle" },
+        turns: [
+          {
+            id: "turn_auto_archive",
+            status: "completed",
+            items: [{ type: "agentMessage", text: "完成。" }]
+          }
+        ],
+        updatedAt: Date.now()
+      }
+    ];
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_auto_archive",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Auto archive",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: {
+          id: "turn_auto_archive",
+          status: "completed",
+          items: []
+        }
+      }
+    });
+    assert.deepEqual(codex.archived, ["thr_auto_archive"]);
   } finally {
     cleanup();
   }
@@ -1446,6 +1532,45 @@ test("bootstrap skips draft task chats that do not have real Codex thread ids ye
   }
 });
 
+test("bootstrap attempts to unarchive completed Codex threads that disappeared from app list", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.readFailures.set("thr_restore_archived", new Error("no rollout found for thread id thr_restore_archived"));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_restore_archived",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Restore archived",
+      status: "completed",
+      createdFrom: "manual_import"
+    });
+    repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      eventType: "task.completed",
+      eventPayload: { text: "已完成" }
+    });
+    (codex as any).unarchiveThread = async (threadId: string) => {
+      codex.unarchived.push(threadId);
+      codex.readFailures.delete(threadId);
+      return {};
+    };
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    await service.bootstrapProjectsFromConfig();
+    assert.deepEqual(codex.unarchived, ["thr_restore_archived"]);
+    assert.equal(
+      repo.listEventsForBinding(binding.id).some((event) => event.eventType === "session.unarchived_codex_thread"),
+      true
+    );
+  } finally {
+    cleanup();
+  }
+});
+
 test("visible task and diagnostic buttons have concrete handlers", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
@@ -1467,7 +1592,14 @@ test("visible task and diagnostic buttons have concrete handlers", async () => {
       sessionBindingId: binding.id,
       codexThreadId: binding.codexThreadId,
       eventType: "task.completed",
-      eventPayload: { text: "done" }
+      eventPayload: { text: "done", finalResult: "最终答案：已经处理完成。", reasoningSummary: "先分析，再执行。" }
+    });
+    repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      codexTurnId: "turn_buttons",
+      eventType: "codex.plan_updated",
+      eventPayload: { text: "1. [完成] 收集上下文 2. [完成] 给出结论" }
     });
     repo.enqueueOutbox({
       sessionBindingId: binding.id,
@@ -1500,6 +1632,17 @@ test("visible task and diagnostic buttons have concrete handlers", async () => {
     assert.equal(feishu.sent.filter((entry) => entry.type === "text").length >= 1, true);
     assert.equal(
       feishu.sent.filter((entry) => entry.mode === "thread" && entry.root === "root_buttons").length >= 2,
+      true
+    );
+    assert.equal(
+      feishu.sent.some(
+        (entry) =>
+          entry.type === "card" &&
+          entry.mode === "thread" &&
+          JSON.stringify(entry.payload).includes("处理记录") &&
+          JSON.stringify(entry.payload).includes("最终结论") &&
+          JSON.stringify(entry.payload).includes("恢复标题测试") === false
+      ),
       true
     );
   } finally {
