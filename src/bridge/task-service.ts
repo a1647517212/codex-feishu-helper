@@ -1305,7 +1305,7 @@ export class TaskService {
       const summaryText =
         status === "completed"
           ? finalResult
-            ? truncate(singleLine(finalResult), 180)
+            ? truncatePlain(singleLine(finalResult), 90)
             : "已完成。需要细节时发送 /logs 查看任务记录。"
           : `任务状态：${taskStatusText(status)}。发送 /logs 查看任务记录。`;
       const event = this.repo.insertEvent({

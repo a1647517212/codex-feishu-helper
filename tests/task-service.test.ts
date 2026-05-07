@@ -363,6 +363,60 @@ test("new task emits one running status and one completion notification", async 
   }
 });
 
+test("status card summary uses short plain text instead of visible truncation marker", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    const longFinal = Array.from({ length: 20 }, (_, index) => `第${index + 1}条结论：这里是比较长的摘要内容`).join("，");
+    codex.threads = [
+      {
+        id: "thr_status_summary",
+        name: "Status summary",
+        preview: "Status summary",
+        cwd: dir,
+        status: { type: "idle" },
+        turns: [
+          {
+            id: "turn_status_summary",
+            status: "completed",
+            items: [{ type: "agentMessage", text: longFinal }]
+          }
+        ],
+        updatedAt: Date.now()
+      }
+    ];
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_status_summary",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Status summary",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: {
+          id: "turn_status_summary",
+          status: "completed",
+          items: []
+        }
+      }
+    });
+    const statusOutbox = repo.listDueOutbox(10).find(
+      (item) => item.notificationType === "task_completed" && JSON.stringify(item.payload.card ?? {}).includes("命令：/logs")
+    );
+    assert.ok(statusOutbox);
+    assert.equal(JSON.stringify(statusOutbox.payload.card).includes("...(已截断)"), false);
+  } finally {
+    cleanup();
+  }
+});
+
 test("completed notification can still auto archive when explicitly enabled", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
