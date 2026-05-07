@@ -131,82 +131,64 @@ export class CardRenderer {
   }
 
   taskStatusCard(projection: TaskStatusProjection): FeishuCard {
-    const lines = [
-      `状态：${statusText(projection.status)}`,
-      `项目：${projection.projectName}`,
-      projection.queuedMessages > 0 ? `队列：${projection.queuedMessages} 条后续要求` : null,
-      projection.pendingApprovals > 0 ? `待确认：${projection.pendingApprovals} 项` : null,
-      projection.lastSummary ? `结论：${projection.lastSummary}` : null,
-      commandHintForStatus(projection.status)
-    ].filter(Boolean);
-    const elements = [
-      text(lines.join("\n")),
+    const summaryItems = [
+      kvLine("状态", statusText(projection.status)),
+      kvLine("项目", projection.projectName),
+      projection.queuedMessages > 0 ? kvLine("队列", `${projection.queuedMessages} 条后续要求`) : null,
+      projection.pendingApprovals > 0 ? kvLine("待确认", `${projection.pendingApprovals} 项`) : null
+    ].filter(Boolean) as string[];
+    const elements: Record<string, unknown>[] = [text(summaryItems.join("\n"))];
+    if (projection.lastSummary) {
+      elements.push(divider());
+      elements.push(sectionBlock("当前结论", projection.lastSummary));
+    }
+    elements.push(divider());
+    elements.push(tipBlock(commandHintForStatus(projection.status)));
+    pushMaybe(
+      elements,
       maybeActions(
         this.interactionMode,
         taskButtons(projection.status).map(([label, action]) => button(label, action, { bindingId: projection.bindingId }))
       )
-    ].filter(Boolean) as Record<string, unknown>[];
+    );
     return card(projection.title, elements);
   }
 
   taskProgressCard(projection: TaskProgressProjection): FeishuCard {
-    const elements: Record<string, unknown>[] = [
-      text(
-        [
-          `状态：${statusText(projection.status)}`,
-          `项目：${projection.projectName}`,
-          `更新时间：${formatTime(projection.updatedAt)}`
-        ].join("\n")
-      )
-    ];
+    const elements: Record<string, unknown>[] = [text(taskMetaLines(projection.status, projection.projectName, projection.updatedAt).join("\n"))];
     for (const section of projection.sections.slice(0, 4)) {
       elements.push(divider());
-      elements.push(text(`**${section.label}**\n${section.text}`));
+      elements.push(sectionBlock(section.label, section.text));
     }
     return card(`${projection.title}｜处理进度`, elements);
   }
 
   taskReportCard(projection: TaskReportProjection): FeishuCard {
-    const elements: Record<string, unknown>[] = [
-      text(
-        [
-          `状态：${statusText(projection.status)}`,
-          `项目：${projection.projectName}`,
-          `完成时间：${formatTime(projection.updatedAt)}`
-        ].join("\n")
-      )
-    ];
+    const elements: Record<string, unknown>[] = [text(taskMetaLines(projection.status, projection.projectName, projection.updatedAt, "完成时间").join("\n"))];
     if (projection.reasoningSummary) {
       elements.push(divider());
-      elements.push(text(`**处理摘要**\n${projection.reasoningSummary}`));
+      elements.push(sectionBlock("处理摘要", projection.reasoningSummary));
     }
     if (projection.finalResult) {
       elements.push(divider());
-      elements.push(text(`**最终结论**\n${projection.finalResult}`));
+      elements.push(sectionBlock("最终结论", projection.finalResult));
     }
     if (!projection.reasoningSummary && !projection.finalResult) {
-      elements.push(text("未提取到可展示的结果内容，请发送 /logs 查看本地任务记录。"));
+      elements.push(divider());
+      elements.push(tipBlock("未提取到可展示的结果内容，请发送 /logs 查看本地任务记录。"));
     }
     return card(`${projection.title}｜处理完成`, elements);
   }
 
   taskProcessCard(projection: TaskProcessProjection): FeishuCard {
-    const elements: Record<string, unknown>[] = [
-      text(
-        [
-          `状态：${statusText(projection.status)}`,
-          `项目：${projection.projectName}`,
-          `更新时间：${formatTime(projection.updatedAt)}`
-        ].join("\n")
-      )
-    ];
+    const elements: Record<string, unknown>[] = [text(taskMetaLines(projection.status, projection.projectName, projection.updatedAt).join("\n"))];
     for (const section of projection.sections.slice(0, 6)) {
       elements.push(divider());
-      elements.push(text(`**${section.label}**\n${section.text}`));
+      elements.push(sectionBlock(section.label, section.text));
     }
     if (projection.sections.length === 0) {
       elements.push(divider());
-      elements.push(text("暂时还没有可展示的处理记录。"));
+      elements.push(tipBlock("暂时还没有可展示的处理记录。"));
     }
     return card(`${projection.title}｜处理记录`, elements);
   }
@@ -453,6 +435,20 @@ const text = (content: string): Record<string, unknown> => ({
   tag: "markdown",
   content: truncate(content, 3000)
 });
+
+const kvLine = (label: string, value: string): string => `**${label}**  ${value}`;
+
+const sectionBlock = (title: string, body: string): Record<string, unknown> =>
+  text(`**${title}**\n${body}`);
+
+const tipBlock = (body: string): Record<string, unknown> =>
+  text(`**操作提示**\n${body}`);
+
+const taskMetaLines = (status: string, projectName: string, updatedAt: string, timeLabel = "更新时间"): string[] => [
+  kvLine("状态", statusText(status)),
+  kvLine("项目", projectName),
+  kvLine(timeLabel, formatTime(updatedAt))
+];
 
 const divider = (): Record<string, unknown> => ({ tag: "hr" });
 

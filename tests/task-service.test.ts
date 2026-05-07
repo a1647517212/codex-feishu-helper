@@ -1738,6 +1738,25 @@ test("visible task and diagnostic buttons have concrete handlers", async () => {
   }
 });
 
+test("task status card renders summary and command hint as separate blocks", () => {
+  const card = new CardRenderer("hybrid").taskStatusCard({
+    bindingId: "bind_card_layout",
+    title: "Layout task",
+    projectName: "Playground",
+    status: "running",
+    cwd: null,
+    queuedMessages: 1,
+    pendingApprovals: 0,
+    lastTurnId: "turn_layout",
+    lastSummary: "这里是当前阶段的简要结论。",
+    updatedAt: new Date().toISOString()
+  });
+  const content = JSON.stringify(card);
+  assert.equal(content.includes("当前结论"), true);
+  assert.equal(content.includes("操作提示"), true);
+  assert.equal(content.includes("这里是当前阶段的简要结论。"), true);
+});
+
 test("approval list and detail buttons render stored pending approvals", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
