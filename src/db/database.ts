@@ -108,6 +108,20 @@ CREATE TABLE IF NOT EXISTS incoming_messages (
 
 CREATE INDEX IF NOT EXISTS idx_incoming_messages_chat_seen ON incoming_messages(feishu_chat_id, last_seen_at);
 
+CREATE TABLE IF NOT EXISTS pending_project_prompts (
+  id TEXT PRIMARY KEY,
+  feishu_message_id TEXT NOT NULL UNIQUE,
+  feishu_chat_id TEXT NOT NULL,
+  feishu_user_id TEXT,
+  text TEXT NOT NULL,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  used_at TEXT,
+  selected_project_id TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_pending_project_prompts_chat ON pending_project_prompts(feishu_chat_id, created_at DESC);
+
 CREATE TABLE IF NOT EXISTS pending_approvals (
   id TEXT PRIMARY KEY,
   session_binding_id TEXT NOT NULL,

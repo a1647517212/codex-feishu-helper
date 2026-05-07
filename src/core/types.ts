@@ -215,6 +215,18 @@ export interface IgnoredThread {
   createdAt: string;
 }
 
+export interface PendingProjectPrompt {
+  id: string;
+  feishuMessageId: string;
+  feishuChatId: string;
+  feishuUserId: string | null;
+  text: string;
+  status: "pending" | "used" | "cancelled";
+  createdAt: string;
+  usedAt: string | null;
+  selectedProjectId: string | null;
+}
+
 export interface ActionRequest {
   actionId: string;
   actionType: string;

@@ -150,7 +150,7 @@ test("repeated Feishu command delivery is ignored after first handling", async (
   }
 });
 
-test("repeated new-task delivery starts only one Codex turn", async () => {
+test("repeated control-group task text only opens one project selection", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
@@ -167,20 +167,30 @@ test("repeated new-task delivery starts only one Codex turn", async () => {
     };
     await service.handleMessage(message);
     await service.handleMessage(message);
-    assert.equal(codex.turns.length, 1);
-    assert.equal(repo.count("session_bindings"), 1);
+    assert.equal(codex.turns.length, 0);
+    assert.equal(repo.count("session_bindings"), 0);
+    assert.equal(repo.count("pending_project_prompts"), 1);
+    assert.equal(feishu.sent.length, 1);
+    assert.equal(JSON.stringify(feishu.sent[0]?.payload ?? {}).includes("选择项目"), true);
   } finally {
     cleanup();
   }
 });
 
-test("direct group message creates a dedicated Feishu task chat before starting Codex turn", async () => {
+test("control-group task text waits for a project before starting Codex turn", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
     const feishu = new MockFeishu();
     const codex = new MockCodex();
     const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({
+      id: "proj_group_start",
+      name: "Group start",
+      rootPath: dir,
+      defaultModel: "gpt-5.5",
+      defaultReasoningEffort: "xhigh"
+    });
     await service.handleMessage({
       messageId: "msg_group_new_task",
       chatId: "chat_1",
@@ -189,6 +199,17 @@ test("direct group message creates a dedicated Feishu task chat before starting 
       userId: "user_1",
       text: "帮我检查项目状态"
     });
+    const pendingPrompt = repo.findPendingProjectPromptByMessageId("msg_group_new_task");
+    assert.ok(pendingPrompt);
+    assert.equal(codex.turns.length, 0);
+    await service.handleCardAction({
+      actionId: "act_start_pending_prompt",
+      action: "project_start_prompt",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "msg_group_new_task",
+      payload: { projectId: project.id, pendingPromptId: pendingPrompt.id }
+    });
     const binding = repo.findBindingByThreadId("thr_new");
     assert.ok(binding);
     assert.equal(feishu.createdChats.length, 1);
@@ -196,10 +217,14 @@ test("direct group message creates a dedicated Feishu task chat before starting 
     assert.equal(binding.feishuChatId, "task_chat_1");
     assert.equal(binding.feishuControlChatId, "chat_1");
     assert.equal(binding.feishuThreadId, null);
+    assert.equal(binding.projectId, project.id);
     assert.equal(feishu.sent.some((entry) => entry.chatId === "chat_1" && String(entry.payload).includes("已创建独立任务会话")), false);
     assert.equal(feishu.sent.some((entry) => entry.chatId === "task_chat_1" && String(entry.payload).includes("后续补充")), true);
     assert.equal(feishu.updatedChatNames.some((entry) => entry.chatId === "task_chat_1" && entry.name.includes("[运行中]")), true);
     assert.equal(feishu.createdChats[0]?.name.includes("C-"), false);
+    assert.equal(codex.startedThreads[0]?.cwd, dir);
+    assert.equal(codex.startedThreads[0]?.model, "gpt-5.5");
+    assert.equal(codex.startedThreads[0]?.reasoningEffort, "xhigh");
   } finally {
     cleanup();
   }
@@ -396,6 +421,7 @@ test("new task emits one running status and one completion notification", async 
     ];
     const feishu = new MockFeishu();
     const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({ id: "proj_status_dedupe", name: "Status dedupe", rootPath: dir });
     await service.handleMessage({
       messageId: "msg_status_dedupe",
       chatId: "chat_1",
@@ -403,6 +429,16 @@ test("new task emits one running status and one completion notification", async 
       threadId: null,
       userId: "user_1",
       text: "只回复 ok"
+    });
+    const pendingPrompt = repo.findPendingProjectPromptByMessageId("msg_status_dedupe");
+    assert.ok(pendingPrompt);
+    await service.handleCardAction({
+      actionId: "act_status_dedupe_start",
+      action: "project_start_prompt",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "msg_status_dedupe",
+      payload: { projectId: project.id, pendingPromptId: pendingPrompt.id }
     });
     const binding = repo.findBindingByThreadId("thr_new");
     assert.ok(binding);
@@ -912,13 +948,14 @@ test("approval action is idempotent and sends one codex response", async () => {
   }
 });
 
-test("console new task action creates a draft dedicated task chat", async () => {
+test("new task action without project shows project selection", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
     const feishu = new MockFeishu();
     const codex = new MockCodex();
     const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    repo.upsertProject({ id: "proj_console_new_task", name: "Console project", rootPath: dir });
     await service.handleCardAction({
       actionId: "act_new_task",
       action: "new_task",
@@ -927,6 +964,32 @@ test("console new task action creates a draft dedicated task chat", async () => 
       rootMessageId: "root_console",
       payload: {}
     });
+    assert.equal(feishu.sent.length, 1);
+    assert.equal(feishu.sent[0]?.type, "card");
+    assert.equal(JSON.stringify(feishu.sent[0]?.payload ?? {}).includes("选择项目"), true);
+    assert.equal(feishu.createdChats.length, 0);
+    assert.equal(repo.listBindings().length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("project new task action creates a draft dedicated task chat", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({ id: "proj_project_new_task", name: "Project task", rootPath: dir });
+    await service.handleCardAction({
+      actionId: "act_project_new_task",
+      action: "new_task",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_project",
+      payload: { projectId: project.id }
+    });
     assert.equal(feishu.createdChats.length, 1);
     assert.equal(feishu.sent.length, 1);
     assert.equal(feishu.sent[0]?.type, "text");
@@ -934,6 +997,7 @@ test("console new task action creates a draft dedicated task chat", async () => 
     assert.equal(String(feishu.sent[0]?.payload).includes("请直接发送"), true);
     const draft = repo.listBindings().find((binding) => binding.status === "waiting_for_prompt");
     assert.ok(draft);
+    assert.equal(draft.projectId, project.id);
     assert.equal(draft.feishuContainerKind, "dedicated_chat");
     assert.equal(draft.feishuChatId, "task_chat_1");
     assert.equal(draft.feishuThreadId, null);
@@ -2059,7 +2123,8 @@ test("console card uses compact mobile-safe button labels", () => {
   const card = new CardRenderer("hybrid").consoleCard({ running: 1, approvals: 2, queued: 3, completedToday: 4 });
   const buttons = collectButtons(card);
   const labels = buttons.map((button) => String((button.text as Record<string, unknown>)?.content ?? ""));
-  assert.equal(labels.includes("新任务"), true);
+  assert.equal(labels.includes("项目"), true);
+  assert.equal(labels.includes("新任务"), false);
   assert.equal(labels.includes("最近任务"), true);
   assert.equal(labels.includes("运行中"), true);
   assert.equal(labels.includes("已完成"), true);

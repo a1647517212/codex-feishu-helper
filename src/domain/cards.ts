@@ -44,7 +44,7 @@ export class CardRenderer {
         ].join("  ")
       ),
       maybeActions(this.interactionMode, [
-        button("新任务", "new_task"),
+        button("项目", "project_list"),
         button("最近任务", "task_list_recent")
       ]),
       maybeActions(this.interactionMode, [
@@ -64,10 +64,7 @@ export class CardRenderer {
       elements.push(divider());
       elements.push(commandText(["/tasks", "/projects", "/unclassified", "/search 关键词", "/doctor", "/notify history"]));
     }
-    pushMaybe(
-      elements,
-      maybeActions(this.interactionMode, [button("项目", "project_list"), button("未归类", "unclassified_threads")])
-    );
+    pushMaybe(elements, maybeActions(this.interactionMode, [button("未归类", "unclassified_threads")]));
     pushMaybe(
       elements,
       maybeActions(this.interactionMode, [button("诊断", "doctor"), button("通知", "notification_settings_global")])
@@ -138,15 +135,21 @@ export class CardRenderer {
     return card("电脑上的 Codex 任务", elements.length > 0 ? elements : [text("没有发现可接管的本机 Codex 任务。")]);
   }
 
-  projectListCard(projects: Array<{ id: string; name: string; rootPath: string; feishuChatId: string | null }>): FeishuCard {
+  projectListCard(
+    projects: Array<{ id: string; name: string; rootPath: string; feishuChatId: string | null }>,
+    options: { pendingPromptId?: string | null } = {}
+  ): FeishuCard {
     if (projects.length === 0) return card("选择项目", [text("还没有发现 Codex App 工作区。请先在 Codex App 打开一个项目。")]);
     const elements: Record<string, unknown>[] = [
-      text("选择一个项目后，可以查看这个项目里的对话、运行状态和项目设置。")
+      text(options.pendingPromptId ? "选择项目后，会用刚才那条需求创建任务会话。" : "选择一个项目后，可以查看这个项目里的对话、运行状态和项目设置。")
     ];
     for (const project of projects.slice(0, 12)) {
       elements.push(text([`项目：${project.name}`, `目录：${project.rootPath}`].join("\n")));
       pushActionRows(elements, this.interactionMode, [
-        button("进入", "project_open", { projectId: project.id }),
+        button(options.pendingPromptId ? "开始" : "进入", options.pendingPromptId ? "project_start_prompt" : "project_open", {
+          projectId: project.id,
+          pendingPromptId: options.pendingPromptId
+        }),
         button("设置", "project_settings", { projectId: project.id })
       ]);
     }

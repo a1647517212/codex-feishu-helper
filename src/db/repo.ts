@@ -17,6 +17,7 @@ import type {
   NotificationType,
   OutboxStatus,
   PendingApproval,
+  PendingProjectPrompt,
   Project,
   QueuedMessage,
   QueueStatus,
@@ -659,6 +660,54 @@ export class Repository {
     return row ? mapAction(row) : null;
   }
 
+  createPendingProjectPrompt(input: {
+    feishuMessageId: string;
+    feishuChatId: string;
+    feishuUserId?: string | null;
+    text: string;
+  }): PendingProjectPrompt {
+    const now = nowIso();
+    const existing = this.findPendingProjectPromptByMessageId(input.feishuMessageId);
+    const id = existing?.id ?? newId("pending_prompt");
+    this.database.db
+      .prepare(
+        `INSERT INTO pending_project_prompts (
+          id, feishu_message_id, feishu_chat_id, feishu_user_id, text, status, created_at, used_at, selected_project_id
+        ) VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL, NULL)
+        ON CONFLICT(feishu_message_id) DO UPDATE SET
+          feishu_chat_id = excluded.feishu_chat_id,
+          feishu_user_id = excluded.feishu_user_id,
+          text = excluded.text`
+      )
+      .run(id, input.feishuMessageId, input.feishuChatId, input.feishuUserId ?? null, input.text, now);
+    return this.getPendingProjectPrompt(id)!;
+  }
+
+  getPendingProjectPrompt(id: string): PendingProjectPrompt | null {
+    const row = this.database.db.prepare("SELECT * FROM pending_project_prompts WHERE id = ?").get(id) as DbRow | undefined;
+    return row ? mapPendingProjectPrompt(row) : null;
+  }
+
+  findPendingProjectPromptByMessageId(feishuMessageId: string): PendingProjectPrompt | null {
+    const row = this.database.db
+      .prepare("SELECT * FROM pending_project_prompts WHERE feishu_message_id = ?")
+      .get(feishuMessageId) as DbRow | undefined;
+    return row ? mapPendingProjectPrompt(row) : null;
+  }
+
+  consumePendingProjectPrompt(id: string, projectId: string): PendingProjectPrompt | null {
+    const prompt = this.getPendingProjectPrompt(id);
+    if (!prompt || prompt.status !== "pending") return null;
+    this.database.db
+      .prepare(
+        `UPDATE pending_project_prompts
+         SET status = 'used', used_at = ?, selected_project_id = ?
+         WHERE id = ? AND status = 'pending'`
+      )
+      .run(nowIso(), projectId, id);
+    return prompt;
+  }
+
   enqueueMessage(input: {
     sessionBindingId: string;
     feishuMessageId: string;
@@ -1090,6 +1139,7 @@ export class Repository {
       "pending_approvals",
       "message_queue",
       "incoming_messages",
+      "pending_project_prompts",
       "ignored_threads",
       "bridge_devices",
       "trusted_feishu_subjects",
@@ -1302,6 +1352,18 @@ const mapIgnoredThread = (row: DbRow): IgnoredThread => ({
   reason: asString(row.reason),
   createdByFeishuUserId: asString(row.created_by_feishu_user_id),
   createdAt: String(row.created_at)
+});
+
+const mapPendingProjectPrompt = (row: DbRow): PendingProjectPrompt => ({
+  id: String(row.id),
+  feishuMessageId: String(row.feishu_message_id),
+  feishuChatId: String(row.feishu_chat_id),
+  feishuUserId: asString(row.feishu_user_id),
+  text: String(row.text),
+  status: String(row.status) as PendingProjectPrompt["status"],
+  createdAt: String(row.created_at),
+  usedAt: asString(row.used_at),
+  selectedProjectId: asString(row.selected_project_id)
 });
 
 const hashText = (text: string): string => {
