@@ -111,7 +111,7 @@ export class DiagnosticsService {
         fullTopicMode,
         recommendation: chatRecommendation(chat.chatMode, chat.groupMessageType, this.config.feishu.taskContainerMode),
         requiredScopes: this.config.feishu.taskContainerMode === "dedicated_chat"
-          ? ["im:chat:readonly", "im:chat:create", "im:chat:update", "im:chat.members:write_only"]
+          ? ["im:chat:readonly", "im:chat:create", "im:chat:update"]
           : ["im:chat:readonly"],
         error: null
       };

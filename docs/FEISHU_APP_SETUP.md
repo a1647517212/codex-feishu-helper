@@ -186,7 +186,8 @@ npm run start
 
 - `im:chat:create`
 - `im:chat:update`
-- `im:chat.members:write_only`
+
+`im:chat.members:write_only` 只在需要把更多成员加入已有任务群时才需要；默认创建任务群不依赖它。
 
 如果暂时不想授权建群，改用 `taskContainerMode=topic`。
 

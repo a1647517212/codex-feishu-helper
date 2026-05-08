@@ -89,7 +89,7 @@ check passed
 3. Configure Events subscription mode to long connection for message events.
 4. Subscribe to `im.message.receive_v1`.
 5. Grant message receive/send/reply permissions. Enable the permission that lets the bot receive all group messages if it should work without `@`.
-6. Grant `im:chat:create`, `im:chat:update`, and `im:chat.members:write_only` so the bridge can create and rename one dedicated task chat per task.
+6. Grant `im:chat:create` and `im:chat:update` so the bridge can create and rename one dedicated task chat per task. `im:chat.members:write_only` is only needed if you later want the bridge to add more members to an existing task chat.
 7. If you also want interactive buttons, subscribe to the newer callback `card.action.trigger`. Prefer long connection for this callback and use `interactionMode=hybrid`; only configure a public HTTPS card callback URL when the tenant requires HTTP callback fallback.
 8. For HTTP callback fallback, configure only the URLs you actually use:
    - Event callback: `https://<public-url>/feishu/events`

@@ -25,8 +25,11 @@
   "author": "",
   "license": "GPL-3.0-only",
   "dependencies": {
-    "@larksuiteoapi/node-sdk": "^1.62.1",
+    "@larksuiteoapi/node-sdk": "^1.63.1",
     "zod": "^4.3.6"
+  },
+  "overrides": {
+    "axios": "^1.16.0"
   },
   "devDependencies": {
     "@types/node": "^22.15.3",
