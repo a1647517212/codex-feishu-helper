@@ -210,6 +210,6 @@ npm run generate:codex-schema
 - [当前功能覆盖](docs/FULL_DESIGN_COVERAGE.md)
 - [用户体验优化计划](docs/UX_OPTIMIZATION_PLAN.md)
 
-## License
+## 许可证
 
-MIT
+GPL-3.0-only。详见 [LICENSE](LICENSE)。

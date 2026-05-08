@@ -30,6 +30,7 @@ rg -n -e "cli_[A-Za-z0-9]+" -e "App Secret" -e "appSecret" -e "app_secret" -e "t
 - [ ] README 说明默认权限风险：`danger-full-access` 和 `approvalPolicy=never`。
 - [ ] 飞书权限和授权步骤已写入 `docs/FEISHU_APP_SETUP.md`。
 - [ ] Codex Desktop 同步优化方案已写入 `docs/CODEX_DESKTOP_SYNC_OPTIMIZATION.md`。
+- [ ] 许可证使用 GPL-3.0-only，根目录 `LICENSE` 已同步。
 
 ## 安装体验
 
