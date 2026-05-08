@@ -68,6 +68,39 @@ notepad $env:USERPROFILE\.feishu-codex\config.json
 - `feishu.defaultChatId`
 - `server.adminToken`
 
+`server.adminToken` 是本机 HTTP 诊断接口的访问 token，只在本机 `/doctor`、`/console-card` 等管理接口使用。可以填一个本机自用随机字符串，例如：
+
+```json
+{
+  "server": {
+    "adminToken": "change-this-local-token"
+  }
+}
+```
+
+最小可运行配置示例：
+
+```json
+{
+  "server": {
+    "host": "127.0.0.1",
+    "port": 8787,
+    "adminToken": "change-this-local-token"
+  },
+  "feishu": {
+    "appId": "cli_xxx",
+    "appSecret": "xxx",
+    "defaultChatId": "oc_xxx",
+    "transport": "long_connection",
+    "messageTransport": "long_connection",
+    "cardActionTransport": "long_connection",
+    "interactionMode": "hybrid",
+    "taskContainerMode": "dedicated_chat",
+    "allowedChatIds": ["oc_xxx"]
+  }
+}
+```
+
 启动服务：
 
 ```powershell
@@ -157,6 +190,8 @@ node dist/src/main.js serve --config D:\path\config.json
 ```
 
 配置模板见 [config.example.json](config.example.json)。
+
+如果直接使用模板里的 `${FEISHU_CODEX_ADMIN_TOKEN}` 但没有设置环境变量，bridge 会在每次启动时生成临时 token。建议正式使用时在 `config.json` 里写固定 `server.adminToken`，这样诊断接口和后台守护更稳定。
 
 不要把真实 `appSecret`、`adminToken`、数据库、日志提交到仓库。`.gitignore` 已默认忽略 `.env`、本地日志、`dist`、`node_modules` 和 `.feishu-codex`。
 

@@ -28,6 +28,19 @@ function Require-Command {
   return $command.Source
 }
 
+function Invoke-CheckedCommand {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$FilePath,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$Arguments
+  )
+  & $FilePath @Arguments
+  if ($LASTEXITCODE -ne 0) {
+    throw "Command failed with exit code $LASTEXITCODE`: $FilePath $($Arguments -join ' ')"
+  }
+}
+
 $repoRoot = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 Set-Location -LiteralPath $repoRoot
 
@@ -62,11 +75,11 @@ Write-Host "codex: $((& $codexPath --version).Trim())"
 
 if (-not $SkipInstall) {
   Write-Step "Installing npm dependencies"
-  npm install
+  Invoke-CheckedCommand -FilePath $npmPath install
 }
 
 Write-Step "Building project"
-npm run build
+Invoke-CheckedCommand -FilePath $npmPath run build
 
 Write-Step "Preparing config"
 $configDirectory = Split-Path -Parent $ConfigPath
@@ -81,6 +94,6 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
 Write-Host ""
 Write-Host "Next steps:"
 Write-Host "1. Edit config: notepad `"$ConfigPath`""
-Write-Host "2. Fill feishu.appId, feishu.appSecret, feishu.defaultChatId, server.adminToken"
+Write-Host "2. Fill feishu.appId, feishu.appSecret, feishu.defaultChatId, and a local server.adminToken"
 Write-Host "3. Start bridge: npm run start"
 Write-Host "4. In Feishu group, send /doctor then /codex"
