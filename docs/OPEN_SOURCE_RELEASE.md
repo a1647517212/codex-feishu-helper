@@ -28,7 +28,9 @@ rg -n -e "cli_[A-Za-z0-9]+" -e "App Secret" -e "appSecret" -e "app_secret" -e "t
 - [ ] README 有最小启动步骤。
 - [ ] README 说明默认不需要公网 IP。
 - [ ] README 说明默认权限风险：`danger-full-access` 和 `approvalPolicy=never`。
+- [ ] README 明确默认一任务一独立群模式需要 `im:chat`、`im:chat:create`、`im:chat:update`。
 - [ ] 飞书权限和授权步骤已写入 `docs/FEISHU_APP_SETUP.md`。
+- [ ] `docs/FEISHU_APP_SETUP.md` 区分默认必选权限、可选权限、话题 fallback。
 - [ ] Codex Desktop 同步优化方案已写入 `docs/CODEX_DESKTOP_SYNC_OPTIMIZATION.md`。
 - [ ] 许可证使用 GPL-3.0-only，根目录 `LICENSE` 已同步。
 

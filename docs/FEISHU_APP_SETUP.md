@@ -62,18 +62,29 @@
 
 ## 5. 授权权限
 
-常用权限如下。飞书控制台的权限名称可能随租户和版本略有差异，以控制台提示为准。
+默认配置 `taskContainerMode=dedicated_chat` 会为每个 Codex 任务创建一个独立飞书群聊。也就是说，机器人不只是回复主控群消息，还会调用飞书 OpenAPI 创建任务群、修改任务群标题、向任务群发送卡片。因此创建群聊权限是默认模式的必选项。
+
+默认必选权限如下。飞书控制台的权限名称可能随租户和版本略有差异，以控制台提示为准。
 
 | 能力 | 权限或能力 |
 | --- | --- |
 | 接收群消息 | `im.message.receive_v1` 事件及消息读取相关权限 |
 | 群里不用 @ 也能读消息 | 机器人接收群聊全部消息能力 |
-| 发送文本/卡片 | `im:message:send_as_bot` |
-| 回复消息 | 消息回复相关权限 |
-| 查询群信息 | `im:chat:readonly` |
-| 创建独立任务会话 | `im:chat:create` |
-| 修改任务会话名称/信息 | `im:chat:update` |
-| 添加群成员/设置机器人 | `im:chat.members:write_only` |
+| 发送文本、卡片、任务结果 | `im:message:send_as_bot`、`im:message` |
+| 回复消息、话题 fallback、更新状态卡片 | `im:message:send_as_bot`、`im:message` |
+| 查询主控群和任务群信息 | `im:chat:readonly` 或 `im:chat:read` |
+| 创建独立任务群聊 | `im:chat`、`im:chat:create` |
+| 修改任务群名称和诊断切换话题模式 | `im:chat`、`im:chat:update` |
+| 卡片按钮点击 | `card.action.trigger` 事件，优先配置为长连接 |
+| 长连接接收事件 | 事件订阅长连接能力 |
+
+可选权限：
+
+| 能力 | 权限或能力 |
+| --- | --- |
+| 自动检查应用回调配置 | `admin:app.info:readonly` |
+| 自动修复应用回调配置 | `application:application:self_manage` |
+| 后续把更多用户或机器人拉入已有任务群 | `im:chat.members:write_only` |
 | 图片/文件消息 | 如后续启用文件能力，需要媒体上传下载相关权限 |
 
 如果只想使用「主控群 + 群内话题」而不创建独立任务会话，可以暂时不授予 `im:chat:create`，并在配置里改为：
@@ -86,6 +97,23 @@
   }
 }
 ```
+
+话题模式不创建新群，因此不会在飞书左侧会话列表里出现一任务一条会话；任务只会作为主控群内的话题/回复存在。
+
+## 5.1 权限和接口对照
+
+当前 bridge 实际调用的飞书接口如下，便于按报错反查权限：
+
+| 功能 | OpenAPI | 主要权限 |
+| --- | --- | --- |
+| 获取 tenant token | `POST /open-apis/auth/v3/tenant_access_token/internal` | 使用 `App ID` / `App Secret` |
+| 发送文本/卡片 | `POST /open-apis/im/v1/messages?receive_id_type=chat_id` | `im:message:send_as_bot`、`im:message` |
+| 回复消息/创建话题回复 | `POST /open-apis/im/v1/messages/{message_id}/reply` | `im:message:send_as_bot`、`im:message` |
+| 更新文本/卡片消息 | `PUT/PATCH /open-apis/im/v1/messages/{message_id}` | `im:message:send_as_bot`、`im:message` |
+| 创建独立任务群 | `POST /open-apis/im/v1/chats` | `im:chat`、`im:chat:create` |
+| 修改任务群标题/群消息形式 | `PUT /open-apis/im/v1/chats/{chat_id}` | `im:chat`、`im:chat:update` |
+| 查询群信息 | `GET /open-apis/im/v1/chats/{chat_id}` | `im:chat:readonly` 或 `im:chat:read` |
+| 检查/修复卡片回调配置 | `GET/PATCH /open-apis/application/v6/applications/{app_id}` | `admin:app.info:readonly` 或 `application:application:self_manage` |
 
 ## 6. 发布并授权应用
 

@@ -27,7 +27,7 @@ Codex Desktop 实时同步的长期优化方案见 [docs/CODEX_DESKTOP_SYNC_OPTI
 
 - Windows 10/11、macOS 或 Linux。当前脚本优先支持 Windows。
 - Node.js 22.13 或更高版本。
-- 已安装并登录 Codex CLI：`codex --version` 能正常输出。
+- 已安装并登录 Codex CLI：`codex --version` 能正常输出，且 `codex login` 已完成。
 - 一个飞书自建应用，已启用机器人和长连接事件订阅。
 
 安装 Codex CLI 后先在本机完成登录：
@@ -98,24 +98,46 @@ powershell -ExecutionPolicy Bypass -File .\scripts\install-watchdog.ps1
 4. 订阅消息事件 `im.message.receive_v1`。
 5. 订阅卡片按钮事件 `card.action.trigger`，优先选择长连接。
 6. 授权机器人读取群内所有消息，这样群里不需要 `@` 机器人。
-7. 授权发送消息、回复消息、发送卡片、创建/更新群聊等权限。
+7. 授权发送消息、回复消息、发送卡片、创建群聊、更新群聊等权限。默认一任务一独立会话模式必须有创建群聊权限。
 8. 发布应用版本，并在管理后台完成授权。
 
-常用权限清单：
+默认模式是 `taskContainerMode=dedicated_chat`，也就是每个 Codex 任务创建一个独立飞书群聊。这个模式不是只在主控群里回复消息，所以「创建群聊」是必选权限。
+
+默认必选权限清单：
 
 | 场景 | 权限 |
 | --- | --- |
-| 接收群消息 | `im:message`, `im:message:readonly` 或控制台提示的等价权限 |
+| 接收群消息 | 事件 `im.message.receive_v1`，以及控制台提示的消息读取权限 |
 | 读取不用 @ 的群消息 | 机器人接收群聊全部消息能力 |
-| 发送文本/卡片 | `im:message:send_as_bot` |
-| 回复消息 | `im:message` 相关回复权限 |
-| 创建任务会话 | `im:chat:create` |
-| 修改任务会话标题/信息 | `im:chat:update` |
-| 邀请成员/设置机器人 | `im:chat.members:write_only` |
-| 查询群信息 | `im:chat:readonly` |
+| 发送文本/卡片、回复消息、更新卡片 | `im:message:send_as_bot`、`im:message` |
+| 创建每个任务的独立飞书群聊 | `im:chat`、`im:chat:create` |
+| 修改任务群标题、诊断/切换话题模式 | `im:chat`、`im:chat:update` |
+| 读取主控群和任务群信息 | `im:chat:readonly` 或 `im:chat:read` |
+| 卡片按钮点击 | 事件 `card.action.trigger`，优先选择长连接 |
 | 长连接事件 | 事件订阅长连接，不需要公网回调地址 |
 
+可选权限：
+
+| 场景 | 权限 |
+| --- | --- |
+| 自动检查/修复应用回调配置 | `admin:app.info:readonly` 或 `application:application:self_manage` |
+| 后续把更多用户或机器人拉入已有任务群 | `im:chat.members:write_only` |
+| 图片/文件消息 | 媒体上传下载相关权限 |
+
 不同租户控制台显示的权限名称可能略有差异，以飞书开放平台实际提示为准。
+
+如果不想给机器人创建群权限，可以改成主控群内话题 fallback：
+
+```json
+{
+  "feishu": {
+    "taskContainerMode": "topic",
+    "taskChatFallbackToTopic": true
+  }
+}
+```
+
+这个模式不创建独立任务群，但任务不会出现在飞书左侧会话列表里，只会作为主控群内话题/回复存在。
 
 ## 配置文件
 
