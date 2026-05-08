@@ -11,6 +11,8 @@
   "codex": {
     "command": "${CODEX_COMMAND:-codex}",
     "args": ["app-server"],
+    "connectionMode": "auto",
+    "proxyArgs": ["app-server", "proxy"],
     "experimentalApi": true,
     "defaultModel": "gpt-5.4",
     "defaultReasoningEffort": "xhigh",

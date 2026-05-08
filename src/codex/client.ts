@@ -12,6 +12,9 @@ export interface CodexThreadSummary {
   cwd: string | null;
   status: ReturnType<typeof toTaskStatus>;
   updatedAt: number | null;
+  source: unknown;
+  agentNickname: string | null;
+  agentRole: string | null;
   raw: Record<string, unknown>;
 }
 
@@ -39,6 +42,7 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
     { resolve: (value: unknown) => void; reject: (reason: Error) => void; timeout: NodeJS.Timeout }
   >();
   private initialized = false;
+  private activeConnectionKind: "desktop_proxy" | "standalone" | null = null;
   private readonly guard = new CodexProtocolGuard();
 
   constructor(
@@ -54,24 +58,29 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
     return this.initialized ? "connected" : "disconnected";
   }
 
+  get connectionKind(): "desktop_proxy" | "standalone" | "not_started" | "unknown" {
+    return this.activeConnectionKind ?? (this.proc ? "unknown" : "not_started");
+  }
+
   async start(): Promise<void> {
     if (this.proc && this.proc.exitCode == null) return;
-    this.proc = spawn(this.config.codex.command, this.config.codex.args, {
-      stdio: ["pipe", "pipe", "pipe"],
-      shell: process.platform === "win32",
-      windowsHide: true
-    });
-    this.proc.stderr.on("data", (chunk: Buffer) => {
-      this.logger.warn("codex app-server stderr", { text: chunk.toString("utf8") });
-    });
-    this.proc.on("exit", (code, signal) => {
-      this.initialized = false;
-      this.rejectAll(new Error(`codex app-server exited: code=${code} signal=${signal}`));
-      this.logger.warn("codex app-server exited", { code, signal });
-    });
-    this.rl = createInterface({ input: this.proc.stdout });
-    this.rl.on("line", (line) => this.handleLine(line));
-    await this.initialize();
+    const modes = this.connectionStartModes();
+    let lastError: unknown = null;
+    for (const mode of modes) {
+      try {
+        await this.startWithArgs(mode.kind, mode.args);
+        return;
+      } catch (error) {
+        lastError = error;
+        await this.stopProcessOnly();
+        this.logger.warn("codex app-server start attempt failed", {
+          mode: mode.kind,
+          args: mode.args,
+          error: String(error)
+        });
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError ?? "codex app-server start failed"));
   }
 
   async stop(): Promise<void> {
@@ -80,6 +89,7 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
     this.proc.kill();
     this.proc = null;
     this.initialized = false;
+    this.activeConnectionKind = null;
   }
 
   async listThreads(limit: number, options: { pageSize?: number; maxPages?: number } = {}): Promise<CodexThreadSummary[]> {
@@ -175,6 +185,17 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
     return result as Record<string, unknown>;
   }
 
+  async setThreadName(threadId: string, name: string): Promise<Record<string, unknown>> {
+    const result = await this.request("thread/name/set", { threadId, name });
+    return result as Record<string, unknown>;
+  }
+
+  async listLoadedThreads(limit = 100): Promise<string[]> {
+    const result = await this.request("thread/loaded/list", { limit });
+    const response = result && typeof result === "object" ? (result as Record<string, unknown>) : {};
+    return Array.isArray(response.data) ? response.data.filter((entry): entry is string => typeof entry === "string") : [];
+  }
+
   async respondToServerRequest(requestId: string | number, result: Record<string, unknown>): Promise<void> {
     this.send({ id: requestId, result });
   }
@@ -192,6 +213,37 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
     });
     this.send({ id, method, params });
     return promise;
+  }
+
+  private connectionStartModes(): Array<{ kind: "desktop_proxy" | "standalone"; args: string[] }> {
+    const mode = this.config.codex.connectionMode;
+    const proxy = { kind: "desktop_proxy" as const, args: this.config.codex.proxyArgs };
+    const standalone = { kind: "standalone" as const, args: this.config.codex.args };
+    if (mode === "desktop_proxy") return [proxy];
+    if (mode === "standalone") return [standalone];
+    return [proxy, standalone];
+  }
+
+  private async startWithArgs(kind: "desktop_proxy" | "standalone", args: string[]): Promise<void> {
+    this.proc = spawn(this.config.codex.command, args, {
+      stdio: ["pipe", "pipe", "pipe"],
+      shell: process.platform === "win32",
+      windowsHide: true
+    });
+    this.activeConnectionKind = kind;
+    this.proc.stderr.on("data", (chunk: Buffer) => {
+      this.logger.warn("codex app-server stderr", { mode: kind, text: chunk.toString("utf8") });
+    });
+    this.proc.on("exit", (code, signal) => {
+      this.initialized = false;
+      this.activeConnectionKind = null;
+      this.rejectAll(new Error(`codex app-server exited: code=${code} signal=${signal}`));
+      this.logger.warn("codex app-server exited", { mode: kind, code, signal });
+    });
+    this.rl = createInterface({ input: this.proc.stdout });
+    this.rl.on("line", (line) => this.handleLine(line));
+    await this.initialize();
+    this.logger.info("codex app-server connected", { mode: kind, args });
   }
 
   private async initialize(): Promise<void> {
@@ -272,7 +324,26 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
       pending.reject(error);
       this.pending.delete(id);
     }
-    this.emit("error", error);
+    if (this.listenerCount("error") > 0) {
+      this.emit("error", error);
+    } else {
+      this.logger.warn("codex client error without listener", { error: String(error) });
+    }
+  }
+
+  private async stopProcessOnly(): Promise<void> {
+    if (!this.proc) return;
+    this.rl?.close();
+    const proc = this.proc;
+    this.proc = null;
+    this.initialized = false;
+    this.activeConnectionKind = null;
+    for (const [id, pending] of this.pending) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error("codex app-server start attempt failed"));
+      this.pending.delete(id);
+    }
+    proc.kill();
   }
 }
 
@@ -285,6 +356,9 @@ const normalizeThread = (value: unknown): CodexThreadSummary => {
     cwd: typeof raw.cwd === "string" ? raw.cwd : null,
     status: toTaskStatus(raw.status),
     updatedAt: typeof raw.updatedAt === "number" ? raw.updatedAt : null,
+    source: raw.source ?? null,
+    agentNickname: typeof raw.agentNickname === "string" ? raw.agentNickname : null,
+    agentRole: typeof raw.agentRole === "string" ? raw.agentRole : null,
     raw
   };
 };

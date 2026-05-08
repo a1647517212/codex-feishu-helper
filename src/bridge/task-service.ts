@@ -27,6 +27,12 @@ import {
 } from "../domain/checkpoints.js";
 import { ProjectionBuilder } from "../domain/projection.js";
 import { SecurityPolicy } from "../domain/security.js";
+import {
+  extractSubAgentsFromEvents,
+  extractSubAgentsFromThreadDetail,
+  formatSubAgentLines,
+  subAgentEventsFromItem
+} from "../domain/subagents.js";
 import type { CodexClient, CodexModelSummary, CodexThreadSummary } from "../codex/client.js";
 import type { FeishuSender, SentMessage } from "../feishu/client.js";
 import type { Logger } from "../logger.js";
@@ -1153,6 +1159,7 @@ export class TaskService {
         cwd: thread.cwd,
         selectedModel: null,
         selectedReasoningEffort: null,
+        subAgents: [],
         queuedMessages: 0,
         pendingApprovals: 0,
         lastTurnId: null,
@@ -1627,6 +1634,7 @@ export class TaskService {
         cwd: status.cwd,
         model: status.selectedModel,
         reasoningEffort: status.selectedReasoningEffort,
+        subAgents: status.subAgents,
         queuedMessages: status.queuedMessages,
         pendingApprovals: status.pendingApprovals,
         checkpoints: this.repo.listWorkspaceCheckpoints(binding.id, 100).length,
@@ -1999,6 +2007,19 @@ export class TaskService {
               extractEventReport(this.repo.listEventsForBinding(binding.id, 200), turnId)
             ) ?? emptyThreadReport()
           : null;
+      const subAgents = compactSubAgentsForBinding(
+        detail ? extractSubAgentsFromThreadDetail(detail) : [],
+        extractSubAgentsFromEvents(this.repo.listEventsForBinding(binding.id, 200))
+      );
+      if (subAgents.length > 0) {
+        this.repo.insertEvent({
+          sessionBindingId: binding.id,
+          codexThreadId: threadId,
+          codexTurnId: turnId,
+          eventType: "codex.subagent",
+          eventPayload: { subAgents, source: "thread_completion_scan" }
+        });
+      }
       const finalResult = report?.finalResult ?? null;
       const reasoningSummary = report?.reasoningSummary ?? null;
       const summaryText =
@@ -2017,6 +2038,7 @@ export class TaskService {
           reasoningSummary,
           finalResult,
           workspaceCheckpointId: endCheckpoint?.id ?? null,
+          subAgents,
           turn
         }
       });
@@ -2046,7 +2068,8 @@ export class TaskService {
           report,
           status,
           this.repo.listEventsForBinding(binding.id, 200),
-          binding.projectId ? this.repo.getProject(binding.projectId)?.name ?? null : null
+          binding.projectId ? this.repo.getProject(binding.projectId)?.name ?? null : null,
+          subAgents
         );
         const supplementalCards = this.cards.taskReportSupplementCards(formattedReport);
         this.repo.enqueueOutbox({
@@ -2069,6 +2092,7 @@ export class TaskService {
     }
     if (method === "item/completed") {
       const item = params.item && typeof params.item === "object" ? (params.item as Record<string, unknown>) : {};
+      await this.recordSubAgentItem(binding, threadId, asString(params.turnId), item, "item/completed");
       const itemEvent = buildCompletedItemEvent(item);
       if (itemEvent) {
         this.repo.insertEvent({
@@ -2082,6 +2106,10 @@ export class TaskService {
           }
         });
       }
+    }
+    if (method === "item/started") {
+      const item = params.item && typeof params.item === "object" ? (params.item as Record<string, unknown>) : {};
+      await this.recordSubAgentItem(binding, threadId, asString(params.turnId), item, "item/started");
     }
     if (method === "item/agentMessage/delta") {
       const delta = asString(params.delta);
@@ -2205,6 +2233,33 @@ export class TaskService {
     });
   }
 
+  private async recordSubAgentItem(
+    binding: SessionBinding,
+    threadId: string,
+    turnId: string | null,
+    item: Record<string, unknown>,
+    source: string
+  ): Promise<void> {
+    const subAgents = subAgentEventsFromItem(item);
+    if (subAgents.length === 0) return;
+    const event = this.repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: threadId,
+      codexTurnId: turnId,
+      eventType: "codex.subagent",
+      eventPayload: {
+        subAgents,
+        itemId: asString(item.id),
+        source
+      }
+    });
+    const text = formatSubAgentLines(subAgents, 3);
+    if (text) {
+      this.enqueueProgressUpdate(binding, event.seq, "子 Agent", turnId, asString(item.id), text, { force: true, replace: true });
+    }
+    await this.updateTaskCard(binding.id);
+  }
+
   private async updateProgressCard(binding: SessionBinding, label: string, text: string): Promise<void> {
     const current =
       this.progressCards.get(binding.id) ?? {
@@ -2234,6 +2289,7 @@ export class TaskService {
       status: binding.status,
       projectName: project?.name ?? "未归类项目",
       updatedAt: new Date().toISOString(),
+      subAgents: extractSubAgentsFromEvents(this.repo.listEventsForBinding(binding.id, 100)),
       sections: [...sections.values()]
         .sort((left, right) => right.updatedAt - left.updatedAt)
         .slice(0, 4)
@@ -2271,6 +2327,7 @@ export class TaskService {
       latestProcessText(events, ["codex.reasoning_summary", "codex.reasoning_summary_delta", "codex.reasoning", "codex.reasoning_delta"]),
       1600
     );
+    pushSection("子 Agent", formatSubAgentLines(extractSubAgentsFromEvents(events), 6), 1600);
     pushSection("工具进度", latestProcessText(events, ["codex.tool_progress"]), 900);
     const finalText =
       latestEventPayloadText(events, ["task.completed", "task.failed", "task.interrupted"], "finalResult") ??
@@ -2284,6 +2341,7 @@ export class TaskService {
       status: binding.status,
       projectName: project?.name ?? "未归类项目",
       updatedAt: new Date().toISOString(),
+      subAgents: extractSubAgentsFromEvents(events),
       sections
     };
   }
@@ -2411,6 +2469,7 @@ export class TaskService {
         projection.lastTurnId ?? "no-turn",
         projection.queuedMessages,
         projection.pendingApprovals,
+        stableSummaryKey(formatSubAgentLines(projection.subAgents)),
         stableSummaryKey(projection.lastSummary)
       ].join(":")
     });
@@ -2429,9 +2488,25 @@ export class TaskService {
           error: String(error)
         });
       }
-      return;
+    } else {
+      await this.updateTopicTitle(bindingId, buildTopicTitle(title, status));
     }
-    await this.updateTopicTitle(bindingId, buildTopicTitle(title, status));
+    await this.syncCodexThreadName(binding, buildCodexThreadTitle(title, status));
+  }
+
+  private async syncCodexThreadName(binding: SessionBinding, title: string): Promise<void> {
+    const setThreadName = (this.codex as unknown as { setThreadName?: (threadId: string, name: string) => Promise<Record<string, unknown>> })
+      .setThreadName;
+    if (!setThreadName || binding.codexThreadId.startsWith("draft_")) return;
+    try {
+      await setThreadName.call(this.codex, binding.codexThreadId, truncatePlain(title, 80));
+    } catch (error) {
+      this.logger.warn("codex thread title sync failed", {
+        bindingId: binding.id,
+        threadId: binding.codexThreadId,
+        error: String(error)
+      });
+    }
   }
 
   private async updateTopicTitle(bindingId: string, title: string): Promise<void> {
@@ -2566,6 +2641,9 @@ const buildTaskChatName = (config: BridgeConfig, key: string, title: string, sta
 };
 
 const buildTopicTitle = (title: string, status: TaskStatus): string =>
+  status === "running" ? title : `${taskStatusPrefix(status)}${title}`;
+
+const buildCodexThreadTitle = (title: string, status: TaskStatus): string =>
   status === "running" ? title : `${taskStatusPrefix(status)}${title}`;
 
 const taskStatusPrefix = (status: TaskStatus): string => {
@@ -2781,6 +2859,9 @@ const normalizeThreadFromDetail = (threadId: string, detail: Record<string, unkn
     cwd: asString(rawThread.cwd),
     status: rawThread.status && typeof rawThread.status === "object" && (rawThread.status as { type?: unknown }).type === "active" ? "running" : "idle",
     updatedAt: typeof rawThread.updatedAt === "number" ? rawThread.updatedAt : null,
+    source: rawThread.source ?? null,
+    agentNickname: asString(rawThread.agentNickname),
+    agentRole: asString(rawThread.agentRole),
     raw: rawThread
   };
 };
@@ -2812,6 +2893,18 @@ type ThreadReport = {
   finalResult: string | null;
 };
 
+type SubAgentLike = {
+  threadId: string;
+  nickname: string | null;
+  role: string | null;
+  tool: string | null;
+  status: string;
+  model: string | null;
+  reasoningEffort: string | null;
+  message: string | null;
+  updatedAt: string | null;
+};
+
 const emptyThreadReport = (): ThreadReport => ({
   reasoningSummary: null,
   finalResult: null
@@ -2823,6 +2916,30 @@ const mergeThreadReports = (...reports: Array<ThreadReport | null>): ThreadRepor
   if (!finalResult && !reasoningSummary) return null;
   return { reasoningSummary, finalResult };
 };
+
+const compactSubAgentsForBinding = (...groups: SubAgentLike[][]): SubAgentLike[] => {
+  const byThread = new Map<string, SubAgentLike>();
+  for (const group of groups) {
+    for (const agent of group) {
+      if (!agent.threadId) continue;
+      const previous = byThread.get(agent.threadId);
+      byThread.set(agent.threadId, previous ? mergeSubAgentLike(previous, agent) : agent);
+    }
+  }
+  return [...byThread.values()];
+};
+
+const mergeSubAgentLike = (previous: SubAgentLike, next: SubAgentLike): SubAgentLike => ({
+  threadId: next.threadId,
+  nickname: next.nickname ?? previous.nickname,
+  role: next.role ?? previous.role,
+  tool: next.tool ?? previous.tool,
+  status: next.status !== "unknown" ? next.status : previous.status,
+  model: next.model ?? previous.model,
+  reasoningEffort: next.reasoningEffort ?? previous.reasoningEffort,
+  message: next.message ?? previous.message,
+  updatedAt: next.updatedAt ?? previous.updatedAt
+});
 
 const extractThreadReport = (detail: Record<string, unknown>): ThreadReport | null => {
   const rawThread = detail.thread && typeof detail.thread === "object" ? (detail.thread as Record<string, unknown>) : detail;
@@ -2947,7 +3064,8 @@ const formatThreadReport = (
   report: ThreadReport,
   status: TaskStatus,
   events: TaskEvent[],
-  projectName: string | null
+  projectName: string | null,
+  subAgents = extractSubAgentsFromEvents(events)
 ) => {
   const reasoningSummary = report.reasoningSummary ? sanitizeAssistantMarkdown(report.reasoningSummary, 1800) : null;
   const fullFinalResult = report.finalResult ? sanitizeAssistantMarkdown(report.finalResult, 200000) : null;
@@ -2962,6 +3080,7 @@ const formatThreadReport = (
     projectName: projectName ?? "Playground",
     reasoningSummary,
     finalResult,
+    subAgents,
     highlights,
     changeItems,
     verificationItems,

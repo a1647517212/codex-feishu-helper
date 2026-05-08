@@ -40,6 +40,8 @@ export const makeConfig = (dir: string): BridgeConfig => ({
   codex: {
     command: "codex",
     args: ["app-server"],
+    connectionMode: "standalone",
+    proxyArgs: ["app-server", "proxy"],
     experimentalApi: true,
     defaultModel: "gpt-5.4",
     defaultReasoningEffort: "xhigh",
@@ -184,6 +186,7 @@ export class MockFeishu implements FeishuSender {
 
 export class MockCodex {
   status = "connected" as const;
+  connectionKind = "standalone" as const;
   notifications: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
   requests: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
   turns: Array<{ threadId: string; text: string }> = [];
@@ -194,6 +197,7 @@ export class MockCodex {
   interrupted: string[] = [];
   archived: string[] = [];
   unarchived: string[] = [];
+  renamed: Array<{ threadId: string; name: string }> = [];
   threads: any[] = [];
   listCalls: Array<{ limit?: number; pageSize?: number; maxPages?: number }> = [];
   readFailures = new Map<string, Error>();
@@ -261,6 +265,11 @@ export class MockCodex {
 
   async unarchiveThread(threadId: string): Promise<Record<string, unknown>> {
     this.unarchived.push(threadId);
+    return {};
+  }
+
+  async setThreadName(threadId: string, name: string): Promise<Record<string, unknown>> {
+    this.renamed.push({ threadId, name });
     return {};
   }
 

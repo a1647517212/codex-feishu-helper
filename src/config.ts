@@ -44,6 +44,8 @@ const ConfigSchema = z.object({
     .object({
       command: z.string().default("codex"),
       args: z.array(z.string()).default(["app-server"]),
+      connectionMode: z.enum(["auto", "desktop_proxy", "standalone"]).default("auto"),
+      proxyArgs: z.array(z.string()).default(["app-server", "proxy"]),
       experimentalApi: z.boolean().default(true),
       defaultModel: z.string().default("gpt-5.4"),
       defaultReasoningEffort: z.string().default("xhigh"),
@@ -56,6 +58,8 @@ const ConfigSchema = z.object({
     .default({
       command: "codex",
       args: ["app-server"],
+      connectionMode: "auto",
+      proxyArgs: ["app-server", "proxy"],
       experimentalApi: true,
       defaultModel: "gpt-5.4",
       defaultReasoningEffort: "xhigh",

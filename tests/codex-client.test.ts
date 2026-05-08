@@ -75,3 +75,41 @@ test("startThread and startTurn pass personal default model, reasoning and full 
     cleanup();
   }
 });
+
+test("setThreadName and listLoadedThreads call app-server helper APIs", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  try {
+    const client = new CodexClient(makeConfig(dir), makeLogger(dir));
+    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
+    (client as unknown as { request: (method: string, params: unknown) => Promise<unknown> }).request = async (
+      method,
+      params
+    ) => {
+      calls.push({ method, params: params as Record<string, unknown> });
+      if (method === "thread/loaded/list") return { data: ["thr_1", "thr_2"], nextCursor: null };
+      return {};
+    };
+
+    await client.setThreadName("thr_1", "New title");
+    const loaded = await client.listLoadedThreads();
+
+    assert.deepEqual(loaded, ["thr_1", "thr_2"]);
+    assert.deepEqual(calls[0], { method: "thread/name/set", params: { threadId: "thr_1", name: "New title" } });
+    assert.equal(calls[1]?.method, "thread/loaded/list");
+  } finally {
+    cleanup();
+  }
+});
+
+test("unhandled Codex client errors are logged instead of crashing", () => {
+  const { dir, cleanup } = makeTempRepo();
+  try {
+    const logger = makeLogger(dir);
+    const client = new CodexClient(makeConfig(dir), logger);
+    assert.doesNotThrow(() => {
+      (client as unknown as { rejectAll: (error: Error) => void }).rejectAll(new Error("proxy failed"));
+    });
+  } finally {
+    cleanup();
+  }
+});

@@ -244,6 +244,8 @@ export interface DiagnosticSnapshot {
   platform: string;
   nodeVersion: string;
   codexCommand: string;
+  codexConnectionMode: string;
+  codexConnectionKind: "desktop_proxy" | "standalone" | "not_started" | "unknown";
   codexAvailable: boolean;
   appServerStatus: "connected" | "disconnected" | "not_started" | "error";
   feishuConfigured: boolean;
@@ -293,6 +295,7 @@ export interface TaskStatusProjection {
   cwd: string | null;
   selectedModel: string | null;
   selectedReasoningEffort: string | null;
+  subAgents: TaskSubAgentProjection[];
   queuedMessages: number;
   pendingApprovals: number;
   lastTurnId: string | null;
@@ -300,11 +303,24 @@ export interface TaskStatusProjection {
   updatedAt: string;
 }
 
+export interface TaskSubAgentProjection {
+  threadId: string;
+  nickname: string | null;
+  role: string | null;
+  tool: string | null;
+  status: string;
+  model: string | null;
+  reasoningEffort: string | null;
+  message: string | null;
+  updatedAt: string | null;
+}
+
 export interface TaskProgressProjection {
   title: string;
   status: TaskStatus;
   projectName: string;
   updatedAt: string;
+  subAgents?: TaskSubAgentProjection[];
   sections: Array<{
     label: string;
     text: string;
@@ -317,6 +333,7 @@ export interface TaskReportProjection {
   projectName: string;
   reasoningSummary: string | null;
   finalResult: string | null;
+  subAgents?: TaskSubAgentProjection[];
   highlights?: string[];
   changeItems?: string[];
   verificationItems?: string[];
@@ -331,6 +348,7 @@ export interface TaskProcessProjection {
   status: TaskStatus;
   projectName: string;
   updatedAt: string;
+  subAgents?: TaskSubAgentProjection[];
   sections: Array<{
     label: string;
     text: string;

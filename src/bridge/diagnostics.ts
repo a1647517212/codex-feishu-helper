@@ -50,6 +50,8 @@ export class DiagnosticsService {
       platform: platform(),
       nodeVersion: process.version,
       codexCommand: this.config.codex.command,
+      codexConnectionMode: this.config.codex.connectionMode,
+      codexConnectionKind: this.codex.connectionKind,
       codexAvailable: await this.isCodexAvailable(),
       appServerStatus: this.codex.status,
       feishuConfigured: Boolean(this.config.feishu.appId && this.config.feishu.appSecret && this.config.feishu.defaultChatId),

@@ -10,6 +10,7 @@ import type {
   TaskProgressProjection,
   TaskReportProjection,
   TaskStatusProjection,
+  TaskSubAgentProjection,
   WorkspaceCheckpoint
 } from "../core/types.js";
 import type { WorkspaceImpactSummary, WorkspaceRestoreSummary } from "./checkpoints.js";
@@ -207,10 +208,15 @@ export class CardRenderer {
       kvLine("项目", projection.projectName),
       projection.selectedModel ? kvLine("模型", projection.selectedModel) : null,
       projection.selectedReasoningEffort ? kvLine("思考", projection.selectedReasoningEffort) : null,
+      projection.subAgents.length > 0 ? kvLine("子 Agent", `${projection.subAgents.length} 个`) : null,
       projection.queuedMessages > 0 ? kvLine("队列", `${projection.queuedMessages} 条后续要求`) : null,
       projection.pendingApprovals > 0 ? kvLine("待确认", `${projection.pendingApprovals} 项`) : null
     ].filter(Boolean) as string[];
     const elements: Record<string, unknown>[] = [text(summaryItems.join("\n"))];
+    if (projection.subAgents.length > 0) {
+      elements.push(divider());
+      elements.push(sectionBlock("子 Agent", formatSubAgents(projection.subAgents)));
+    }
     if (projection.lastSummary) {
       elements.push(divider());
       elements.push(sectionBlock("当前结论", projection.lastSummary));
@@ -237,6 +243,10 @@ export class CardRenderer {
 
   taskProgressCard(projection: TaskProgressProjection): FeishuCard {
     const elements: Record<string, unknown>[] = [text(taskMetaLines(projection.status, projection.projectName, projection.updatedAt).join("\n"))];
+    if (projection.subAgents && projection.subAgents.length > 0) {
+      elements.push(divider());
+      elements.push(sectionBlock("子 Agent", formatSubAgents(projection.subAgents, 3)));
+    }
     for (const section of projection.sections.slice(0, 4)) {
       elements.push(divider());
       elements.push(sectionBlock(section.label, section.text));
@@ -257,6 +267,10 @@ export class CardRenderer {
     if (projection.verificationItems && projection.verificationItems.length > 0) {
       elements.push(divider());
       elements.push(sectionBlock("验证情况", projection.verificationItems.map((item, index) => `${index + 1}. ${item}`).join("\n")));
+    }
+    if (projection.subAgents && projection.subAgents.length > 0) {
+      elements.push(divider());
+      elements.push(sectionBlock("子 Agent", formatSubAgents(projection.subAgents)));
     }
     if (projection.reasoningSummary) {
       elements.push(divider());
@@ -310,6 +324,10 @@ export class CardRenderer {
 
   taskProcessCard(projection: TaskProcessProjection): FeishuCard {
     const elements: Record<string, unknown>[] = [text(taskMetaLines(projection.status, projection.projectName, projection.updatedAt).join("\n"))];
+    if (projection.subAgents && projection.subAgents.length > 0) {
+      elements.push(divider());
+      elements.push(sectionBlock("子 Agent", formatSubAgents(projection.subAgents)));
+    }
     for (const section of projection.sections.slice(0, 6)) {
       elements.push(divider());
       elements.push(sectionBlock(section.label, section.text));
@@ -509,6 +527,7 @@ export class CardRenderer {
     cwd: string | null;
     model: string | null;
     reasoningEffort: string | null;
+    subAgents?: TaskSubAgentProjection[];
     queuedMessages: number;
     pendingApprovals: number;
     checkpoints: number;
@@ -524,6 +543,7 @@ export class CardRenderer {
           input.cwd ? kvLine("目录", input.cwd) : null,
           input.model ? kvLine("模型", input.model) : null,
           input.reasoningEffort ? kvLine("思考", input.reasoningEffort) : null,
+          input.subAgents && input.subAgents.length > 0 ? kvLine("子 Agent", `${input.subAgents.length} 个`) : null,
           kvLine("队列", `${input.queuedMessages} 条`),
           kvLine("待确认", `${input.pendingApprovals} 项`),
           kvLine("检查点", `${input.checkpoints} 个`),
@@ -537,6 +557,10 @@ export class CardRenderer {
     if (input.lastSummary) {
       elements.push(divider());
       elements.push(sectionBlock("当前结论", input.lastSummary));
+    }
+    if (input.subAgents && input.subAgents.length > 0) {
+      elements.push(divider());
+      elements.push(sectionBlock("子 Agent", formatSubAgents(input.subAgents)));
     }
     pushActionRows(elements, this.interactionMode, [
       button("继续", "task_continue", { bindingId: input.bindingId }),
@@ -686,6 +710,7 @@ export class CardRenderer {
           `电脑：${snapshot.machineName}`,
           `Codex：${snapshot.codexAvailable ? "可用" : "不可用"}`,
           `app-server：${snapshot.appServerStatus}`,
+          `Codex连接：${codexConnectionText(snapshot.codexConnectionMode, snapshot.codexConnectionKind)}`,
           `飞书配置：${snapshot.feishuConfigured ? "已配置" : "未完整配置"}`,
           `消息接入：${snapshot.feishuMessageTransport === "long_connection" ? "长连接" : "HTTP 回调"}`,
           `卡片回调：${snapshot.feishuCardActionTransport === "long_connection" ? "长连接" : "HTTP 回调"}`,
@@ -1221,6 +1246,51 @@ const formatRecentTasks = (
       ].join("\n")
     )
     .join("\n\n");
+
+const formatSubAgents = (subAgents: TaskSubAgentProjection[], limit = 4): string => {
+  const visible = subAgents.slice(0, limit).map((agent, index) => {
+    const name = agent.nickname || agent.role || shortThreadId(agent.threadId) || `子 Agent ${index + 1}`;
+    const role = agent.role && agent.role !== name ? `角色：${agent.role}` : null;
+    const meta = [
+      subAgentStatusText(agent.status),
+      agent.model ? `模型：${agent.model}` : "模型：继承主任务/未知",
+      agent.reasoningEffort ? `思考：${agent.reasoningEffort}` : "思考：继承主任务/未知",
+      role,
+      agent.message ? `说明：${agent.message}` : null
+    ].filter(Boolean);
+    return `${index + 1}. **${name}**\n${meta.join(" · ")}`;
+  });
+  const hidden = subAgents.length > visible.length ? `\n\n... 还有 ${subAgents.length - visible.length} 个子 Agent` : "";
+  return `${visible.join("\n\n")}${hidden}`;
+};
+
+const shortThreadId = (threadId: string): string =>
+  threadId.length > 10 ? `${threadId.slice(0, 6)}...${threadId.slice(-4)}` : threadId;
+
+const subAgentStatusText = (status: string): string =>
+  ({
+    pendingInit: "初始化中",
+    inProgress: "调用中",
+    running: "运行中",
+    completed: "已完成",
+    errored: "失败",
+    interrupted: "已中断",
+    shutdown: "已关闭",
+    notFound: "未找到",
+    failed: "失败"
+  })[status] ?? status;
+
+const codexConnectionText = (mode: string, kind: string): string => {
+  const modeText = ({ auto: "自动", desktop_proxy: "Desktop代理", standalone: "独立进程" } as Record<string, string>)[mode] ?? mode;
+  const kindText =
+    ({
+      desktop_proxy: "已接入 Desktop app-server",
+      standalone: "独立 app-server",
+      not_started: "未启动",
+      unknown: "未知"
+    } as Record<string, string>)[kind] ?? kind;
+  return `${modeText} / ${kindText}`;
+};
 
 const formatImpactSummary = (impact: WorkspaceImpactSummary | null): string => {
   if (!impact) return "还没有可对比的检查点。下一轮任务完成后会自动生成。";

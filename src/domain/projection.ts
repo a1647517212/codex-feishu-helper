@@ -1,5 +1,6 @@
 import type { Repository } from "../db/repo.js";
 import type { TaskStatusProjection } from "../core/types.js";
+import { extractSubAgentsFromEvents } from "./subagents.js";
 
 export class ProjectionBuilder {
   constructor(private readonly repo: Repository) {}
@@ -22,6 +23,7 @@ export class ProjectionBuilder {
       cwd: binding.cwd,
       selectedModel: binding.selectedModel,
       selectedReasoningEffort: binding.selectedReasoningEffort,
+      subAgents: extractSubAgentsFromEvents(events),
       queuedMessages,
       pendingApprovals,
       lastTurnId: binding.lastTurnId,

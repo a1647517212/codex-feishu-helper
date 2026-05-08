@@ -2222,6 +2222,7 @@ test("task status card renders summary and command hint as separate blocks", () 
     cwd: null,
     selectedModel: "gpt-5.4",
     selectedReasoningEffort: "xhigh",
+    subAgents: [],
     queuedMessages: 1,
     pendingApprovals: 0,
     lastTurnId: "turn_layout",
@@ -2234,6 +2235,89 @@ test("task status card renders summary and command hint as separate blocks", () 
   assert.equal(content.includes("这里是当前阶段的简要结论。"), true);
   assert.equal(content.includes("gpt-5.4"), true);
   assert.equal(content.includes("xhigh"), true);
+});
+
+test("task status card renders subagent model and reasoning", () => {
+  const card = new CardRenderer("hybrid").taskStatusCard({
+    bindingId: "bind_subagent_card",
+    title: "Subagent task",
+    projectName: "Playground",
+    status: "running",
+    cwd: null,
+    selectedModel: "gpt-5.5",
+    selectedReasoningEffort: "xhigh",
+    subAgents: [
+      {
+        threadId: "thr_child_1",
+        nickname: "worker-a",
+        role: "worker",
+        tool: "spawnAgent",
+        status: "running",
+        model: "gpt-5.4",
+        reasoningEffort: "high",
+        message: "正在实现模块",
+        updatedAt: null
+      }
+    ],
+    queuedMessages: 0,
+    pendingApprovals: 0,
+    lastTurnId: "turn_subagent",
+    lastSummary: null,
+    updatedAt: new Date().toISOString()
+  });
+  const content = JSON.stringify(card);
+  assert.equal(content.includes("子 Agent"), true);
+  assert.equal(content.includes("worker-a"), true);
+  assert.equal(content.includes("gpt-5.4"), true);
+  assert.equal(content.includes("high"), true);
+});
+
+test("collab agent events are projected into Feishu task status", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_parent_subagent",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuTaskCardMessageId: "msg_status_card",
+      feishuContainerKind: "dedicated_chat",
+      title: "Subagent projection",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "item/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turnId: "turn_subagent",
+        item: {
+          type: "collabAgentToolCall",
+          id: "item_spawn",
+          tool: "spawnAgent",
+          status: "completed",
+          senderThreadId: binding.codexThreadId,
+          receiverThreadIds: ["thr_child_subagent"],
+          prompt: "实现模块",
+          model: "gpt-5.5",
+          reasoningEffort: "xhigh",
+          agentsStates: {
+            thr_child_subagent: { status: "running", message: "正在检查代码" }
+          }
+        }
+      }
+    });
+    const latest = JSON.stringify(feishu.updatedCards[feishu.updatedCards.length - 1]?.card ?? {});
+    assert.equal(repo.listEventsForBinding(binding.id).some((event) => event.eventType === "codex.subagent"), true);
+    assert.equal(latest.includes("子 Agent"), true);
+    assert.equal(latest.includes("gpt-5.5"), true);
+    assert.equal(latest.includes("xhigh"), true);
+  } finally {
+    cleanup();
+  }
 });
 
 test("console card uses compact mobile-safe button labels", () => {
@@ -2279,6 +2363,7 @@ test("task report card renders highlights and next steps blocks", () => {
     changeItems: ["已完成主流程实现"],
     verificationItems: ["已完成基础验证"],
     nextSteps: ["继续优化移动端显示", "补强归档流程体验"],
+    subAgents: [],
     finalResultTruncated: false,
     updatedAt: new Date().toISOString()
   });
@@ -2316,6 +2401,7 @@ test("task report card preserves markdown structure in final result", () => {
     projectName: "Playground",
     reasoningSummary: "已完成对比。",
     finalResult,
+    subAgents: [],
     finalResultTruncated: false,
     updatedAt: new Date().toISOString()
   });
@@ -2337,6 +2423,7 @@ test("task report supplement cards carry overflow markdown before text fallback"
     reasoningSummary: "已完成整理。",
     finalResult: finalResult.slice(0, 8600),
     fullFinalResult: finalResult,
+    subAgents: [],
     finalResultTruncated: true,
     updatedAt: new Date().toISOString()
   };
@@ -2420,6 +2507,77 @@ test("completed notification preserves markdown final result from Codex thread",
     assert.equal(payload.includes("1. 先修复飞书卡片排版。"), true);
     assert.equal(payload.includes("| 项目 | 状态 |"), true);
     assert.equal(payload.includes("- npm run check"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("completed notification extracts subagent metadata from Codex thread", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    codex.threads = [
+      {
+        id: "thr_completed_subagent",
+        name: "Completed subagent",
+        preview: "Completed subagent",
+        cwd: dir,
+        status: { type: "idle" },
+        turns: [
+          {
+            id: "turn_completed_subagent",
+            status: "completed",
+            items: [
+              {
+                type: "collabAgentToolCall",
+                id: "item_spawn_completed",
+                tool: "spawnAgent",
+                status: "completed",
+                senderThreadId: "thr_completed_subagent",
+                receiverThreadIds: ["thr_child_completed"],
+                prompt: "并行检查",
+                model: "gpt-5.5",
+                reasoningEffort: "xhigh",
+                agentsStates: {
+                  thr_child_completed: { status: "completed", message: "检查完成" }
+                }
+              },
+              { type: "agentMessage", text: "已完成主任务。" }
+            ]
+          }
+        ],
+        updatedAt: Date.now()
+      }
+    ];
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_completed_subagent",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Completed subagent",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: {
+          id: "turn_completed_subagent",
+          status: "completed",
+          items: []
+        }
+      }
+    });
+    const result = findTaskReportOutbox(repo.listDueOutbox(10));
+    assert.ok(result);
+    const payload = JSON.stringify(result.payload.card);
+    assert.equal(payload.includes("子 Agent"), true);
+    assert.equal(payload.includes("gpt-5.5"), true);
+    assert.equal(payload.includes("xhigh"), true);
+    assert.equal(repo.listEventsForBinding(binding.id).some((event) => event.eventType === "codex.subagent"), true);
   } finally {
     cleanup();
   }

@@ -13,7 +13,7 @@ Reasons:
 
 ## Implemented P0 Components
 
-- `CodexClient`: starts `codex app-server`, performs `initialize` and `initialized`, wraps thread and turn APIs, captures notifications and server approval requests.
+- `CodexClient`: connects to Codex app-server, preferring `codex app-server proxy` in auto mode and falling back to standalone `codex app-server`; performs `initialize` and `initialized`, wraps thread and turn APIs, captures notifications and server approval requests.
 - `FeishuClient`: sends Feishu text messages, replies, cards, and card updates through Feishu OpenAPI.
 - `FeishuEventParser`: parses URL verification, message events, and card action callbacks.
 - `FeishuLongConnectionServer`: receives Feishu message events and, when enabled, card action callbacks through the official long-connection SDK path.
@@ -111,12 +111,14 @@ Verified with the bot in group `codex-ep` using long connection:
 - New threads now default to `gpt-5.4`, `xhigh`, `danger-full-access`, and `approvalPolicy=never`.
 - New tasks default to dedicated Feishu task chats; topic mode is fallback-only.
 - Task completion messages and claim summaries no longer echo raw PowerShell or shell command text back into Feishu.
+- Sub-agent spawn/wait records are projected into Feishu status/progress/detail/result cards, including requested model and reasoning effort when Codex exposes them.
+- Task title changes are also sent to `thread/name/set`, so Codex persisted thread titles stay aligned with Feishu task titles.
 
 ## Current Boundaries
 
 - Long connection is still the default for messages and newer card callbacks; message-command mode remains the local-only fallback.
 - Card button callbacks require the Feishu app to subscribe to the newer `card.action.trigger` callback. Prefer long connection for this callback. If the bridge never records `lastFeishuCardActionAt`, the failing path is before `TaskService`; verify the Feishu callback subscription first, then fall back to message commands or add a public callback/relay only if the tenant requires HTTP callbacks.
 - Desktop owner IPC routing is intentionally not implemented in P0.
-- The bridge does not mirror the Codex App GUI. It controls persisted Codex sessions through `app-server`.
+- Desktop live refresh is best-effort. In `codex.connectionMode=auto`, the bridge first tries `codex app-server proxy` so it can share the running Desktop app-server and receive the same live notifications. If the Desktop control socket is unavailable, it falls back to a standalone app-server; Feishu remains live, while the Desktop UI may only show persisted updates after its own refresh/restart.
 - High-risk approvals do not expose a task-wide trust button.
 - Full local detail pages for large content are reserved for P2.
