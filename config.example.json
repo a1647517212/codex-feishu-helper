@@ -18,7 +18,7 @@
     "defaultReasoningEffort": "xhigh",
     "defaultSandboxMode": "danger-full-access",
     "defaultApprovalPolicy": "never",
-    "autoArchiveOnCompletion": true,
+    "autoArchiveOnCompletion": false,
     "serviceName": "feishu_codex_bridge"
   },
   "feishu": {

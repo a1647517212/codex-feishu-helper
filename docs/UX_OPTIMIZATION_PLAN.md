@@ -2,7 +2,7 @@
 
 Source baseline:
 
-- `C:\Users\EPEANZ\Documents\Playground\FEISHU_CODEX_CONTROL_DESIGN.md`
+- `FEISHU_CODEX_CONTROL_DESIGN.md`
 - Current branch implementation on `zpj/飞书控制Codex桥接`
 
 ## Goal

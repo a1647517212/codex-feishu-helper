@@ -1,6 +1,6 @@
 # Full Design Coverage Matrix
 
-Source: `C:\Users\EPEANZ\Documents\Playground\FEISHU_CODEX_CONTROL_DESIGN.md`
+Source: `FEISHU_CODEX_CONTROL_DESIGN.md`
 
 Legend:
 

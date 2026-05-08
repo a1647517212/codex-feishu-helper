@@ -1,7 +1,7 @@
 {
-  "name": "codex-feishu",
+  "name": "codex-feishu-helper",
   "version": "0.1.0",
-  "description": "Feishu control bridge for local Codex app-server task chats.",
+  "description": "Local Feishu control bridge for Codex app-server task chats.",
   "type": "module",
   "bin": {
     "feishu-codex": "./dist/src/main.js"

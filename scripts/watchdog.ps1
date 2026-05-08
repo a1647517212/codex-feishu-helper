@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
   [string]$RepoRoot = (Split-Path -Parent $PSScriptRoot),
-  [string]$NodePath = "C:\develope\nodejs\node.exe",
+  [string]$NodePath = "node",
   [string]$BridgeScript = "dist/src/main.js",
   [string]$BridgeCommand = "serve",
   [int]$MinBridgeAgeSecondsBeforeRestart = 60

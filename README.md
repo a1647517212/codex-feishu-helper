@@ -1,125 +1,215 @@
-# codex-feishu
+# Codex Feishu Helper
 
-`codex-feishu` is a local bridge that lets Feishu messages and cards control local Codex `app-server` threads. It is designed for the session-level workflow described in `FEISHU_CODEX_CONTROL_DESIGN.md`: a main Feishu control group receives task requests, and each Codex task is represented by a dedicated Feishu task chat by default.
+Codex Feishu Helper 是一个本地桥接服务，用飞书群聊控制本机 Codex `app-server` 任务。它适合个人把飞书当作 Codex 任务控制台：在主控群里选择项目、创建任务、查看任务列表，在每个任务的独立飞书会话里持续追问和接收进度、结论。
 
-The first implementation uses TypeScript on Node.js 22 with the built-in `node:sqlite` module. That keeps the Windows install path simple while still giving the bridge durable state for task bindings, queues, approvals, and notification retry.
+当前默认设计是：
 
-Design coverage is tracked in [docs/FULL_DESIGN_COVERAGE.md](docs/FULL_DESIGN_COVERAGE.md). It compares every section of `FEISHU_CODEX_CONTROL_DESIGN.md` against the current implementation, including unfinished P1/P2 work.
+- 飞书事件默认走长连接，不要求公网 IP、域名或内网穿透。
+- HTTP 服务默认只监听 `127.0.0.1`，用于健康检查、诊断和可选 HTTP 回调 fallback。
+- 新任务默认创建独立飞书任务会话；如果没有建群权限，可回退为群内话题。
+- Codex 默认模型是 `gpt-5.4`，思考等级是 `xhigh`，权限是 `danger-full-access`，审批策略是 `never`。
+- 任务过程会推送结构化进度卡片，完成后推送结构化最终结论。
 
-## P0 Scope
+Codex Desktop 实时同步的长期优化方案见 [docs/CODEX_DESKTOP_SYNC_OPTIMIZATION.md](docs/CODEX_DESKTOP_SYNC_OPTIMIZATION.md)。
 
-- Feishu long-connection message transport by default.
-- Button-first hybrid interaction by default: cards render buttons and also show equivalent commands.
-- Card actions use Feishu long connection by default through the newer `card.action.trigger` callback event; HTTP callback remains an optional fallback when a public endpoint is available.
-- Local Codex `app-server` JSONL transport over stdio.
-- `thread/list`, `thread/read`, `thread/start`, `thread/resume`, `turn/start`, `turn/steer`, and `turn/interrupt` wrappers.
-- SQLite tables for projects, session bindings, semantic events, pending approvals, idempotent actions, incoming message dedupe, message queue, notification outbox, trusted Feishu subjects, and device state.
-- SQLite-backed incoming message dedupe for Feishu long-connection retries.
-- Semantic event store and projection builder so Feishu cards are based on bridge events instead of raw Codex payloads.
-- Busy message queue so task-chat replies are not lost while a task is running.
-- Approval request capture and Feishu approval card generation.
-- Notification outbox with dedupe and retry.
-- Diagnostics endpoint and Feishu diagnostic card.
-- Safe project path checks and concise task/event summaries for Feishu.
+## 功能概览
 
-## Quick Start
+- `/codex`：打开主控台。
+- 项目列表：自动/配置导入本地项目后，从主控台选择项目。
+- 新建任务：在项目下创建 Codex 任务，并创建独立飞书任务会话。
+- 继续任务：在任务会话里直接发消息即可继续同一个 Codex 线程。
+- 任务列表：查看运行中、已完成、失败、中断、归档任务。
+- 任务设置：在飞书中查看和调整模型、思考等级。
+- 诊断恢复：检查飞书权限、长连接、Codex app-server、数据库、消息 outbox。
+- 本地守护：Windows 定时任务可每 5 分钟检查并拉起桥接服务。
+
+## 环境要求
+
+- Windows 10/11、macOS 或 Linux。当前脚本优先支持 Windows。
+- Node.js 22.13 或更高版本。
+- 已安装并登录 Codex CLI：`codex --version` 能正常输出。
+- 一个飞书自建应用，已启用机器人和长连接事件订阅。
+
+安装 Codex CLI 后先在本机完成登录：
 
 ```powershell
-npm install
-npm run build
-npm test
-npm run generate:codex-schema
-npm run doctor
+codex login
+codex --version
 ```
 
-Create a config:
+## 快速启动
+
+Windows 推荐使用初始化脚本：
 
 ```powershell
-copy .\config.example.json $env:USERPROFILE\.feishu-codex\config.json
+git clone https://github.com/a1647517212/codex-feishu-helper.git
+cd codex-feishu-helper
+powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1
+```
+
+脚本会完成：
+
+- 检查 Node.js 和 Codex CLI。
+- 安装 npm 依赖。
+- 构建项目。
+- 创建用户配置目录 `%USERPROFILE%\.feishu-codex`。
+- 如果配置不存在，复制 `config.example.json` 为 `%USERPROFILE%\.feishu-codex\config.json`。
+
+然后编辑配置：
+
+```powershell
 notepad $env:USERPROFILE\.feishu-codex\config.json
 ```
 
-Start the bridge:
+至少需要填写：
+
+- `feishu.appId`
+- `feishu.appSecret`
+- `feishu.defaultChatId`
+- `server.adminToken`
+
+启动服务：
 
 ```powershell
 npm run start
 ```
 
-The default Feishu control path is long-connection group messages plus long-connection card actions. Keep the local HTTP server on `127.0.0.1`; it is used for health, diagnostics, and optional HTTP fallback, not as the primary Feishu entry point.
-
-Default runtime behavior:
-
-- New Codex threads default to `gpt-5.4`.
-- Reasoning effort defaults to `xhigh`.
-- New threads default to `danger-full-access`.
-- Default approval policy is `never`.
-- New Feishu tasks default to one dedicated task chat per Codex task; group topics remain an optional fallback.
-- Feishu completion messages include a clean processing summary and final conclusion. Raw command/script output stays in local logs/events instead of being echoed into the chat.
-
-Card button callbacks do not require exposing the local machine when the Feishu app uses the newer `card.action.trigger` callback event in long-connection mode. If a tenant is still wired to the older card callback path that only supports HTTP callback URLs, switch `feishu.interactionMode` to `message_command`, or set `feishu.cardActionTransport` to `http_callback` and expose only `/feishu/card` through a public relay/tunnel.
-
-Expose these endpoints only when the matching transport is `http_callback`:
-
-- `POST /feishu/events`
-- `POST /feishu/card`
-- `GET /healthz`
-- `GET /doctor`
-
-For local testing, use `FEISHU_CODEX_ADMIN_TOKEN` and call:
+检查诊断：
 
 ```powershell
-curl http://127.0.0.1:8787/doctor -H "authorization: Bearer <token>"
+npm run doctor
 ```
 
-## Feishu App Setup
+如果希望后台保活：
 
-In the Feishu developer console:
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-watchdog.ps1
+```
 
-- Enable the bot and add it to the target group.
-- Set Events and Callbacks subscription mode to long connection if both messages and newer card callbacks should enter by WebSocket.
-- Subscribe to `im.message.receive_v1`.
-- Subscribe to the newer card callback `card.action.trigger` for interactive card buttons. Choose long connection for this callback when available.
-- Enable the permission to receive all group messages, so the bot can read group messages without `@`.
-- Grant message send/reply/card scopes needed by `im/v1/messages` APIs.
-- Grant `im:chat:create`, `im:chat:update`, and `im:chat.members:write_only` for the default dedicated task-chat mode.
-- Grant `im:chat:readonly` or equivalent chat read scope if you want to search or verify group information by API.
-- If event encryption is enabled in the app, set `feishu.encryptKey`; otherwise keep encryption disabled while using the bridge.
-- If card clicks show a Feishu-side error and `/doctor` never records `lastFeishuCardActionAt`, first confirm the app subscribes to the newer `card.action.trigger` callback with long connection. If the tenant only supports HTTP callbacks for cards, either leave `feishu.interactionMode` as `message_command` or configure a public relay/tunnel for `https://<public-url>/feishu/card`, set `feishu.cardActionTransport` to `http_callback`, and keep `feishu.interactionMode` as `hybrid`.
+## 飞书应用配置
 
-Operational notes:
+完整配置步骤见 [docs/FEISHU_APP_SETUP.md](docs/FEISHU_APP_SETUP.md)。
 
-- Do not run another `lark-cli event +subscribe` or a second bridge instance for the same app unless you are intentionally load-balancing. Feishu can split long-connection events between consumers, which makes one process appear to miss messages.
-- In mixed mode, `/feishu/events` or `/feishu/card` return `409` only for the transport that is still set to long connection.
+最小流程：
 
-## Feishu Commands
+1. 在飞书开放平台创建企业自建应用。
+2. 启用机器人，并把机器人拉入主控群。
+3. 在「事件订阅」里启用长连接。
+4. 订阅消息事件 `im.message.receive_v1`。
+5. 订阅卡片按钮事件 `card.action.trigger`，优先选择长连接。
+6. 授权机器人读取群内所有消息，这样群里不需要 `@` 机器人。
+7. 授权发送消息、回复消息、发送卡片、创建/更新群聊等权限。
+8. 发布应用版本，并在管理后台完成授权。
 
-Inside the allowed Feishu chat:
+常用权限清单：
 
-- `/codex` shows the control console.
-- `/doctor` returns bridge diagnostics.
-- `/tasks` lists recent local Codex sessions that can be claimed.
-- `/claim <codexThreadId>` binds an existing local Codex thread to a dedicated Feishu task chat.
-- `/projects` shows configured projects.
-- `/notify test` sends a test notification; `/notify history` shows notification history.
-- Any message inside a bound task chat continues that Codex task.
-- Inside a bound task chat, `/status`, `/logs`, `/queue`, `/queue cancel <queueId>`, `/run-tests`, `/retry`, `/analyze-failure`, `/stop`, and `/archive` map to the same operations as the current card buttons.
-- Approval cards include explicit commands: `/approval list`, `/approval detail <approvalId>`, `/approval once <approvalId>`, `/approval task <approvalId>`, and `/approval deny <approvalId>`.
+| 场景 | 权限 |
+| --- | --- |
+| 接收群消息 | `im:message`, `im:message:readonly` 或控制台提示的等价权限 |
+| 读取不用 @ 的群消息 | 机器人接收群聊全部消息能力 |
+| 发送文本/卡片 | `im:message:send_as_bot` |
+| 回复消息 | `im:message` 相关回复权限 |
+| 创建任务会话 | `im:chat:create` |
+| 修改任务会话标题/信息 | `im:chat:update` |
+| 邀请成员/设置机器人 | `im:chat.members:write_only` |
+| 查询群信息 | `im:chat:readonly` |
+| 长连接事件 | 事件订阅长连接，不需要公网回调地址 |
 
-## Local-Only Callback Workarounds
+不同租户控制台显示的权限名称可能略有差异，以飞书开放平台实际提示为准。
 
-When the bridge must run on a private local IP with no domain, use one of these patterns:
+## 配置文件
 
-- Long-connection hybrid mode, recommended: Feishu messages and newer card actions arrive through the bot long connection. Cards show buttons plus equivalent text commands, with no public local IP or domain required.
-- Message-command mode: disable buttons and use the command text only. This is the most conservative fallback when the app cannot receive card callbacks over long connection.
-- HTTP hybrid fallback: keep message commands, but expose only `/feishu/card` through a public HTTPS endpoint or tunnel when a tenant requires HTTP for cards.
-- Cloud relay: deploy a tiny public relay that accepts Feishu callbacks while the local bridge maintains an outbound WebSocket or polling connection to it. This avoids exposing the local machine, but adds a small hosted component.
-- Local custom protocol: use URL buttons such as `codex-feishu://...` on Feishu Desktop. This is Windows-desktop-only and less reliable across web/mobile clients.
-- Polling/search fallback: have the local bridge poll message history through OpenAPI. This avoids event delivery but needs extra message-history permissions and is slower than long connection.
-- Topic fallback: set `feishu.taskContainerMode` to `topic`, or leave `taskChatFallbackToTopic=true` so task creation falls back to Feishu `reply_in_thread` if chat creation is not authorized.
+默认配置路径：
 
-## Security Notes
+```text
+%USERPROFILE%\.feishu-codex\config.json
+```
 
-- Configure both `allowedUserIds` and `allowedChatIds` before using this outside a private test chat.
-- Do not expose `codex app-server` directly to a non-loopback network address.
-- This bridge starts Codex through stdio and keeps Feishu-facing HTTP as the only inbound control surface.
-- High-risk command approvals intentionally do not expose a "trust for task" button.
+可以通过环境变量或参数指定：
+
+```powershell
+$env:FEISHU_CODEX_CONFIG="D:\path\config.json"
+npm run start
+
+node dist/src/main.js serve --config D:\path\config.json
+```
+
+配置模板见 [config.example.json](config.example.json)。
+
+不要把真实 `appSecret`、`adminToken`、数据库、日志提交到仓库。`.gitignore` 已默认忽略 `.env`、本地日志、`dist`、`node_modules` 和 `.feishu-codex`。
+
+## 常用命令
+
+在飞书主控群里：
+
+- `/codex`：主控台。
+- `/doctor`：诊断。
+- `/tasks`：最近任务。
+- `/projects`：项目列表。
+- `/claim <threadId>`：绑定已有 Codex 线程。
+
+在任务会话里：
+
+- 直接发消息：继续当前任务。
+- `/status`：查看状态。
+- `/queue`：查看队列。
+- `/stop`：停止当前任务。
+- `/retry`：重试失败任务。
+- `/archive`：归档任务。
+
+## 本地 HTTP 服务说明
+
+默认不需要公网地址。HTTP 只用于：
+
+- `GET /healthz`
+- `GET /doctor`
+- `POST /feishu/events`，仅 HTTP callback fallback 使用。
+- `POST /feishu/card`，仅 HTTP card callback fallback 使用。
+
+如果飞书租户无法把卡片按钮事件配置成长连接，可以临时改成命令模式：
+
+```json
+{
+  "feishu": {
+    "interactionMode": "message_command",
+    "cardActionTransport": "long_connection"
+  }
+}
+```
+
+或者自行部署公网 relay，只暴露 `/feishu/card`。
+
+## 开发
+
+```powershell
+npm install
+npm run build
+npm test
+npm run check
+```
+
+生成 Codex app-server schema：
+
+```powershell
+npm run generate:codex-schema
+```
+
+## 安全边界
+
+- 个人使用优先，默认不做复杂团队权限模型。
+- 建议只在自己的私有主控群中使用。
+- 不要把 `codex app-server` 暴露到公网。
+- 默认 `danger-full-access` 和 `approvalPolicy=never` 意味着 Codex 可以直接操作本机文件和命令，请只在可信环境使用。
+- 如果要给多人使用，请先配置 `allowedUserIds` 和 `allowedChatIds`。
+
+## 开源文档
+
+- [飞书应用配置](docs/FEISHU_APP_SETUP.md)
+- [开源发布检查清单](docs/OPEN_SOURCE_RELEASE.md)
+- [Codex Desktop 同步优化方案](docs/CODEX_DESKTOP_SYNC_OPTIMIZATION.md)
+- [当前功能覆盖](docs/FULL_DESIGN_COVERAGE.md)
+- [用户体验优化计划](docs/UX_OPTIMIZATION_PLAN.md)
+
+## License
+
+MIT

@@ -126,12 +126,12 @@ test("notification outbox deduplicates completed turn notifications", () => {
 test("repository matches project path across Windows slash styles", () => {
   const { repo, cleanup } = makeTempRepo();
   try {
-    const project = repo.upsertProject({ name: "Playground", rootPath: "C:/Users/EPEANZ/Documents/Playground/" });
-    assert.equal(repo.findProjectForPath("C:\\Users\\EPEANZ\\Documents\\Playground")?.id, project.id);
-    assert.equal(repo.findProjectForPath("C:\\Users\\EPEANZ\\Documents\\Playground\\src")?.id, project.id);
+    const project = repo.upsertProject({ name: "Playground", rootPath: "C:/Users/Example/Documents/Playground/" });
+    assert.equal(repo.findProjectForPath("C:\\Users\\Example\\Documents\\Playground")?.id, project.id);
+    assert.equal(repo.findProjectForPath("C:\\Users\\Example\\Documents\\Playground\\src")?.id, project.id);
     assert.equal(
       repo.findProjectForContext({
-        cwd: "C:\\Users\\EPEANZ\\Documents\\Playground\\src"
+        cwd: "C:\\Users\\Example\\Documents\\Playground\\src"
       })?.id,
       project.id
     );
@@ -154,7 +154,7 @@ test("repository stores notification preferences, trusted subjects, devices and 
     const device = repo.upsertBridgeDevice({
       id: "machine-a",
       machineName: "Machine A",
-      codexHome: "C:\\Users\\EPEANZ\\.feishu-codex",
+      codexHome: "C:\\Users\\Example\\.feishu-codex",
       status: "active"
     });
     assert.equal(repo.getBridgeDevice("machine-a")?.machineName, "Machine A");
