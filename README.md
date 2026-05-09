@@ -9,6 +9,7 @@ Codex Feishu Helper 是一个本地桥接服务，用飞书群聊控制本机 Co
 - 新任务默认创建独立飞书任务会话；如果没有建群权限，可回退为群内话题。
 - Codex 默认模型是 `gpt-5.4`，思考等级是 `xhigh`，权限是 `danger-full-access`，审批策略是 `never`。
 - 任务过程会推送结构化进度卡片，完成后推送结构化最终结论。
+- 只在 Codex App 里单独发起、没有绑定飞书的对话，结束后也会在主控群提醒，并可一键接管到飞书继续。
 
 Codex Desktop 实时同步的长期优化方案见 [docs/CODEX_DESKTOP_SYNC_OPTIMIZATION.md](docs/CODEX_DESKTOP_SYNC_OPTIMIZATION.md)。
 
@@ -20,6 +21,7 @@ Codex Desktop 实时同步的长期优化方案见 [docs/CODEX_DESKTOP_SYNC_OPTI
 - 继续任务：在任务会话里直接发消息即可继续同一个 Codex 线程。
 - 任务列表：查看运行中、已完成、失败、中断、归档任务。
 - 任务设置：在飞书中查看和调整模型、思考等级。
+- Codex App 单独对话提醒：后台扫描最近结束的未绑定本机 Codex 对话，完成/失败/中断后推送到主控群。
 - 诊断恢复：检查飞书权限、长连接、Codex app-server、数据库、消息 outbox。
 - 本地守护：Windows 定时任务可每 5 分钟检查并拉起桥接服务。
 
@@ -192,6 +194,20 @@ node dist/src/main.js serve --config D:\path\config.json
 配置模板见 [config.example.json](config.example.json)。
 
 如果直接使用模板里的 `${FEISHU_CODEX_ADMIN_TOKEN}` 但没有设置环境变量，bridge 会在每次启动时生成临时 token。建议正式使用时在 `config.json` 里写固定 `server.adminToken`，这样诊断接口和后台守护更稳定。
+
+默认会扫描 Codex App 最近 24 小时内结束、但还没有绑定飞书的本机对话，并向 `feishu.defaultChatId` 推送一次提醒。提醒卡片包含摘要和 `[在飞书继续]`、`[查看摘要]`、`[忽略]` 操作；同一个 turn 会用 outbox 去重，不会反复提醒。
+
+相关配置：
+
+```json
+{
+  "bridge": {
+    "codexOnlyCompletionWatchEnabled": true,
+    "codexOnlyCompletionPollMs": 60000,
+    "codexOnlyCompletionLookbackMs": 86400000
+  }
+}
+```
 
 不要把真实 `appSecret`、`adminToken`、数据库、日志提交到仓库。`.gitignore` 已默认忽略 `.env`、本地日志、`dist`、`node_modules` 和 `.feishu-codex`。
 

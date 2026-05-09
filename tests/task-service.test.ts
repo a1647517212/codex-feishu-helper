@@ -1390,6 +1390,102 @@ test("claim summary for an already bound dedicated task stays as a control-group
   }
 });
 
+test("codex-only completed thread enqueues one control chat reminder", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.feishu.interactionMode = "hybrid";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const completedAt = Date.now();
+    codex.threads = [
+      {
+        id: "thr_codex_only_done",
+        name: "Codex App only task",
+        preview: "Codex App only task",
+        cwd: dir,
+        status: { type: "idle" },
+        updatedAt: completedAt
+      }
+    ];
+    (codex as unknown as { readThread: (threadId: string) => Promise<Record<string, unknown>> }).readThread = async () => ({
+      thread: {
+        id: "thr_codex_only_done",
+        name: "Codex App only task",
+        preview: "Codex App only task",
+        cwd: dir,
+        status: { type: "idle" },
+        updatedAt: completedAt,
+        turns: [
+          {
+            id: "turn_codex_only_done",
+            status: "completed",
+            completedAt,
+            items: [
+              { type: "reasoning", summary: [{ text: "完成了需求拆解和验证。" }] },
+              { type: "agentMessage", text: "最终结论：这个任务已经处理完成。" }
+            ]
+          }
+        ]
+      }
+    });
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    assert.equal(await service.scanCodexOnlyCompletions(), 1);
+    assert.equal(await service.scanCodexOnlyCompletions(), 0);
+    const outbox = repo.listDueOutbox(10).filter((item) => item.dedupeKey.startsWith("codex-only:"));
+    assert.equal(outbox.length, 1);
+    assert.equal(outbox[0]?.notificationType, "task_completed");
+    assert.equal(outbox[0]?.feishuChatId, "chat_1");
+    const payload = JSON.stringify(outbox[0]?.payload.card ?? {});
+    assert.equal(payload.includes("Codex App 任务已完成"), true);
+    assert.equal(payload.includes("最终结论：这个任务已经处理完成。"), true);
+    assert.equal(collectButtons(outbox[0]?.payload.card).some((button) => buttonAction(button) === "claim_thread"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("codex-only completion scan skips bound, ignored and stale threads", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const now = Date.now();
+    const stale = now - config.bridge.codexOnlyCompletionLookbackMs - 1000;
+    codex.threads = [
+      { id: "thr_bound_done", name: "Bound done", preview: "Bound done", cwd: dir, status: { type: "idle" }, updatedAt: now },
+      { id: "thr_ignored_done", name: "Ignored done", preview: "Ignored done", cwd: dir, status: { type: "idle" }, updatedAt: now },
+      { id: "thr_stale_done", name: "Stale done", preview: "Stale done", cwd: dir, status: { type: "idle" }, updatedAt: stale }
+    ];
+    (codex as unknown as { readThread: (threadId: string) => Promise<Record<string, unknown>> }).readThread = async (threadId: string) => ({
+      thread: {
+        id: threadId,
+        name: threadId,
+        cwd: dir,
+        status: { type: "idle" },
+        updatedAt: threadId === "thr_stale_done" ? stale : now,
+        turns: [{ id: `turn_${threadId}`, status: "completed", completedAt: threadId === "thr_stale_done" ? stale : now }]
+      }
+    });
+    repo.createOrUpdateBinding({
+      codexThreadId: "thr_bound_done",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Bound done",
+      status: "completed",
+      createdFrom: "manual_import"
+    });
+    repo.ignoreThread({ codexThreadId: "thr_ignored_done", title: "Ignored done", createdByFeishuUserId: "user_1" });
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    assert.equal(await service.scanCodexOnlyCompletions(), 0);
+    assert.equal(repo.listDueOutbox(10).filter((item) => item.dedupeKey.startsWith("codex-only:")).length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
 test("unclassified command lists only unclassified and non-ignored tasks", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {

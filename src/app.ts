@@ -43,6 +43,7 @@ export class BridgeApp {
     await this.codex.start();
     await this.tasks.bootstrapRuntimeState();
     this.outbox.start();
+    this.tasks.startCodexOnlyCompletionWatch();
     if (this.http.shouldStart()) {
       await this.http.start();
       this.httpStarted = true;
@@ -54,6 +55,7 @@ export class BridgeApp {
 
   async stop(): Promise<void> {
     await this.longConnection.stop();
+    this.tasks.stopCodexOnlyCompletionWatch();
     this.outbox.stop();
     await this.http.stop();
     await this.codex.stop();

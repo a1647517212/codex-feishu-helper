@@ -79,7 +79,10 @@ export const makeConfig = (dir: string): BridgeConfig => ({
     queueMergeWindowMs: 300000,
     outboxRetryBaseMs: 10,
     outboxMaxAttempts: 3,
-    threadListLimit: 20
+    threadListLimit: 20,
+    codexOnlyCompletionWatchEnabled: true,
+    codexOnlyCompletionPollMs: 60000,
+    codexOnlyCompletionLookbackMs: 24 * 60 * 60 * 1000
   },
   projects: []
 });

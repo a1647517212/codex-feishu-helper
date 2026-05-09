@@ -115,14 +115,20 @@ const ConfigSchema = z.object({
       queueMergeWindowMs: z.number().int().positive().default(300000),
       outboxRetryBaseMs: z.number().int().positive().default(15000),
       outboxMaxAttempts: z.number().int().positive().default(8),
-      threadListLimit: z.number().int().positive().default(20)
+      threadListLimit: z.number().int().positive().default(20),
+      codexOnlyCompletionWatchEnabled: z.boolean().default(true),
+      codexOnlyCompletionPollMs: z.number().int().positive().default(60000),
+      codexOnlyCompletionLookbackMs: z.number().int().positive().default(24 * 60 * 60 * 1000)
     })
     .default({
       maxFeishuTextLength: 3500,
       queueMergeWindowMs: 300000,
       outboxRetryBaseMs: 15000,
       outboxMaxAttempts: 8,
-      threadListLimit: 20
+      threadListLimit: 20,
+      codexOnlyCompletionWatchEnabled: true,
+      codexOnlyCompletionPollMs: 60000,
+      codexOnlyCompletionLookbackMs: 24 * 60 * 60 * 1000
     }),
   projects: z
     .array(

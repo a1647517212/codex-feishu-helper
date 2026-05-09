@@ -889,6 +889,13 @@ export class Repository {
       .map((row) => mapOutbox(row as DbRow));
   }
 
+  getOutboxByDedupeKey(dedupeKey: string): NotificationOutboxItem | null {
+    const row = this.database.db.prepare("SELECT * FROM notification_outbox WHERE dedupe_key = ?").get(dedupeKey) as
+      | DbRow
+      | undefined;
+    return row ? mapOutbox(row) : null;
+  }
+
   listRecentOutbox(limit = 20): NotificationOutboxItem[] {
     return this.database.db
       .prepare("SELECT * FROM notification_outbox ORDER BY created_at DESC LIMIT ?")

@@ -49,7 +49,10 @@
     "queueMergeWindowMs": 300000,
     "outboxRetryBaseMs": 15000,
     "outboxMaxAttempts": 8,
-    "threadListLimit": 20
+    "threadListLimit": 20,
+    "codexOnlyCompletionWatchEnabled": true,
+    "codexOnlyCompletionPollMs": 60000,
+    "codexOnlyCompletionLookbackMs": 86400000
   },
   "projects": []
 }

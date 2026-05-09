@@ -136,6 +136,35 @@ export class CardRenderer {
     return card("电脑上的 Codex 任务", elements.length > 0 ? elements : [text("没有发现可接管的本机 Codex 任务。")]);
   }
 
+  codexOnlyCompletionCard(thread: {
+    id: string;
+    title: string;
+    status: string;
+    cwd: string | null;
+    projectName?: string | null;
+    updatedAt?: number | null;
+    summary?: string | null;
+  }): FeishuCard {
+    const lines = [
+      thread.projectName ? kvLine("项目", thread.projectName) : null,
+      kvLine("任务", thread.title),
+      kvLine("状态", statusText(thread.status)),
+      thread.cwd ? kvLine("工作目录", thread.cwd) : null,
+      thread.updatedAt ? kvLine("结束时间", formatTime(new Date(thread.updatedAt).toISOString())) : null,
+      thread.summary ? `\n**摘要**\n\n${thread.summary}` : null
+    ].filter(Boolean);
+    const elements: Record<string, unknown>[] = [text(lines.join("\n"))];
+    pushActionRows(elements, this.interactionMode, [
+      button("在飞书继续", "claim_thread", { codexThreadId: thread.id }),
+      button("查看摘要", "claim_summary", { codexThreadId: thread.id }),
+      button("忽略", "claim_ignore", { codexThreadId: thread.id })
+    ]);
+    if (this.interactionMode === "message_command") {
+      elements.push(commandText([`/claim ${thread.id}`, `/claim summary ${thread.id}`, `/claim ignore ${thread.id}`]));
+    }
+    return card(codexOnlyCompletionTitle(thread.status), elements);
+  }
+
   projectListCard(
     projects: Array<{ id: string; name: string; rootPath: string; feishuChatId: string | null }>,
     options: { pendingPromptId?: string | null } = {}
@@ -1279,6 +1308,13 @@ const subAgentStatusText = (status: string): string =>
     notFound: "未找到",
     failed: "失败"
   })[status] ?? status;
+
+const codexOnlyCompletionTitle = (status: string): string =>
+  ({
+    completed: "Codex App 任务已完成",
+    failed: "Codex App 任务失败",
+    interrupted: "Codex App 任务已中断"
+  })[status] ?? "Codex App 任务已结束";
 
 const codexConnectionText = (mode: string, kind: string): string => {
   const modeText = ({ auto: "自动", desktop_proxy: "Desktop代理", standalone: "独立进程" } as Record<string, string>)[mode] ?? mode;

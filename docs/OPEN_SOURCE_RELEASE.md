@@ -31,6 +31,7 @@ rg -n -e "cli_[A-Za-z0-9]+" -e "App Secret" -e "appSecret" -e "app_secret" -e "t
 - [x] README 说明默认不需要公网 IP。
 - [x] README 说明默认权限风险：`danger-full-access` 和 `approvalPolicy=never`。
 - [x] README 明确默认一任务一独立群模式需要 `im:chat`、`im:chat:create`、`im:chat:update`。
+- [x] README 说明 Codex App 单独对话完成提醒和对应配置项。
 - [x] 飞书权限和授权步骤已写入 `docs/FEISHU_APP_SETUP.md`。
 - [x] `docs/FEISHU_APP_SETUP.md` 区分默认必选权限、可选权限、话题 fallback。
 - [x] Codex Desktop 同步优化方案已写入 `docs/CODEX_DESKTOP_SYNC_OPTIMIZATION.md`。

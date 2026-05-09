@@ -8,6 +8,7 @@ import type {
   FeishuCardAction,
   FeishuIncomingMessage,
   NotificationLevel,
+  NotificationType,
   PendingApproval,
   Project,
   SessionBinding,
@@ -74,6 +75,8 @@ export class TaskService {
   private readonly security: SecurityPolicy;
   private readonly progressState = new Map<string, { text: string; lastSentLength: number; lastSentAt: number }>();
   private readonly progressCards = new Map<string, { messageId: string; sections: Map<string, ProgressSection>; lastUpdatedAt: number }>();
+  private codexOnlyCompletionTimer: NodeJS.Timeout | null = null;
+  private codexOnlyCompletionScanRunning = false;
 
   constructor(
     private readonly config: BridgeConfig,
@@ -124,6 +127,82 @@ export class TaskService {
   async bootstrapRuntimeState(): Promise<void> {
     await this.syncCodexAppWorkspaces();
     await this.reconcilePersistedBindings();
+    await this.scanCodexOnlyCompletions();
+  }
+
+  startCodexOnlyCompletionWatch(): void {
+    if (!this.config.bridge.codexOnlyCompletionWatchEnabled) return;
+    if (this.codexOnlyCompletionTimer) return;
+    this.codexOnlyCompletionTimer = setInterval(() => {
+      this.scanCodexOnlyCompletions().catch((error) => {
+        this.logger.warn("codex-only completion scan failed", { error: String(error) });
+      });
+    }, this.config.bridge.codexOnlyCompletionPollMs);
+  }
+
+  stopCodexOnlyCompletionWatch(): void {
+    if (this.codexOnlyCompletionTimer) clearInterval(this.codexOnlyCompletionTimer);
+    this.codexOnlyCompletionTimer = null;
+  }
+
+  async scanCodexOnlyCompletions(): Promise<number> {
+    const defaultChatId = this.config.feishu.defaultChatId;
+    if (!defaultChatId) return 0;
+    if (!this.config.bridge.codexOnlyCompletionWatchEnabled) return 0;
+    if (this.codexOnlyCompletionScanRunning) return 0;
+    this.codexOnlyCompletionScanRunning = true;
+    try {
+      const threads = await this.codex.listThreads(this.config.bridge.threadListLimit);
+      let enqueued = 0;
+      for (const thread of threads) {
+        if (this.repo.findBindingByThreadId(thread.id)) continue;
+        if (this.repo.findIgnoredThread(thread.id)) continue;
+        const detail = await this.codex.readThread(thread.id, true).catch((error) => {
+          this.logger.warn("codex-only completion thread read failed", { threadId: thread.id, error: String(error) });
+          return null;
+        });
+        const state = normalizeThreadCompletionState(thread, detail);
+        if (!state || !isRecentCodexOnlyCompletion(state.updatedAt, this.config.bridge.codexOnlyCompletionLookbackMs)) {
+          continue;
+        }
+        const detailThread = detail ? normalizeThreadFromDetail(thread.id, detail) : thread;
+        const threadCwd = detailThread.cwd ?? thread.cwd;
+        const threadTitle = detailThread.title ?? detailThread.preview ?? thread.title ?? thread.preview ?? thread.id;
+        const project = this.repo.findProjectForPath(threadCwd);
+        const summary =
+          state.report?.finalResult
+            ? truncatePlain(singleLine(state.report.finalResult), 220)
+            : state.report?.reasoningSummary
+              ? truncatePlain(singleLine(state.report.reasoningSummary), 220)
+              : detailThread.preview ?? thread.preview
+                ? truncatePlain(singleLine(detailThread.preview ?? thread.preview ?? ""), 220)
+                : null;
+        const before = this.repo.getOutboxByDedupeKey(codexOnlyCompletionDedupeKey(thread.id, state.turnId, state.status));
+        this.repo.enqueueOutbox({
+          notificationType: codexOnlyCompletionNotificationType(state.status),
+          feishuChatId: defaultChatId,
+          payload: {
+            card: this.cards.codexOnlyCompletionCard({
+              id: thread.id,
+              title: threadTitle,
+              status: state.status,
+              cwd: threadCwd,
+              projectName: project?.name ?? null,
+              updatedAt: state.updatedAt,
+              summary
+            })
+          },
+          dedupeKey: codexOnlyCompletionDedupeKey(thread.id, state.turnId, state.status)
+        });
+        if (!before) enqueued += 1;
+      }
+      if (enqueued > 0) {
+        this.logger.info("codex-only completion reminders enqueued", { count: enqueued });
+      }
+      return enqueued;
+    } finally {
+      this.codexOnlyCompletionScanRunning = false;
+    }
   }
 
   async syncCodexAppWorkspaces(): Promise<WorkspaceImportSummary> {
@@ -2864,6 +2943,67 @@ const normalizeThreadFromDetail = (threadId: string, detail: Record<string, unkn
     agentRole: asString(rawThread.agentRole),
     raw: rawThread
   };
+};
+
+type CodexOnlyCompletionState = {
+  status: "completed" | "failed" | "interrupted";
+  turnId: string;
+  updatedAt: number | null;
+  report: ThreadReport | null;
+};
+
+const normalizeThreadCompletionState = (
+  summary: CodexThreadSummary,
+  detail: Record<string, unknown> | null
+): CodexOnlyCompletionState | null => {
+  const rawThread = detail && detail.thread && typeof detail.thread === "object"
+    ? (detail.thread as Record<string, unknown>)
+    : detail;
+  const turns = rawThread && typeof rawThread === "object" && Array.isArray(rawThread.turns) ? rawThread.turns : [];
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = turns[index];
+    if (!turn || typeof turn !== "object") continue;
+    const object = turn as Record<string, unknown>;
+    const status = normalizeCodexOnlyTurnStatus(object.status);
+    if (!status) continue;
+    const turnId = asString(object.id) ?? `turn_${index}`;
+    return {
+      status,
+      turnId,
+      updatedAt: numberTimestamp(object.completedAt) ?? numberTimestamp(object.updatedAt) ?? numberTimestamp(rawThread?.updatedAt) ?? summary.updatedAt,
+      report: mergeThreadReports(detail ? extractThreadReport(detail) : null, extractTurnReport(object))
+    };
+  }
+  return null;
+};
+
+const normalizeCodexOnlyTurnStatus = (status: unknown): "completed" | "failed" | "interrupted" | null => {
+  if (status === "completed") return "completed";
+  if (status === "failed") return "failed";
+  if (status === "interrupted" || status === "cancelled") return "interrupted";
+  return null;
+};
+
+const numberTimestamp = (value: unknown): number | null => {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  return value > 0 && value < 10_000_000_000 ? value * 1000 : value;
+};
+
+const isRecentCodexOnlyCompletion = (updatedAt: number | null, lookbackMs: number): boolean => {
+  if (!updatedAt) return false;
+  return Date.now() - updatedAt <= lookbackMs;
+};
+
+const codexOnlyCompletionDedupeKey = (
+  threadId: string,
+  turnId: string,
+  status: "completed" | "failed" | "interrupted"
+): string => `codex-only:${threadId}:${turnId}:${status}`;
+
+const codexOnlyCompletionNotificationType = (status: "completed" | "failed" | "interrupted"): NotificationType => {
+  if (status === "completed") return "task_completed";
+  if (status === "interrupted") return "task_interrupted";
+  return "task_failed";
 };
 
 const summarizeThreadDetail = (detail: Record<string, unknown>): string => {
