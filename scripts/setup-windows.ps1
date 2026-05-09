@@ -1,7 +1,9 @@
 [CmdletBinding()]
 param(
   [string]$ConfigPath = "$env:USERPROFILE\.feishu-codex\config.json",
-  [switch]$SkipInstall
+  [switch]$SkipInstall,
+  [switch]$SkipShortcuts,
+  [switch]$InstallWatchdog
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,8 +34,7 @@ function Invoke-CheckedCommand {
   param(
     [Parameter(Mandatory = $true)]
     [string]$FilePath,
-    [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$Arguments
+    [string[]]$Arguments = @()
   )
   & $FilePath @Arguments
   if ($LASTEXITCODE -ne 0) {
@@ -75,11 +76,11 @@ Write-Host "codex: $((& $codexPath --version).Trim())"
 
 if (-not $SkipInstall) {
   Write-Step "Installing npm dependencies"
-  Invoke-CheckedCommand -FilePath $npmPath install
+  Invoke-CheckedCommand -FilePath $npmPath -Arguments @("install")
 }
 
 Write-Step "Building project"
-Invoke-CheckedCommand -FilePath $npmPath run build
+Invoke-CheckedCommand -FilePath $npmPath -Arguments @("run", "build")
 
 Write-Step "Preparing config"
 $configDirectory = Split-Path -Parent $ConfigPath
@@ -91,9 +92,36 @@ if (-not (Test-Path -LiteralPath $ConfigPath)) {
   Write-Host "Config already exists: $ConfigPath"
 }
 
+if (-not $SkipShortcuts) {
+  Write-Step "Installing desktop shortcuts"
+  Invoke-CheckedCommand -FilePath "powershell.exe" -Arguments @(
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    (Join-Path $repoRoot "scripts\install-user-shortcuts.ps1"),
+    "-RepoRoot",
+    $repoRoot
+  )
+}
+
+if ($InstallWatchdog) {
+  Write-Step "Installing watchdog scheduled task"
+  Invoke-CheckedCommand -FilePath "powershell.exe" -Arguments @(
+    "-NoProfile",
+    "-ExecutionPolicy",
+    "Bypass",
+    "-File",
+    (Join-Path $repoRoot "scripts\install-watchdog.ps1"),
+    "-RepoRoot",
+    $repoRoot
+  )
+}
+
 Write-Host ""
-Write-Host "Next steps:"
-Write-Host "1. Edit config: notepad `"$ConfigPath`""
-Write-Host "2. Fill feishu.appId, feishu.appSecret, feishu.defaultChatId, and a local server.adminToken"
-Write-Host "3. Start bridge: npm run start"
-Write-Host "4. In Feishu group, send /doctor then /codex"
+Write-Host "Ready."
+Write-Host "1. Open the desktop shortcut: Codex Feishu Helper"
+Write-Host "2. Click Open Config, fill feishu.appId, feishu.appSecret, feishu.defaultChatId, and server.adminToken"
+Write-Host "3. Click Start Bridge"
+Write-Host "4. Click Launch Shared Desktop when you want Codex Desktop to use the shared app-server"
+Write-Host "5. In Feishu group, send /doctor then /codex"

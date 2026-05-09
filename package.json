@@ -11,6 +11,11 @@
     "dev": "tsx src/main.ts serve",
     "start": "node dist/src/main.js serve",
     "doctor": "tsx src/main.ts doctor",
+    "desktop": "powershell -ExecutionPolicy Bypass -File scripts/start-codex-desktop-canonical.ps1",
+    "desktop:shortcut": "powershell -ExecutionPolicy Bypass -File scripts/install-user-shortcuts.ps1",
+    "panel": "powershell -ExecutionPolicy Bypass -File scripts/open-control-panel.ps1",
+    "shortcuts": "powershell -ExecutionPolicy Bypass -File scripts/install-user-shortcuts.ps1",
+    "watchdog": "powershell -ExecutionPolicy Bypass -File scripts/install-watchdog.ps1",
     "generate:codex-schema": "node scripts/generate-codex-schema.mjs",
     "test": "node --no-warnings=ExperimentalWarning --test --import tsx \"tests/**/*.test.ts\"",
     "check": "npm run build && npm test"

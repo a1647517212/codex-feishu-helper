@@ -41,7 +41,9 @@ codex --version
 
 ## 快速启动
 
-Windows 推荐使用初始化脚本：
+Windows 推荐走一次初始化，后面都用桌面入口：
+
+如果你是下载 ZIP 或已经拿到仓库目录，直接双击根目录的 `Install Codex Feishu Helper.cmd` 即可。
 
 ```powershell
 git clone https://github.com/a1647517212/codex-feishu-helper.git
@@ -56,8 +58,27 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1
 - 构建项目。
 - 创建用户配置目录 `%USERPROFILE%\.feishu-codex`。
 - 如果配置不存在，复制 `config.example.json` 为 `%USERPROFILE%\.feishu-codex\config.json`。
+- 在桌面创建 `Codex Feishu Helper` 控制面板快捷方式。
+- 在桌面创建 `Codex Shared Server` 同服启动快捷方式。
 
-然后编辑配置：
+日常使用不需要记命令，直接双击桌面的 `Codex Feishu Helper`：
+
+| 按钮 | 用途 |
+| --- | --- |
+| `Setup / Repair` | 重新检查依赖、构建项目、修复桌面快捷方式 |
+| `Open Config` | 打开 `%USERPROFILE%\.feishu-codex\config.json` |
+| `Start Bridge` | 后台启动飞书桥接服务 |
+| `Launch Shared Desktop` | 用同一个 canonical app-server 启动 Codex Desktop |
+| `Install Watchdog` | 安装 5 分钟一次的后台保活任务 |
+| `Refresh` | 刷新配置、构建产物、bridge、app-server、SOCKS、Desktop 状态 |
+
+仓库根目录也提供了两个可双击入口：
+
+- `Install Codex Feishu Helper.cmd`：首次安装或修复。
+- `Codex Feishu Helper.cmd`：打开控制面板。
+- `Start Shared Codex Desktop.cmd`：直接启动同服 Codex Desktop。
+
+首次使用时，在控制面板点 `Open Config`，填写配置：
 
 ```powershell
 notepad $env:USERPROFILE\.feishu-codex\config.json
@@ -103,7 +124,7 @@ notepad $env:USERPROFILE\.feishu-codex\config.json
 }
 ```
 
-启动服务：
+如果你更习惯命令行，也可以手动启动服务：
 
 ```powershell
 npm run start
@@ -131,19 +152,26 @@ npm run doctor
 }
 ```
 
-然后用同一个 URL 启动 Codex Desktop：
+然后用控制面板的 `Launch Shared Desktop` 打开 Codex Desktop。命令行备用方式：
 
 ```powershell
-$env:CODEX_APP_SERVER_WS_URL="ws://127.0.0.1:47931"
-Start-Process "C:\Program Files\WindowsApps\OpenAI.Codex_...\app\Codex.exe"
+npm run desktop
 ```
+
+如果桌面快捷方式被删，可以重新创建：
+
+```powershell
+npm run shortcuts
+```
+
+桌面上的 `Codex Shared Server` 会自动检查 bridge、等待 canonical app-server 和 SOCKS5 代理就绪，然后用同一个 `CODEX_APP_SERVER_WS_URL` 启动 Codex Desktop。若已有 Codex Desktop 正在运行，启动器默认会先询问是否关闭并重启，避免误关当前工作窗口。你也可以创建后在 Windows 桌面上把快捷方式重命名为中文名称。
 
 当前 Codex Desktop 版本会通过 `127.0.0.1:1080` SOCKS5 代理访问 `CODEX_APP_SERVER_WS_URL`，所以启用 Desktop 接入时需要 `desktopSocksProxyEnabled=true`，或确保本机已有 1080 代理能转发到该 WebSocket 端口。`/doctor` 会显示 `WebSocket` 和 `Desktop SOCKS` 状态。
 
 如果希望后台保活：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\install-watchdog.ps1
+npm run watchdog
 ```
 
 ## 飞书应用配置
