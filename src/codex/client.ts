@@ -196,7 +196,7 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
       threadId,
       input: [textInput(text)],
       cwd: options.cwd ?? undefined,
-      model: options.model ?? undefined,
+      model: options.model ?? this.config.codex.defaultModel,
       effort: options.reasoningEffort ?? this.config.codex.defaultReasoningEffort,
       approvalPolicy: this.config.codex.defaultApprovalPolicy,
       sandboxPolicy: sandboxPolicyFromMode(this.config.codex.defaultSandboxMode)

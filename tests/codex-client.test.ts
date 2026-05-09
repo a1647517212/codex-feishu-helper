@@ -67,11 +67,11 @@ test("startThread and startTurn pass personal default model, reasoning and full 
 
     const threadStart = calls.find((call) => call.method === "thread/start")?.params;
     const turnStart = calls.find((call) => call.method === "turn/start")?.params;
-    assert.equal(threadStart?.model, "gpt-5.4");
+    assert.equal(threadStart?.model, "gpt-5.5");
     assert.equal(threadStart?.approvalPolicy, "never");
     assert.equal(threadStart?.sandbox, "danger-full-access");
     assert.deepEqual(threadStart?.config, { model_reasoning_effort: "xhigh" });
-    assert.equal(turnStart?.model, undefined);
+    assert.equal(turnStart?.model, "gpt-5.5");
     assert.equal(turnStart?.effort, "xhigh");
     assert.equal(turnStart?.approvalPolicy, "never");
     assert.deepEqual(turnStart?.sandboxPolicy, { type: "dangerFullAccess" });

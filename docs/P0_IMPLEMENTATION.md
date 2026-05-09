@@ -108,7 +108,7 @@ Verified with the bot in group `codex-ep` using long connection:
 - `POST /feishu/events` returned `409` in long-connection mode, confirming HTTP callback fallback is disabled by default.
 - After waiting for long-connection retry windows, the latest `/codex` delivery produced one card and one `incoming_messages` row.
 - A temporary `lark-cli event +subscribe` process was confirmed to split events away from the bridge; only one long-connection consumer should run for this app in normal operation.
-- New threads now default to `gpt-5.4`, `xhigh`, `danger-full-access`, and `approvalPolicy=never`.
+- New threads now default to `gpt-5.5`, `xhigh`, `danger-full-access`, and `approvalPolicy=never`.
 - New tasks default to dedicated Feishu task chats; topic mode is fallback-only.
 - Task completion messages and claim summaries no longer echo raw PowerShell or shell command text back into Feishu.
 - Sub-agent spawn/wait records are projected into Feishu status/progress/detail/result cards, including requested model and reasoning effort when Codex exposes them.

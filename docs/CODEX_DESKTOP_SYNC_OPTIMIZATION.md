@@ -48,6 +48,8 @@ OpenAI Codex app-server 支持以下 transport：
 - Codex Desktop 26.506.2212.0 会读取 `CODEX_APP_SERVER_WS_URL`，但 WebSocket transport 硬编码通过 `socks5h://127.0.0.1:1080` 访问目标 URL。
 - 当前项目已提供 Desktop WS 直连补丁：复制一份可写 Codex Desktop 到用户目录后，只补丁副本的 `app.asar`，把 WebSocket transport 的硬编码 SOCKS agent 改成直连。这样不破坏 WindowsApps 官方包。
 - 因此推荐路径是安装直连补丁后让 Desktop 直接接入 bridge-owned app-server；不安装补丁时，仍可用本机 `127.0.0.1:1080` SOCKS5 代理作为兼容路径。
+- 2026-05-09 再次实测 `codex app-server proxy` 连接官方 Desktop 当前 server，仍失败在 `%USERPROFILE%\.codex\app-server-control\app-server-control.sock`，报 `os error 10050`；同时本机该 control 目录不存在。因此“让 bridge 直接接官方 Desktop 当前 server”目前不是可落地稳定路径。
+- 补丁版 Desktop 是可删除、可重建的用户目录副本，不修改 WindowsApps 官方包；但它不会自动继承 Microsoft Store 后续升级。官方升级后需要重新执行 `Install Patched Desktop` 复制新版本并重打直连补丁。如果优先要求跟随官方升级，应使用未补丁 SOCKS 兼容路径。
 
 社区 issue 里也有相同方向的讨论：
 

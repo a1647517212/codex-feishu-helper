@@ -7,7 +7,7 @@ Codex Feishu Helper 是一个本地桥接服务，用飞书群聊控制本机 Co
 - 飞书事件默认走长连接，不要求公网 IP、域名或内网穿透。
 - HTTP 服务默认只监听 `127.0.0.1`，用于健康检查、诊断和可选 HTTP 回调 fallback。
 - 新任务默认创建独立飞书任务会话；如果没有建群权限，可回退为群内话题。
-- Codex 默认模型是 `gpt-5.4`，思考等级是 `xhigh`，权限是 `danger-full-access`，审批策略是 `never`。
+- Codex 默认模型是 `gpt-5.5`，思考等级是 `xhigh`，权限是 `danger-full-access`，审批策略是 `never`。
 - 任务过程会推送结构化进度卡片，完成后推送结构化最终结论。
 - 只在 Codex App 里单独发起、没有绑定飞书的对话，结束后也会在主控群提醒，并可一键接管到飞书继续。
 
@@ -179,6 +179,10 @@ npm run shortcuts
 - 保留 `Remove Patched Desktop` 删除副本，不改 WindowsApps 官方包。
 
 安装补丁版副本后，`Launch Shared Desktop` 会优先启动这个副本。`CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:<port>` 会直连 bridge-owned canonical app-server，不再需要 `desktopSocksProxyEnabled=true`。如果当前已经打开了 Microsoft Store 版 Codex Desktop，它仍在使用自己启动的 app-server；需要点 `Launch Shared Desktop` 重启到补丁版副本后，Desktop 才会和 bridge 使用同一个 canonical app-server。Codex Desktop 每次更新后，重新点一次 `Install Patched Desktop` 即可把新版本复制并补丁。
+
+补丁版副本不会自动继承 Microsoft Store 版的后续升级。它的好处是完全不改官方安装目录，可删除、可重建；代价是官方升级后需要重新执行 `Install Patched Desktop`。如果希望一直使用官方自动升级版本，请优先使用未补丁兼容路径：`desktopSocksProxyEnabled=true`，由 bridge 提供 `127.0.0.1:1080` 到 canonical app-server 的本机 SOCKS5 转发。
+
+理论上最理想的是 bridge 直接接入官方 Desktop 正在使用的 app-server。但当前 Windows 实测 `codex app-server proxy` 仍会失败在 `%USERPROFILE%\.codex\app-server-control\app-server-control.sock`，错误为 `os error 10050`；且该 control 目录当前不存在。因此现阶段不能把“接官方 Desktop 当前 server”当成稳定方案，只能使用 canonical WebSocket 统一 runtime，或等待官方提供稳定的本地 app-server ingress。
 
 命令行备用方式：
 

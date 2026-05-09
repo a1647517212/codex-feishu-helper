@@ -50,7 +50,7 @@ export const makeConfig = (dir: string): BridgeConfig => ({
     desktopSocksProxyPort: 1080,
     desktopSocksProxyAllowExisting: false,
     experimentalApi: true,
-    defaultModel: "gpt-5.4",
+    defaultModel: "gpt-5.5",
     defaultReasoningEffort: "xhigh",
     defaultSandboxMode: "danger-full-access",
     defaultApprovalPolicy: "never",
