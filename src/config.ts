@@ -11,6 +11,7 @@ const TaskChatTypeSchema = z.enum(["private", "public"]);
 const SandboxModeSchema = z.enum(["read-only", "workspace-write", "danger-full-access"]);
 const ApprovalPolicySchema = z.enum(["untrusted", "on-failure", "on-request", "never"]);
 const HttpServerModeSchema = z.enum(["auto", "enabled", "disabled"]);
+const CodexConnectionModeSchema = z.enum(["auto", "desktop_proxy", "standalone", "canonical_websocket"]);
 
 const stringArrayFromEnv = z
   .union([z.array(z.string()), z.string()])
@@ -44,8 +45,14 @@ const ConfigSchema = z.object({
     .object({
       command: z.string().default("codex"),
       args: z.array(z.string()).default(["app-server"]),
-      connectionMode: z.enum(["auto", "desktop_proxy", "standalone"]).default("auto"),
+      connectionMode: CodexConnectionModeSchema.default("auto"),
       proxyArgs: z.array(z.string()).default(["app-server", "proxy"]),
+      websocketListenUrl: z.string().default("ws://127.0.0.1:47931"),
+      websocketUrl: z.string().optional(),
+      desktopSocksProxyEnabled: z.boolean().default(false),
+      desktopSocksProxyHost: z.string().default("127.0.0.1"),
+      desktopSocksProxyPort: z.number().int().positive().max(65535).default(1080),
+      desktopSocksProxyAllowExisting: z.boolean().default(false),
       experimentalApi: z.boolean().default(true),
       defaultModel: z.string().default("gpt-5.4"),
       defaultReasoningEffort: z.string().default("xhigh"),
@@ -60,6 +67,11 @@ const ConfigSchema = z.object({
       args: ["app-server"],
       connectionMode: "auto",
       proxyArgs: ["app-server", "proxy"],
+      websocketListenUrl: "ws://127.0.0.1:47931",
+      desktopSocksProxyEnabled: false,
+      desktopSocksProxyHost: "127.0.0.1",
+      desktopSocksProxyPort: 1080,
+      desktopSocksProxyAllowExisting: false,
       experimentalApi: true,
       defaultModel: "gpt-5.4",
       defaultReasoningEffort: "xhigh",

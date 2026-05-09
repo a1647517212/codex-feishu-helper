@@ -52,6 +52,8 @@ export class DiagnosticsService {
       codexCommand: this.config.codex.command,
       codexConnectionMode: this.config.codex.connectionMode,
       codexConnectionKind: this.codex.connectionKind,
+      codexWebSocketUrl: this.codex.webSocketUrl,
+      codexDesktopSocksProxy: this.codex.desktopSocksProxySnapshot,
       codexAvailable: await this.isCodexAvailable(),
       appServerStatus: this.codex.status,
       feishuConfigured: Boolean(this.config.feishu.appId && this.config.feishu.appSecret && this.config.feishu.defaultChatId),

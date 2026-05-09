@@ -42,6 +42,12 @@ export const makeConfig = (dir: string): BridgeConfig => ({
     args: ["app-server"],
     connectionMode: "standalone",
     proxyArgs: ["app-server", "proxy"],
+    websocketListenUrl: "ws://127.0.0.1:47931",
+    websocketUrl: undefined,
+    desktopSocksProxyEnabled: false,
+    desktopSocksProxyHost: "127.0.0.1",
+    desktopSocksProxyPort: 1080,
+    desktopSocksProxyAllowExisting: false,
     experimentalApi: true,
     defaultModel: "gpt-5.4",
     defaultReasoningEffort: "xhigh",
@@ -190,6 +196,8 @@ export class MockFeishu implements FeishuSender {
 export class MockCodex {
   status = "connected" as const;
   connectionKind = "standalone" as const;
+  webSocketUrl = null;
+  desktopSocksProxySnapshot = null;
   notifications: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
   requests: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
   turns: Array<{ threadId: string; text: string }> = [];

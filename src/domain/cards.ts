@@ -740,6 +740,10 @@ export class CardRenderer {
           `Codex：${snapshot.codexAvailable ? "可用" : "不可用"}`,
           `app-server：${snapshot.appServerStatus}`,
           `Codex连接：${codexConnectionText(snapshot.codexConnectionMode, snapshot.codexConnectionKind)}`,
+          snapshot.codexWebSocketUrl ? `WebSocket：${snapshot.codexWebSocketUrl}` : null,
+          snapshot.codexDesktopSocksProxy
+            ? `Desktop SOCKS：${snapshot.codexDesktopSocksProxy.host}:${snapshot.codexDesktopSocksProxy.port} / ${snapshot.codexDesktopSocksProxy.status}`
+            : null,
           `飞书配置：${snapshot.feishuConfigured ? "已配置" : "未完整配置"}`,
           `消息接入：${snapshot.feishuMessageTransport === "long_connection" ? "长连接" : "HTTP 回调"}`,
           `卡片回调：${snapshot.feishuCardActionTransport === "long_connection" ? "长连接" : "HTTP 回调"}`,
@@ -828,9 +832,9 @@ export class CardRenderer {
             `项目：${task.projectName}`,
             `状态：${statusText(task.status)}`,
             `更新时间：${task.updatedAt}`
-          ].join("\n")
-        )
-      );
+        ].filter(Boolean).join("\n")
+      )
+    );
       pushActionRows(
         elements,
         this.interactionMode,
@@ -1317,11 +1321,16 @@ const codexOnlyCompletionTitle = (status: string): string =>
   })[status] ?? "Codex App 任务已结束";
 
 const codexConnectionText = (mode: string, kind: string): string => {
-  const modeText = ({ auto: "自动", desktop_proxy: "Desktop代理", standalone: "独立进程" } as Record<string, string>)[mode] ?? mode;
+  const modeText =
+    ({ auto: "自动", desktop_proxy: "Desktop代理", standalone: "独立进程", canonical_websocket: "Canonical WebSocket" } as Record<
+      string,
+      string
+    >)[mode] ?? mode;
   const kindText =
     ({
       desktop_proxy: "已接入 Desktop app-server",
       standalone: "独立 app-server",
+      canonical_websocket: "Canonical WebSocket app-server",
       not_started: "未启动",
       unknown: "未知"
     } as Record<string, string>)[kind] ?? kind;

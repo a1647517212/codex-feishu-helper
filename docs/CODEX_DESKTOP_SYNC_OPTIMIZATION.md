@@ -40,6 +40,14 @@ OpenAI Codex app-server 支持以下 transport：
 
 `codex --remote ws://host:port` 可以让 TUI 连接远程 app-server。Codex Desktop 打包代码中也存在 `CODEX_APP_SERVER_WS_URL` 和 `CODEX_APP_SERVER_FORCE_CLI` 入口，说明 Desktop 内部存在 WebSocket app-server 连接路径。
 
+2026-05-09 本机实测补充：
+
+- `codex app-server --listen ws://127.0.0.1:<port>` 可作为 canonical WebSocket app-server。
+- Node 22 原生 `WebSocket` 可完成 `initialize` / `initialized` / `thread/list`。
+- 多个客户端可以同时连接同一个 app-server。
+- Codex Desktop 26.506.2212.0 会读取 `CODEX_APP_SERVER_WS_URL`，但 WebSocket transport 硬编码通过 `socks5h://127.0.0.1:1080` 访问目标 URL。
+- 因此如果要让 Desktop 接入 bridge-owned app-server，需要本机 `127.0.0.1:1080` 存在 SOCKS5 代理，并允许转发到 canonical app-server 端口。
+
 社区 issue 里也有相同方向的讨论：
 
 - `openai/codex#11166`：希望把 app-server 暴露为更稳定的网络/socket transport，供第三方 UI 和桥接器使用。
@@ -54,7 +62,8 @@ OpenAI Codex app-server 支持以下 transport：
 flowchart LR
   Feishu["飞书群 / 任务会话"] --> Bridge["codex-feishu-helper"]
   Bridge --> Canonical["canonical codex app-server\nws://127.0.0.1:<port>"]
-  Desktop["Codex Desktop\n可选接入"] --> Canonical
+  Bridge --> Socks["本机 SOCKS5\n127.0.0.1:1080"]
+  Desktop["Codex Desktop\nCODEX_APP_SERVER_WS_URL"] --> Socks --> Canonical
   TUI["codex --remote\n可选实时查看"] --> Canonical
   Canonical --> Store["Codex sessions / state"]
 ```
@@ -68,9 +77,11 @@ flowchart LR
 ```json
 {
   "codex": {
-    "connectionMode": "websocket",
-    "websocketUrl": "ws://127.0.0.1:47891",
-    "websocketListenUrl": "ws://127.0.0.1:47891"
+    "connectionMode": "canonical_websocket",
+    "websocketListenUrl": "ws://127.0.0.1:47931",
+    "desktopSocksProxyEnabled": true,
+    "desktopSocksProxyHost": "127.0.0.1",
+    "desktopSocksProxyPort": 1080
   }
 }
 ```
@@ -79,8 +90,8 @@ flowchart LR
 
 - bridge 启动 `codex app-server --listen ws://127.0.0.1:<port>`。
 - bridge 通过 WebSocket JSON-RPC 连接它。
-- 保留 `standalone` stdio 作为 fallback。
-- doctor 展示当前连接类型、URL、健康检查结果。
+- 可选启动只允许转发到 canonical app-server 的本机 SOCKS5 代理。
+- doctor 展示当前连接类型、URL、SOCKS5 代理状态。
 
 ### P1：验证 Desktop 接入 canonical runtime
 
@@ -88,10 +99,12 @@ flowchart LR
 
 ```powershell
 $env:CODEX_APP_SERVER_WS_URL="ws://127.0.0.1:47891"
-codex app
+Start-Process "C:\Program Files\WindowsApps\OpenAI.Codex_...\app\Codex.exe"
 ```
 
 或者通过 Windows 启动脚本给 Codex Desktop 注入环境变量。
+
+注意：当前 Desktop 版本不是直连 `CODEX_APP_SERVER_WS_URL`，而是先连 `127.0.0.1:1080`。如果 1080 没有 SOCKS5 代理，Desktop 会连接失败；如果 1080 已被其他代理占用，需要确认该代理允许访问 `127.0.0.1:<canonical-port>`。
 
 验收标准：
 
@@ -144,13 +157,11 @@ codex app
 - 难以审计和恢复。
 - 不适合后台 bridge 长期运行。
 
-## 后续实现清单
-
-- [ ] `CodexClient` 抽象 stdio 与 WebSocket transport。
-- [ ] 配置新增 `websocketUrl`、`websocketListenUrl`、`websocketTokenFile`。
-- [ ] 启动 canonical app-server 并检查 `/readyz`。
-- [ ] doctor 展示 app-server transport 和健康状态。
-- [ ] 增加 WebSocket transport mock 测试。
+- [x] `CodexClient` 抽象 stdio 与 WebSocket transport。
+- [x] 配置新增 `websocketUrl`、`websocketListenUrl` 与 Desktop SOCKS5 代理选项。
+- [x] 启动 canonical app-server 并检查 `/readyz`。
+- [x] doctor 展示 app-server transport、WebSocket URL 和 SOCKS5 代理状态。
+- [x] 增加 WebSocket transport mock 测试。
+- [x] 验证 `CODEX_APP_SERVER_WS_URL` 启动 Desktop 的可行性，并确认当前版本需要 `127.0.0.1:1080` SOCKS5 代理。
 - [ ] 增加完成后 `thread/read` 补偿同步。
-- [ ] 验证 `CODEX_APP_SERVER_WS_URL` 启动 Desktop 的可行性。
 - [ ] 文档化 Desktop/TUI 接入方式。

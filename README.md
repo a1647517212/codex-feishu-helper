@@ -115,6 +115,31 @@ npm run start
 npm run doctor
 ```
 
+### Canonical WebSocket 模式
+
+默认 `connectionMode=auto` 会优先尝试 Desktop proxy，失败后回退到独立 stdio app-server。若希望 bridge 拥有一个 canonical WebSocket app-server，并让 Codex Desktop 尽量接入同一个 runtime，可改成：
+
+```json
+{
+  "codex": {
+    "connectionMode": "canonical_websocket",
+    "websocketListenUrl": "ws://127.0.0.1:47931",
+    "desktopSocksProxyEnabled": true,
+    "desktopSocksProxyHost": "127.0.0.1",
+    "desktopSocksProxyPort": 1080
+  }
+}
+```
+
+然后用同一个 URL 启动 Codex Desktop：
+
+```powershell
+$env:CODEX_APP_SERVER_WS_URL="ws://127.0.0.1:47931"
+Start-Process "C:\Program Files\WindowsApps\OpenAI.Codex_...\app\Codex.exe"
+```
+
+当前 Codex Desktop 版本会通过 `127.0.0.1:1080` SOCKS5 代理访问 `CODEX_APP_SERVER_WS_URL`，所以启用 Desktop 接入时需要 `desktopSocksProxyEnabled=true`，或确保本机已有 1080 代理能转发到该 WebSocket 端口。`/doctor` 会显示 `WebSocket` 和 `Desktop SOCKS` 状态。
+
 如果希望后台保活：
 
 ```powershell

@@ -245,7 +245,17 @@ export interface DiagnosticSnapshot {
   nodeVersion: string;
   codexCommand: string;
   codexConnectionMode: string;
-  codexConnectionKind: "desktop_proxy" | "standalone" | "not_started" | "unknown";
+  codexConnectionKind: "desktop_proxy" | "standalone" | "canonical_websocket" | "not_started" | "unknown";
+  codexWebSocketUrl: string | null;
+  codexDesktopSocksProxy: {
+    enabled: boolean;
+    host: string;
+    port: number;
+    status: "not_started" | "listening" | "external_or_occupied" | "error" | "stopped";
+    allowedHost: string;
+    allowedPort: number;
+    lastError: string | null;
+  } | null;
   codexAvailable: boolean;
   appServerStatus: "connected" | "disconnected" | "not_started" | "error";
   feishuConfigured: boolean;
