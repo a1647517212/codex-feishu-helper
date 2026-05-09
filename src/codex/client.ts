@@ -298,6 +298,14 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
     const args = mode.args;
     const { host, port } = parseWebSocketEndpoint(url);
     await this.startDesktopSocksProxyIfNeeded(host, port);
+    if (this.config.codex.websocketAttachExisting && await this.isReady(url)) {
+      this.activeConnectionKind = mode.kind;
+      this.activeWebSocketUrl = url;
+      await this.connectWebSocket(url);
+      await this.initialize();
+      this.logger.info("codex app-server connected", { mode: mode.kind, args, url, attachedExisting: true });
+      return;
+    }
     this.proc = spawn(this.config.codex.command, args, {
       stdio: ["pipe", "pipe", "pipe"],
       shell: process.platform === "win32",
@@ -487,20 +495,26 @@ export class CodexClient extends EventEmitter<CodexClientEvents> {
   }
 
   private async waitForReady(webSocketUrl: string): Promise<void> {
-    const healthUrl = webSocketUrl.replace(/^ws:/, "http:").replace(/^wss:/, "https:").replace(/\/$/, "") + "/readyz";
     const deadline = Date.now() + 15000;
     let lastError: unknown = null;
     while (Date.now() < deadline) {
       try {
-        const response = await fetch(healthUrl);
-        if (response.ok) return;
-        lastError = new Error(`readyz returned ${response.status}`);
+        if (await this.isReady(webSocketUrl)) return;
       } catch (error) {
         lastError = error;
       }
       await new Promise((resolve) => setTimeout(resolve, 250));
     }
-    throw lastError instanceof Error ? lastError : new Error(`Codex app-server did not become ready: ${healthUrl}`);
+    throw lastError instanceof Error ? lastError : new Error(`Codex app-server did not become ready: ${readyUrl(webSocketUrl)}`);
+  }
+
+  private async isReady(webSocketUrl: string): Promise<boolean> {
+    try {
+      const response = await fetch(readyUrl(webSocketUrl));
+      return response.ok;
+    } catch {
+      return false;
+    }
   }
 
   private async startDesktopSocksProxyIfNeeded(allowedHost: string, allowedPort: number): Promise<void> {
@@ -565,6 +579,9 @@ const parseWebSocketEndpoint = (url: string): { host: string; port: number } => 
     port: parsed.port ? Number(parsed.port) : defaultPort
   };
 };
+
+const readyUrl = (webSocketUrl: string): string =>
+  webSocketUrl.replace(/^ws:/, "http:").replace(/^wss:/, "https:").replace(/\/$/, "") + "/readyz";
 
 const killProcessTree = async (proc: ChildProcessWithoutNullStreams | null): Promise<void> => {
   if (!proc || proc.exitCode != null) return;

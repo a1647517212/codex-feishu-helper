@@ -46,7 +46,8 @@ OpenAI Codex app-server 支持以下 transport：
 - Node 22 原生 `WebSocket` 可完成 `initialize` / `initialized` / `thread/list`。
 - 多个客户端可以同时连接同一个 app-server。
 - Codex Desktop 26.506.2212.0 会读取 `CODEX_APP_SERVER_WS_URL`，但 WebSocket transport 硬编码通过 `socks5h://127.0.0.1:1080` 访问目标 URL。
-- 因此如果要让 Desktop 接入 bridge-owned app-server，需要本机 `127.0.0.1:1080` 存在 SOCKS5 代理，并允许转发到 canonical app-server 端口。
+- 当前项目已提供 Desktop WS 直连补丁：复制一份可写 Codex Desktop 到用户目录后，只补丁副本的 `app.asar`，把 WebSocket transport 的硬编码 SOCKS agent 改成直连。这样不破坏 WindowsApps 官方包。
+- 因此推荐路径是安装直连补丁后让 Desktop 直接接入 bridge-owned app-server；不安装补丁时，仍可用本机 `127.0.0.1:1080` SOCKS5 代理作为兼容路径。
 
 社区 issue 里也有相同方向的讨论：
 
@@ -62,8 +63,9 @@ OpenAI Codex app-server 支持以下 transport：
 flowchart LR
   Feishu["飞书群 / 任务会话"] --> Bridge["codex-feishu-helper"]
   Bridge --> Canonical["canonical codex app-server\nws://127.0.0.1:<port>"]
-  Bridge --> Socks["本机 SOCKS5\n127.0.0.1:1080"]
-  Desktop["Codex Desktop\nCODEX_APP_SERVER_WS_URL"] --> Socks --> Canonical
+  Desktop["Codex Desktop\nCODEX_APP_SERVER_WS_URL"] --> Canonical
+  Bridge -. "未补丁兼容路径" .-> Socks["本机 SOCKS5\n127.0.0.1:1080"]
+  Desktop -. "未补丁兼容路径" .-> Socks -.-> Canonical
   TUI["codex --remote\n可选实时查看"] --> Canonical
   Canonical --> Store["Codex sessions / state"]
 ```
@@ -79,7 +81,8 @@ flowchart LR
   "codex": {
     "connectionMode": "canonical_websocket",
     "websocketListenUrl": "ws://127.0.0.1:47931",
-    "desktopSocksProxyEnabled": true,
+    "websocketAttachExisting": true,
+    "desktopSocksProxyEnabled": false,
     "desktopSocksProxyHost": "127.0.0.1",
     "desktopSocksProxyPort": 1080
   }
@@ -90,10 +93,26 @@ flowchart LR
 
 - bridge 启动 `codex app-server --listen ws://127.0.0.1:<port>`。
 - bridge 通过 WebSocket JSON-RPC 连接它。
+- 如果 `websocketAttachExisting=true` 且该端口已有 ready app-server，bridge 直接接入现有服务，不再新启动 app-server。这样 bridge/watchdog 重启不会顺带中断 Codex Desktop 当前连接。
 - 可选启动只允许转发到 canonical app-server 的本机 SOCKS5 代理。
 - doctor 展示当前连接类型、URL、SOCKS5 代理状态。
 
-### P1：验证 Desktop 接入 canonical runtime
+### P1：让 Desktop 接入 canonical runtime
+
+推荐先安装补丁版 Desktop 副本：
+
+```powershell
+npm run desktop:copy
+```
+
+安装行为：
+
+- 自动定位当前 Codex Desktop 官方安装目录。
+- 复制一份可写副本到 `%LOCALAPPDATA%\CodexFeishuHelper\CodexDesktopPatched`。
+- 只把副本 `app.asar` 中硬编码的 `SocksProxyAgent("socks5h://127.0.0.1:1080")` 改成直连。
+- 可通过 `npm run desktop:copy:remove` 删除补丁版副本。
+
+注意：已经运行中的 Microsoft Store 版 Codex Desktop 不会自动切换到 bridge-owned app-server。必须通过 `Launch Shared Desktop` / `npm run desktop` 重启 Desktop，让它继承 `CODEX_APP_SERVER_WS_URL` 并使用补丁版副本，才是真正同一个 canonical app-server。
 
 验证方式：
 
@@ -104,7 +123,7 @@ Start-Process "C:\Program Files\WindowsApps\OpenAI.Codex_...\app\Codex.exe"
 
 或者通过 Windows 启动脚本给 Codex Desktop 注入环境变量。
 
-注意：当前 Desktop 版本不是直连 `CODEX_APP_SERVER_WS_URL`，而是先连 `127.0.0.1:1080`。如果 1080 没有 SOCKS5 代理，Desktop 会连接失败；如果 1080 已被其他代理占用，需要确认该代理允许访问 `127.0.0.1:<canonical-port>`。
+注意：未安装补丁时，当前 Desktop 版本不是直连 `CODEX_APP_SERVER_WS_URL`，而是先连 `127.0.0.1:1080`。如果 1080 没有 SOCKS5 代理，Desktop 会连接失败；如果 1080 已被其他代理占用，需要确认该代理允许访问 `127.0.0.1:<canonical-port>`。
 
 验收标准：
 
@@ -162,6 +181,7 @@ Start-Process "C:\Program Files\WindowsApps\OpenAI.Codex_...\app\Codex.exe"
 - [x] 启动 canonical app-server 并检查 `/readyz`。
 - [x] doctor 展示 app-server transport、WebSocket URL 和 SOCKS5 代理状态。
 - [x] 增加 WebSocket transport mock 测试。
-- [x] 验证 `CODEX_APP_SERVER_WS_URL` 启动 Desktop 的可行性，并确认当前版本需要 `127.0.0.1:1080` SOCKS5 代理。
+- [x] 验证 `CODEX_APP_SERVER_WS_URL` 启动 Desktop 的可行性，并确认当前版本未补丁时需要 `127.0.0.1:1080` SOCKS5 代理。
+- [x] 增加可回滚的 Codex Desktop WS 直连补丁，补丁后 Desktop 不再要求 SOCKS 代理。
 - [ ] 增加完成后 `thread/read` 补偿同步。
 - [ ] 文档化 Desktop/TUI 接入方式。

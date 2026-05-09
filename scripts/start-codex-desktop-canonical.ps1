@@ -227,17 +227,94 @@ function Resolve-CodexDesktopExecutable {
   throw "Codex Desktop executable was not found. Pass -CodexExe explicitly."
 }
 
+function Get-PatchedDesktopCopyStatus {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$RepoRootPath
+  )
+  $copyScript = Join-Path $RepoRootPath "scripts\install-patched-codex-desktop-copy.ps1"
+  if (-not (Test-Path -LiteralPath $copyScript)) {
+    return $null
+  }
+  try {
+    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $copyScript -Action status -Json 2>$null
+    if ($LASTEXITCODE -ne 0) {
+      return $null
+    }
+    return ($output -join "`n" | ConvertFrom-Json)
+  } catch {
+    return $null
+  }
+}
+
+function Resolve-CodexDesktopExecutableForSharedServer {
+  param(
+    [string]$ExplicitPath,
+    [Parameter(Mandatory = $true)]
+    [string]$RepoRootPath
+  )
+  if ($ExplicitPath) {
+    return Resolve-RequiredPath -PathValue $ExplicitPath
+  }
+  $copyStatus = Get-PatchedDesktopCopyStatus -RepoRootPath $RepoRootPath
+  if ($copyStatus -and $copyStatus.state -eq "patched" -and $copyStatus.patchedExe -and (Test-Path -LiteralPath $copyStatus.patchedExe)) {
+    Write-Host "Using patched Codex Desktop copy: $($copyStatus.patchedExe)"
+    return [string]$copyStatus.patchedExe
+  }
+  return Resolve-CodexDesktopExecutable -ExplicitPath ""
+}
+
 function Get-CodexDesktopProcesses {
   param(
     [Parameter(Mandatory = $true)]
     [string]$DesktopExe
   )
-  $desktopRoot = Split-Path -Parent $DesktopExe
   return @(Get-CimInstance Win32_Process | Where-Object {
     $_.Name -ieq "Codex.exe" -and
     $_.ExecutablePath -and
-    ([string]$_.ExecutablePath).StartsWith($desktopRoot, [System.StringComparison]::OrdinalIgnoreCase)
+    ([System.IO.Path]::GetFileName([string]$_.ExecutablePath)) -ceq "Codex.exe" -and
+    ([string]$_.CommandLine) -notmatch "\sapp-server(\s|$)"
   })
+}
+
+function Get-CodexDesktopProcessIdsForExecutable {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$DesktopExe
+  )
+  $desktopExeFull = [System.IO.Path]::GetFullPath($DesktopExe)
+  return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    $_.Name -ieq "Codex.exe" -and
+    $_.ExecutablePath -and
+    ([System.IO.Path]::GetFullPath([string]$_.ExecutablePath)).Equals($desktopExeFull, [System.StringComparison]::OrdinalIgnoreCase)
+  } | ForEach-Object { [int]$_.ProcessId })
+}
+
+function Get-ProcessTreeIds {
+  param(
+    [Parameter(Mandatory = $true)]
+    [int[]]$RootProcessIds
+  )
+  $allProcesses = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue)
+  $seen = [System.Collections.Generic.HashSet[int]]::new()
+  $queue = [System.Collections.Generic.Queue[int]]::new()
+  foreach ($rootProcessId in $RootProcessIds) {
+    if ($rootProcessId -gt 0 -and $seen.Add($rootProcessId)) {
+      $queue.Enqueue($rootProcessId)
+    }
+  }
+  while ($queue.Count -gt 0) {
+    $current = $queue.Dequeue()
+    foreach ($process in $allProcesses) {
+      if ([int]$process.ParentProcessId -eq $current) {
+        $processId = [int]$process.ProcessId
+        if ($seen.Add($processId)) {
+          $queue.Enqueue($processId)
+        }
+      }
+    }
+  }
+  return @($seen)
 }
 
 function Stop-CodexDesktop {
@@ -281,13 +358,38 @@ function Start-CodexDesktopWithCanonicalServer {
     [Environment]::SetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", $WebSocketUrl, "Process")
     $started = Start-Process -FilePath $DesktopExe -PassThru
     Write-Host "Started Codex Desktop: pid=$($started.Id)"
+    return $started
   } finally {
     [Environment]::SetEnvironmentVariable("CODEX_APP_SERVER_WS_URL", $oldValue, "Process")
   }
 }
 
+function Get-DesktopWsPatchStatus {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$RepoRootPath
+  )
+  $patchScript = Join-Path $RepoRootPath "scripts\patch-codex-desktop-ws.ps1"
+  if (-not (Test-Path -LiteralPath $patchScript)) {
+    return $null
+  }
+  try {
+    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $patchScript -Action status -Json 2>$null
+    if ($LASTEXITCODE -ne 0) {
+      return $null
+    }
+    return ($output -join "`n" | ConvertFrom-Json)
+  } catch {
+    return $null
+  }
+}
+
 function Wait-ForDesktopSocksConnection {
   param(
+    [Parameter(Mandatory = $true)]
+    [string]$DesktopExe,
+    [Parameter(Mandatory = $true)]
+    [int]$StartedProcessId,
     [Parameter(Mandatory = $true)]
     [int]$SocksPort,
     [Parameter(Mandatory = $true)]
@@ -295,13 +397,43 @@ function Wait-ForDesktopSocksConnection {
   )
   $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
   while ((Get-Date) -lt $deadline) {
-    $line = netstat -ano -p tcp | Select-String -Pattern ":$SocksPort\s+.*ESTABLISHED" | Select-Object -First 1
-    if ($line) {
+    $rootIds = @($StartedProcessId) + @(Get-CodexDesktopProcessIdsForExecutable -DesktopExe $DesktopExe)
+    $desktopTreeIds = @(Get-ProcessTreeIds -RootProcessIds $rootIds)
+    $connection = Get-NetTCPConnection -RemoteAddress 127.0.0.1 -RemotePort $SocksPort -State Established -ErrorAction SilentlyContinue |
+      Where-Object { [int]$_.OwningProcess -in $desktopTreeIds } |
+      Select-Object -First 1
+    if ($connection) {
       return
     }
     Start-Sleep -Milliseconds 500
   }
   Write-Host "Desktop has not connected to SOCKS yet. It may still be starting; check /doctor if needed."
+}
+
+function Wait-ForDesktopDirectConnection {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$DesktopExe,
+    [Parameter(Mandatory = $true)]
+    [int]$StartedProcessId,
+    [Parameter(Mandatory = $true)]
+    [int]$CanonicalPort,
+    [Parameter(Mandatory = $true)]
+    [int]$TimeoutSeconds
+  )
+  $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+  while ((Get-Date) -lt $deadline) {
+    $rootIds = @($StartedProcessId) + @(Get-CodexDesktopProcessIdsForExecutable -DesktopExe $DesktopExe)
+    $desktopTreeIds = @(Get-ProcessTreeIds -RootProcessIds $rootIds)
+    $connection = Get-NetTCPConnection -RemoteAddress 127.0.0.1 -RemotePort $CanonicalPort -State Established -ErrorAction SilentlyContinue |
+      Where-Object { [int]$_.OwningProcess -in $desktopTreeIds } |
+      Select-Object -First 1
+    if ($connection) {
+      return
+    }
+    Start-Sleep -Milliseconds 500
+  }
+  Write-Host "Desktop direct WebSocket connection was not observed yet. It may still be starting; check /doctor if needed."
 }
 
 $repoRootPath = Resolve-RequiredPath -PathValue (Resolve-DefaultRepoRoot)
@@ -311,6 +443,12 @@ $readyzUrl = Convert-WebSocketToReadyzUrl -WebSocketUrl $webSocketUrl
 $socksHost = if ($config.codex.desktopSocksProxyHost) { [string]$config.codex.desktopSocksProxyHost } else { "127.0.0.1" }
 $socksPort = if ($config.codex.desktopSocksProxyPort) { [int]$config.codex.desktopSocksProxyPort } else { 1080 }
 $desktopSocksEnabled = [bool]$config.codex.desktopSocksProxyEnabled
+$desktopPatchStatus = Get-DesktopWsPatchStatus -RepoRootPath $repoRootPath
+$patchedCopyStatus = Get-PatchedDesktopCopyStatus -RepoRootPath $repoRootPath
+$desktopWsDirect =
+  ($patchedCopyStatus -and $patchedCopyStatus.state -eq "patched") -or
+  ($desktopPatchStatus -and $desktopPatchStatus.state -eq "patched")
+$canonicalPort = ([Uri]$webSocketUrl).Port
 
 Write-Step "Checking bridge"
 Start-BridgeIfNeeded -RepoRootPath $repoRootPath
@@ -319,24 +457,32 @@ Write-Step "Waiting for canonical app-server"
 Wait-ForReadyz -ReadyzUrl $readyzUrl -TimeoutSeconds $ReadyTimeoutSeconds
 Write-Host "Canonical app-server ready: $webSocketUrl"
 
-if (-not $desktopSocksEnabled) {
-  Write-Host "Warning: desktopSocksProxyEnabled is false. Current Codex Desktop builds need 127.0.0.1:1080 SOCKS for CODEX_APP_SERVER_WS_URL."
+if ($desktopWsDirect) {
+  Write-Host "Codex Desktop WS direct patch is installed. SOCKS proxy is not required for Desktop startup."
+} else {
+  if (-not $desktopSocksEnabled) {
+    Write-Host "Warning: desktopSocksProxyEnabled is false. Unpatched Codex Desktop builds need 127.0.0.1:1080 SOCKS for CODEX_APP_SERVER_WS_URL."
+  }
+
+  Write-Step "Waiting for Desktop SOCKS proxy"
+  Wait-ForTcpPort -HostName $socksHost -Port $socksPort -TimeoutSeconds $ReadyTimeoutSeconds
+  Write-Host "Desktop SOCKS ready: ${socksHost}:$socksPort"
 }
 
-Write-Step "Waiting for Desktop SOCKS proxy"
-Wait-ForTcpPort -HostName $socksHost -Port $socksPort -TimeoutSeconds $ReadyTimeoutSeconds
-Write-Host "Desktop SOCKS ready: ${socksHost}:$socksPort"
-
 Write-Step "Resolving Codex Desktop"
-$desktopExe = Resolve-CodexDesktopExecutable -ExplicitPath $CodexExe
+$desktopExe = Resolve-CodexDesktopExecutableForSharedServer -ExplicitPath $CodexExe -RepoRootPath $repoRootPath
 Write-Host "Codex Desktop: $desktopExe"
 
 Write-Step "Restarting Codex Desktop into shared server mode"
 Stop-CodexDesktop -DesktopExe $desktopExe
-Start-CodexDesktopWithCanonicalServer -DesktopExe $desktopExe -WebSocketUrl $webSocketUrl
+$startedDesktop = Start-CodexDesktopWithCanonicalServer -DesktopExe $desktopExe -WebSocketUrl $webSocketUrl
 
 Write-Step "Checking Desktop connection"
-Wait-ForDesktopSocksConnection -SocksPort $socksPort -TimeoutSeconds 20
+if ($desktopWsDirect) {
+  Wait-ForDesktopDirectConnection -DesktopExe $desktopExe -StartedProcessId $startedDesktop.Id -CanonicalPort $canonicalPort -TimeoutSeconds 20
+} else {
+  Wait-ForDesktopSocksConnection -DesktopExe $desktopExe -StartedProcessId $startedDesktop.Id -SocksPort $socksPort -TimeoutSeconds 20
+}
 Write-Host ""
 Write-Host "Done. Codex Desktop should now use the bridge-owned app-server:"
 Write-Host "  $webSocketUrl"

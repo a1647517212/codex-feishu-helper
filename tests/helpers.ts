@@ -44,6 +44,7 @@ export const makeConfig = (dir: string): BridgeConfig => ({
     proxyArgs: ["app-server", "proxy"],
     websocketListenUrl: "ws://127.0.0.1:47931",
     websocketUrl: undefined,
+    websocketAttachExisting: true,
     desktopSocksProxyEnabled: false,
     desktopSocksProxyHost: "127.0.0.1",
     desktopSocksProxyPort: 1080,

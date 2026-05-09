@@ -65,6 +65,7 @@ test("config accepts canonical websocket app-server settings", () => {
     assert.equal(config.codex.connectionMode, "canonical_websocket");
     assert.equal(config.codex.websocketListenUrl, "ws://127.0.0.1:47939");
     assert.equal(config.codex.websocketUrl, undefined);
+    assert.equal(config.codex.websocketAttachExisting, true);
     assert.equal(config.codex.desktopSocksProxyEnabled, true);
     assert.equal(config.codex.desktopSocksProxyHost, "127.0.0.1");
     assert.equal(config.codex.desktopSocksProxyPort, 1080);

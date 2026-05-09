@@ -129,6 +129,7 @@ test("canonical websocket mode starts app-server with --listen and speaks JSON-R
     config.codex.args = ["-e", "setInterval(() => {}, 1000)"];
     config.codex.websocketListenUrl = server.wsUrl;
     config.codex.websocketUrl = server.wsUrl;
+    config.codex.websocketAttachExisting = false;
     client = new CodexClient(config, makeLogger(dir));
 
     const threads = await client.listThreads(2);
@@ -140,6 +141,32 @@ test("canonical websocket mode starts app-server with --listen and speaks JSON-R
       ["initialize", "initialized", "thread/list"]
     );
     assert.equal(threads[0]?.id, "thr_ws");
+  } finally {
+    await client?.stop();
+    await server.stop();
+    cleanup();
+  }
+});
+
+test("canonical websocket mode attaches to an existing app-server when it is already ready", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  const server = await startMockCodexWebSocketServer();
+  let client: CodexClient | null = null;
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "canonical_websocket";
+    config.codex.command = process.execPath;
+    config.codex.args = ["-e", "process.exit(55)"];
+    config.codex.websocketListenUrl = server.wsUrl;
+    config.codex.websocketUrl = server.wsUrl;
+    config.codex.websocketAttachExisting = true;
+    client = new CodexClient(config, makeLogger(dir));
+
+    await client.request("thread/list", {});
+
+    assert.equal(client.connectionKind, "canonical_websocket");
+    assert.equal((client as unknown as { proc: unknown | null }).proc, null);
+    assert.deepEqual(server.methods.slice(0, 3), ["initialize", "initialized", "thread/list"]);
   } finally {
     await client?.stop();
     await server.stop();
@@ -159,6 +186,7 @@ test("canonical websocket mode can expose the Desktop SOCKS proxy for the config
     config.codex.args = ["-e", "setInterval(() => {}, 1000)"];
     config.codex.websocketListenUrl = server.wsUrl;
     config.codex.websocketUrl = server.wsUrl;
+    config.codex.websocketAttachExisting = false;
     config.codex.desktopSocksProxyEnabled = true;
     config.codex.desktopSocksProxyPort = socksPort;
     client = new CodexClient(config, makeLogger(dir));
@@ -197,6 +225,7 @@ test("canonical websocket mode cleans stale process before reconnecting", async 
     config.codex.args = ["-e", "setInterval(() => {}, 1000)"];
     config.codex.websocketListenUrl = server.wsUrl;
     config.codex.websocketUrl = server.wsUrl;
+    config.codex.websocketAttachExisting = false;
     client = new CodexClient(config, makeLogger(dir));
 
     await client.request("thread/list", {});

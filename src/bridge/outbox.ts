@@ -45,13 +45,18 @@ export class OutboxWorker {
         : [];
       const text = typeof item.payload.text === "string" ? item.payload.text : null;
       const binding = item.sessionBindingId ? this.repo.findBindingById(item.sessionBindingId) : null;
-      const dedicatedChat = binding?.feishuContainerKind === "dedicated_chat";
-      if (cards.length > 0) {
-        for (const entry of cards) {
-          await this.sendCard(item, entry, dedicatedChat);
-        }
-      } else if (card) {
-        const sent = await this.sendCard(item, card, dedicatedChat);
+      const target = resolveDeliveryTarget(item, binding);
+      this.logger.info("outbox delivery target resolved", {
+        id: item.id,
+        notificationType: item.notificationType,
+        sessionBindingId: item.sessionBindingId,
+        chatId: target.chatId,
+        rootMessageId: target.rootMessageId,
+        threadId: target.threadId,
+        mode: deliveryTargetMode(target)
+      });
+      if (card) {
+        const sent = await this.sendCard(target, card);
         if (
           item.notificationType === "task_status" &&
           item.sessionBindingId &&
@@ -62,13 +67,18 @@ export class OutboxWorker {
           this.repo.updateBindingTaskCardMessageId(item.sessionBindingId, sent.messageId);
         }
       }
+      if (cards.length > 0) {
+        for (const entry of cards) {
+          await this.sendCard(target, entry);
+        }
+      }
       if (text) {
         const chunks = splitFeishuText(text, this.config.bridge.maxFeishuTextLength);
         for (const chunk of chunks) {
-          if (!dedicatedChat && item.feishuThreadId) {
-            await this.feishu.replyTextInThread(item.feishuTopicRootMessageId ?? item.feishuThreadId, chunk);
+          if (target.threadId) {
+            await this.feishu.replyTextInThread(target.rootMessageId ?? target.threadId, chunk);
           } else {
-            await this.feishu.sendText(item.feishuChatId, chunk, dedicatedChat ? null : item.feishuTopicRootMessageId);
+            await this.feishu.sendText(target.chatId, chunk, target.rootMessageId);
           }
         }
       }
@@ -91,12 +101,11 @@ export class OutboxWorker {
     }
   }
 
-  private async sendCard(item: NotificationOutboxItem, card: Record<string, unknown>, dedicatedChat: boolean) {
-    if (!dedicatedChat && item.feishuThreadId) {
-      return this.feishu.replyCardInThread(item.feishuTopicRootMessageId ?? item.feishuThreadId, card);
-    } else {
-      return this.feishu.sendCard(item.feishuChatId, card, dedicatedChat ? null : item.feishuTopicRootMessageId);
+  private async sendCard(target: FeishuDeliveryTarget, card: Record<string, unknown>) {
+    if (target.threadId) {
+      return this.feishu.replyCardInThread(target.rootMessageId ?? target.threadId, card);
     }
+    return this.feishu.sendCard(target.chatId, card, target.rootMessageId);
   }
 
   private shouldDeliver(item: NotificationOutboxItem): boolean {
@@ -132,6 +141,60 @@ const notificationSeverity = (type: NotificationOutboxItem["notificationType"]):
   if (type === "task_failed" || type === "task_interrupted" || type === "bridge_unavailable") return "error";
   if (type === "task_completed" || type === "project_unclassified" || type === "diagnostic") return "important";
   return "info";
+};
+
+type FeishuDeliveryTarget = {
+  chatId: string;
+  rootMessageId: string | null;
+  threadId: string | null;
+};
+
+const resolveDeliveryTarget = (
+  item: NotificationOutboxItem,
+  binding: SessionBinding | null
+): FeishuDeliveryTarget => {
+  const chatId = binding?.feishuChatId ?? item.feishuChatId;
+  if (binding?.feishuContainerKind === "dedicated_chat") {
+    return {
+      chatId,
+      rootMessageId:
+        firstRealFeishuMessageId(
+          binding.feishuTaskCardMessageId,
+          item.feishuTopicRootMessageId,
+          binding.feishuTopicRootMessageId
+        ) ?? null,
+      threadId: firstRealFeishuThreadId(item.feishuThreadId, binding.feishuThreadId) ?? null
+    };
+  }
+  return {
+    chatId,
+    rootMessageId: item.feishuTopicRootMessageId,
+    threadId: item.feishuThreadId
+  };
+};
+
+const firstRealFeishuMessageId = (...values: Array<string | null | undefined>): string | null => {
+  for (const value of values) {
+    if (value && isRealFeishuMessageId(value)) return value;
+  }
+  return null;
+};
+
+const firstRealFeishuThreadId = (...values: Array<string | null | undefined>): string | null => {
+  for (const value of values) {
+    if (value && isRealFeishuThreadId(value)) return value;
+  }
+  return null;
+};
+
+const isRealFeishuMessageId = (value: string): boolean => /^om_[A-Za-z0-9_-]+$/.test(value);
+
+const isRealFeishuThreadId = (value: string): boolean => /^omt_[A-Za-z0-9_-]+$/.test(value);
+
+const deliveryTargetMode = (target: FeishuDeliveryTarget): "thread_reply" | "message_reply" | "top_level" => {
+  if (target.threadId) return "thread_reply";
+  if (target.rootMessageId) return "message_reply";
+  return "top_level";
 };
 
 const splitFeishuText = (text: string, maxLength: number): string[] => {

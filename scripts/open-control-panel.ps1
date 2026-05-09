@@ -147,6 +147,59 @@ function Start-ExternalPowerShell {
   Start-Process -FilePath "powershell.exe" -ArgumentList $argumentLine -WorkingDirectory $script:RepoRootPath -WindowStyle $windowStyle | Out-Null
 }
 
+function Invoke-DesktopWsPatch {
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("status", "install", "restore")]
+    [string]$Action
+  )
+  $patchScript = Join-Path $script:RepoRootPath "scripts\patch-codex-desktop-ws.ps1"
+  if (-not (Test-Path -LiteralPath $patchScript)) {
+    Write-PanelLog "Desktop WS patch script is missing."
+    return $null
+  }
+  $nodeCommand = Get-Command "node" -ErrorAction SilentlyContinue
+  if (-not $nodeCommand) {
+    Write-PanelLog "Node.js was not found. Cannot run Desktop WS patcher."
+    return $null
+  }
+  try {
+    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $patchScript -Action $Action -Json 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      Write-PanelLog "Desktop WS patch $Action failed: $($output -join ' ')"
+      return $null
+    }
+    return ($output -join "`n" | ConvertFrom-Json)
+  } catch {
+    Write-PanelLog "Desktop WS patch $Action failed: $($_.Exception.Message)"
+    return $null
+  }
+}
+
+function Invoke-PatchedDesktopCopy {
+  param(
+    [Parameter(Mandatory = $true)]
+    [ValidateSet("status", "install", "remove")]
+    [string]$Action
+  )
+  $copyScript = Join-Path $script:RepoRootPath "scripts\install-patched-codex-desktop-copy.ps1"
+  if (-not (Test-Path -LiteralPath $copyScript)) {
+    Write-PanelLog "Patched Desktop copy script is missing."
+    return $null
+  }
+  try {
+    $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $copyScript -Action $Action -Json 2>&1
+    if ($LASTEXITCODE -ne 0) {
+      Write-PanelLog "Patched Desktop copy $Action failed: $($output -join ' ')"
+      return $null
+    }
+    return ($output -join "`n" | ConvertFrom-Json)
+  } catch {
+    Write-PanelLog "Patched Desktop copy $Action failed: $($_.Exception.Message)"
+    return $null
+  }
+}
+
 function Start-BridgeHidden {
   $bridgeScript = Join-Path $script:RepoRootPath "dist\src\main.js"
   if (-not (Test-Path -LiteralPath $bridgeScript)) {
@@ -217,12 +270,28 @@ function Refresh-Status {
     $bridgeProcesses = Get-BridgeProcesses
     $desktopProcesses = @(Get-Process -Name "Codex" -ErrorAction SilentlyContinue)
     $buildPath = Join-Path $script:RepoRootPath "dist\src\main.js"
+    $desktopPatch = Invoke-DesktopWsPatch -Action "status"
+    $patchedCopy = Invoke-PatchedDesktopCopy -Action "status"
+    $desktopWsDirect = ($patchedCopy -and $patchedCopy.state -eq "patched") -or ($desktopPatch -and $desktopPatch.state -eq "patched")
 
     $script:ConfigStatus.Text = if ($config) { "OK - $script:ConfigPathValue" } else { "Missing - open config first" }
     $script:BuildStatus.Text = if (Test-Path -LiteralPath $buildPath) { "OK - build output exists" } else { "Missing - run Setup / Repair" }
     $script:BridgeStatus.Text = if ($bridgeProcesses.Count -gt 0) { "Running - pid=$($bridgeProcesses[0].ProcessId)" } else { "Stopped" }
     $script:AppServerStatus.Text = if (Test-AppServerReady -ReadyzUrl $readyzUrl) { "Ready - $webSocketUrl" } else { "Not ready - $webSocketUrl" }
-    $script:SocksStatus.Text = if (Test-TcpPort -HostName $socksHost -Port $socksPort) { "Ready - ${socksHost}:$socksPort" } else { "Not ready - ${socksHost}:$socksPort" }
+    $script:SocksStatus.Text = if ($desktopWsDirect) {
+      "Not required - WS direct patch installed"
+    } elseif (Test-TcpPort -HostName $socksHost -Port $socksPort) {
+      "Ready - ${socksHost}:$socksPort"
+    } else {
+      "Not ready - ${socksHost}:$socksPort"
+    }
+    $script:DesktopPatchStatus.Text = if ($patchedCopy -and $patchedCopy.state -eq "patched") {
+      "patched copy - $($patchedCopy.patchedExe)"
+    } elseif ($desktopPatch) {
+      "$($desktopPatch.state) - $($desktopPatch.asarPath)"
+    } else {
+      "Unknown"
+    }
     $script:DesktopStatus.Text = if ($desktopProcesses.Count -gt 0) { "Running - $($desktopProcesses.Count) process(es)" } else { "Not running" }
     Write-PanelLog "Status refreshed."
   } catch {
@@ -238,8 +307,8 @@ $script:ConfigPathValue = $ConfigPath
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Codex Feishu Helper"
 $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
-$form.Size = New-Object System.Drawing.Size(760, 560)
-$form.MinimumSize = New-Object System.Drawing.Size(680, 500)
+$form.Size = New-Object System.Drawing.Size(820, 640)
+$form.MinimumSize = New-Object System.Drawing.Size(720, 560)
 
 $root = New-Object System.Windows.Forms.TableLayoutPanel
 $root.Dock = [System.Windows.Forms.DockStyle]::Fill
@@ -247,8 +316,8 @@ $root.ColumnCount = 1
 $root.RowCount = 4
 $root.Padding = New-Object System.Windows.Forms.Padding(14)
 $root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 52))) | Out-Null
-$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 180))) | Out-Null
-$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 92))) | Out-Null
+$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 210))) | Out-Null
+$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 138))) | Out-Null
 $root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
 $form.Controls.Add($root)
 
@@ -262,7 +331,7 @@ $root.Controls.Add($title, 0, 0)
 $statusGrid = New-Object System.Windows.Forms.TableLayoutPanel
 $statusGrid.Dock = [System.Windows.Forms.DockStyle]::Fill
 $statusGrid.ColumnCount = 2
-$statusGrid.RowCount = 6
+$statusGrid.RowCount = 7
 $statusGrid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 120))) | Out-Null
 $statusGrid.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100))) | Out-Null
 $root.Controls.Add($statusGrid, 0, 1)
@@ -273,6 +342,7 @@ $statusItems = @(
   @("Bridge", "BridgeStatus"),
   @("App Server", "AppServerStatus"),
   @("SOCKS", "SocksStatus"),
+  @("Desktop Patch", "DesktopPatchStatus"),
   @("Desktop", "DesktopStatus")
 )
 foreach ($item in $statusItems) {
@@ -295,17 +365,20 @@ foreach ($item in $statusItems) {
 $buttons = New-Object System.Windows.Forms.TableLayoutPanel
 $buttons.Dock = [System.Windows.Forms.DockStyle]::Fill
 $buttons.ColumnCount = 3
-$buttons.RowCount = 2
+$buttons.RowCount = 3
 for ($i = 0; $i -lt 3; $i++) {
   $buttons.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 33.33))) | Out-Null
 }
-$buttons.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 50))) | Out-Null
-$buttons.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 50))) | Out-Null
+$buttons.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 33.33))) | Out-Null
+$buttons.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 33.33))) | Out-Null
+$buttons.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 33.33))) | Out-Null
 $root.Controls.Add($buttons, 0, 2)
 
 $setupScript = Join-Path $script:RepoRootPath "scripts\setup-windows.ps1"
 $desktopScript = Join-Path $script:RepoRootPath "scripts\start-codex-desktop-canonical.ps1"
 $watchdogScript = Join-Path $script:RepoRootPath "scripts\install-watchdog.ps1"
+$desktopPatchScript = Join-Path $script:RepoRootPath "scripts\patch-codex-desktop-ws.ps1"
+$desktopCopyScript = Join-Path $script:RepoRootPath "scripts\install-patched-codex-desktop-copy.ps1"
 
 $buttons.Controls.Add((New-Button -Text "Setup / Repair" -OnClick {
   Write-PanelLog "Opening setup window."
@@ -329,6 +402,23 @@ $buttons.Controls.Add((New-Button -Text "Install Watchdog" -OnClick {
   Write-PanelLog "Opening watchdog installer."
   Start-ExternalPowerShell -ScriptPath $watchdogScript -Arguments @("-RepoRoot", "`"$script:RepoRootPath`"")
 }), 2, 1)
+$buttons.Controls.Add((New-Button -Text "Install Patched Desktop" -OnClick {
+  Write-PanelLog "Installing patched Codex Desktop copy."
+  Start-ExternalPowerShell -ScriptPath $desktopCopyScript -Arguments @("-Action", "install")
+}), 0, 2)
+$buttons.Controls.Add((New-Button -Text "Remove Patched Desktop" -OnClick {
+  Write-PanelLog "Removing patched Codex Desktop copy."
+  Start-ExternalPowerShell -ScriptPath $desktopCopyScript -Arguments @("-Action", "remove")
+}), 1, 2)
+$buttons.Controls.Add((New-Button -Text "Patch Status" -OnClick {
+  $status = Invoke-DesktopWsPatch -Action "status"
+  $copy = Invoke-PatchedDesktopCopy -Action "status"
+  if ($status -or $copy) {
+    if ($copy) { Write-PanelLog "Patched Desktop copy state: $($copy.state)" }
+    if ($status) { Write-PanelLog "Store app.asar patch state: $($status.state)" }
+    Refresh-Status
+  }
+}), 2, 2)
 
 $script:LogBox = New-Object System.Windows.Forms.TextBox
 $script:LogBox.Multiline = $true

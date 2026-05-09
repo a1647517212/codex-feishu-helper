@@ -49,7 +49,7 @@ test("outbox prefers replying inside Feishu thread when binding has thread id", 
   }
 });
 
-test("outbox sends dedicated task chat notifications as normal chat messages", async () => {
+test("outbox sends dedicated task chat notifications as replies to the task card when available", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
@@ -59,7 +59,7 @@ test("outbox sends dedicated task chat notifications as normal chat messages", a
       codexThreadId: "thr_dedicated_outbox",
       feishuChatId: "task_chat_1",
       feishuTopicRootMessageId: "task-root",
-      feishuThreadId: "omt_should_not_reply",
+      feishuTaskCardMessageId: "om_task_card_1",
       feishuContainerKind: "dedicated_chat",
       title: "Dedicated outbox",
       status: "running",
@@ -70,7 +70,6 @@ test("outbox sends dedicated task chat notifications as normal chat messages", a
       notificationType: "console",
       feishuChatId: "task_chat_1",
       feishuTopicRootMessageId: "task-root",
-      feishuThreadId: "omt_should_not_reply",
       payload: { text: "hello dedicated" },
       dedupeKey: "dedicated-hello"
     });
@@ -78,7 +77,65 @@ test("outbox sends dedicated task chat notifications as normal chat messages", a
     assert.equal(feishu.sent.length, 1);
     assert.equal(feishu.sent[0]?.mode, undefined);
     assert.equal(feishu.sent[0]?.chatId, "task_chat_1");
+    assert.equal(feishu.sent[0]?.root, "om_task_card_1");
+  } finally {
+    cleanup();
+  }
+});
+
+test("outbox keeps dedicated task chat notifications top-level until a real task card exists", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const worker = new OutboxWorker(config, repo, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_dedicated_outbox_no_card",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Dedicated outbox without card",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    repo.enqueueOutbox({
+      sessionBindingId: binding.id,
+      notificationType: "console",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      payload: { text: "hello dedicated" },
+      dedupeKey: "dedicated-hello-no-card"
+    });
+    await worker.flush();
+    assert.equal(feishu.sent.length, 1);
+    assert.equal(feishu.sent[0]?.chatId, "task_chat_1");
     assert.equal(feishu.sent[0]?.root, null);
+  } finally {
+    cleanup();
+  }
+});
+
+test("outbox sends the main card before supplemental cards", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const worker = new OutboxWorker(config, repo, feishu, makeLogger(dir));
+    repo.enqueueOutbox({
+      notificationType: "task_completed",
+      feishuChatId: "chat_1",
+      payload: {
+        card: { schema: "2.0", header: { title: { tag: "plain_text", content: "main" } }, body: { elements: [] } },
+        cards: [
+          { schema: "2.0", header: { title: { tag: "plain_text", content: "supplement" } }, body: { elements: [] } }
+        ]
+      },
+      dedupeKey: "main-and-supplement"
+    });
+    await worker.flush();
+    assert.equal(feishu.sent.length, 2);
+    assert.equal(JSON.stringify(feishu.sent[0]?.payload).includes("main"), true);
+    assert.equal(JSON.stringify(feishu.sent[1]?.payload).includes("supplement"), true);
   } finally {
     cleanup();
   }

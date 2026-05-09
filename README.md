@@ -69,6 +69,8 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1
 | `Open Config` | 打开 `%USERPROFILE%\.feishu-codex\config.json` |
 | `Start Bridge` | 后台启动飞书桥接服务 |
 | `Launch Shared Desktop` | 用同一个 canonical app-server 启动 Codex Desktop |
+| `Install Patched Desktop` | 复制一份可写 Codex Desktop 并安装直连 WebSocket 补丁，去掉 1080 SOCKS 依赖 |
+| `Remove Patched Desktop` | 删除本工具安装的补丁版 Codex Desktop 副本 |
 | `Install Watchdog` | 安装 5 分钟一次的后台保活任务 |
 | `Refresh` | 刷新配置、构建产物、bridge、app-server、SOCKS、Desktop 状态 |
 
@@ -145,7 +147,8 @@ npm run doctor
   "codex": {
     "connectionMode": "canonical_websocket",
     "websocketListenUrl": "ws://127.0.0.1:47931",
-    "desktopSocksProxyEnabled": true,
+    "websocketAttachExisting": true,
+    "desktopSocksProxyEnabled": false,
     "desktopSocksProxyHost": "127.0.0.1",
     "desktopSocksProxyPort": 1080
   }
@@ -166,7 +169,26 @@ npm run shortcuts
 
 桌面上的 `Codex Shared Server` 会自动检查 bridge、等待 canonical app-server 和 SOCKS5 代理就绪，然后用同一个 `CODEX_APP_SERVER_WS_URL` 启动 Codex Desktop。若已有 Codex Desktop 正在运行，启动器默认会先询问是否关闭并重启，避免误关当前工作窗口。你也可以创建后在 Windows 桌面上把快捷方式重命名为中文名称。
 
-当前 Codex Desktop 版本会通过 `127.0.0.1:1080` SOCKS5 代理访问 `CODEX_APP_SERVER_WS_URL`，所以启用 Desktop 接入时需要 `desktopSocksProxyEnabled=true`，或确保本机已有 1080 代理能转发到该 WebSocket 端口。`/doctor` 会显示 `WebSocket` 和 `Desktop SOCKS` 状态。
+`websocketAttachExisting=true` 是默认值。它会在 `websocketListenUrl` 已有可用 app-server 时直接接入现有服务，适合 bridge 重启或 watchdog 拉起场景，避免为了重启飞书桥接而中断 Codex Desktop 当前会话。
+
+当前 Codex Desktop 版本会通过 `127.0.0.1:1080` SOCKS5 代理访问 `CODEX_APP_SERVER_WS_URL`。如果不想维护 SOCKS 代理，可以在控制面板点 `Install Patched Desktop`，它会：
+
+- 自动定位当前 Codex Desktop 官方安装目录。
+- 复制一份可写副本到 `%LOCALAPPDATA%\CodexFeishuHelper\CodexDesktopPatched`。
+- 只把副本 `app.asar` 里的 WebSocket transport 硬编码 `SocksProxyAgent("socks5h://127.0.0.1:1080")` 改成直连。
+- 保留 `Remove Patched Desktop` 删除副本，不改 WindowsApps 官方包。
+
+安装补丁版副本后，`Launch Shared Desktop` 会优先启动这个副本。`CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:<port>` 会直连 bridge-owned canonical app-server，不再需要 `desktopSocksProxyEnabled=true`。如果当前已经打开了 Microsoft Store 版 Codex Desktop，它仍在使用自己启动的 app-server；需要点 `Launch Shared Desktop` 重启到补丁版副本后，Desktop 才会和 bridge 使用同一个 canonical app-server。Codex Desktop 每次更新后，重新点一次 `Install Patched Desktop` 即可把新版本复制并补丁。
+
+命令行备用方式：
+
+```powershell
+npm run desktop:copy:status
+npm run desktop:copy
+npm run desktop:copy:remove
+```
+
+如果不安装补丁，仍可使用旧兼容路径：设置 `desktopSocksProxyEnabled=true`，让 bridge 启动只允许转发到 canonical app-server 的本机 SOCKS5 代理。`/doctor` 会显示 `WebSocket` 和 `Desktop SOCKS` 状态。
 
 如果希望后台保活：
 

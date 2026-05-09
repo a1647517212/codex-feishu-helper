@@ -1904,8 +1904,8 @@ export class TaskService {
     if (binding.feishuContainerKind === "dedicated_chat") {
       return {
         chatId: binding.feishuChatId,
-        rootMessageId: null,
-        threadId: null
+        rootMessageId: firstRealFeishuMessageId(binding.feishuTaskCardMessageId, binding.feishuTopicRootMessageId),
+        threadId: firstRealFeishuThreadId(binding.feishuThreadId)
       };
     }
     return {
@@ -2185,10 +2185,12 @@ export class TaskService {
           }
         });
       }
+      this.recordItemProgress(binding, threadId, asString(params.turnId), item, "completed");
     }
     if (method === "item/started") {
       const item = params.item && typeof params.item === "object" ? (params.item as Record<string, unknown>) : {};
       await this.recordSubAgentItem(binding, threadId, asString(params.turnId), item, "item/started");
+      this.recordItemProgress(binding, threadId, asString(params.turnId), item, "started");
     }
     if (method === "item/agentMessage/delta") {
       const delta = asString(params.delta);
@@ -2267,6 +2269,115 @@ export class TaskService {
         this.enqueueProgressUpdate(binding, event.seq, "工具进度", asString(params.turnId), asString(params.itemId), messageText);
       }
     }
+    if (method === "rawResponseItem/completed") {
+      const item = params.item && typeof params.item === "object" ? (params.item as Record<string, unknown>) : {};
+      const itemEvent = buildRawResponseItemEvent(item);
+      if (itemEvent) {
+        const event = this.repo.insertEvent({
+          sessionBindingId: binding.id,
+          codexThreadId: threadId,
+          codexTurnId: asString(params.turnId),
+          eventType: itemEvent.eventType,
+          eventPayload: {
+            itemId: itemEvent.itemId,
+            text: itemEvent.text,
+            source: "rawResponseItem/completed"
+          }
+        });
+        this.enqueueProgressUpdate(
+          binding,
+          event.seq,
+          itemEvent.label,
+          asString(params.turnId),
+          itemEvent.itemId,
+          itemEvent.text,
+          { force: true, replace: true }
+        );
+      }
+    }
+    if (method === "item/fileChange/patchUpdated") {
+      const changes = Array.isArray(params.changes) ? params.changes : [];
+      const text = formatFileChangeSummary(changes, "updated");
+      if (text) {
+        const event = this.repo.insertEvent({
+          sessionBindingId: binding.id,
+          codexThreadId: threadId,
+          codexTurnId: asString(params.turnId),
+          eventType: "codex.file_change",
+          eventPayload: {
+            itemId: asString(params.itemId),
+            text,
+            source: "item/fileChange/patchUpdated"
+          }
+        });
+        this.enqueueProgressUpdate(binding, event.seq, "文件变更", asString(params.turnId), asString(params.itemId), text, {
+          force: true,
+          replace: true
+        });
+      }
+    }
+    if (method === "item/commandExecution/outputDelta" || method === "item/fileChange/outputDelta") {
+      const delta = asString(params.delta);
+      if (delta) {
+        this.repo.insertEvent({
+          sessionBindingId: binding.id,
+          codexThreadId: threadId,
+          codexTurnId: asString(params.turnId),
+          eventType: method === "item/commandExecution/outputDelta" ? "codex.command_output" : "codex.file_change_output",
+          eventPayload: {
+            itemId: asString(params.itemId),
+            text: truncate(delta, 1200)
+          }
+        });
+      }
+    }
+    if (method === "item/commandExecution/terminalInteraction") {
+      const stdin = asString(params.stdin);
+      const text = stdin ? `终端交互：已向运行中的命令发送输入。` : "终端交互：命令等待输入。";
+      const event = this.repo.insertEvent({
+        sessionBindingId: binding.id,
+        codexThreadId: threadId,
+        codexTurnId: asString(params.turnId),
+        eventType: "codex.command_execution",
+        eventPayload: {
+          itemId: asString(params.itemId),
+          processId: asString(params.processId),
+          text
+        }
+      });
+      this.enqueueProgressUpdate(binding, event.seq, "执行命令", asString(params.turnId), asString(params.itemId), text, {
+        force: true,
+        replace: true
+      });
+    }
+  }
+
+  private recordItemProgress(
+    binding: SessionBinding,
+    threadId: string,
+    turnId: string | null,
+    item: Record<string, unknown>,
+    phase: "started" | "completed"
+  ): void {
+    const itemEvent = buildItemProgressEvent(item, phase);
+    if (!itemEvent) return;
+    const event = this.repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: threadId,
+      codexTurnId: turnId,
+      eventType: itemEvent.eventType,
+      eventPayload: {
+        itemId: itemEvent.itemId,
+        itemType: itemEvent.itemType,
+        phase,
+        text: itemEvent.text,
+        ...itemEvent.payload
+      }
+    });
+    this.enqueueProgressUpdate(binding, event.seq, itemEvent.label, turnId, itemEvent.itemId, itemEvent.text, {
+      force: true,
+      replace: true
+    });
   }
 
   private enqueueProgressUpdate(
@@ -2407,6 +2518,8 @@ export class TaskService {
       1600
     );
     pushSection("子 Agent", formatSubAgentLines(extractSubAgentsFromEvents(events), 6), 1600);
+    pushSection("执行命令", latestProcessText(events, ["codex.command_execution"]), 1000);
+    pushSection("文件变更", latestProcessText(events, ["codex.file_change"]), 1200);
     pushSection("工具进度", latestProcessText(events, ["codex.tool_progress"]), 900);
     const finalText =
       latestEventPayloadText(events, ["task.completed", "task.failed", "task.interrupted"], "finalResult") ??
@@ -2732,6 +2845,20 @@ const taskStatusPrefix = (status: TaskStatus): string => {
   if (status === "waiting_for_approval") return "[确认] ";
   if (status === "running") return "[运行中] ";
   return "";
+};
+
+const firstRealFeishuMessageId = (...values: Array<string | null | undefined>): string | null => {
+  for (const value of values) {
+    if (value && /^om_[A-Za-z0-9_-]+$/.test(value)) return value;
+  }
+  return null;
+};
+
+const firstRealFeishuThreadId = (...values: Array<string | null | undefined>): string | null => {
+  for (const value of values) {
+    if (value && /^omt_[A-Za-z0-9_-]+$/.test(value)) return value;
+  }
+  return null;
 };
 
 const normalizeTurnStatus = (status: unknown): TaskStatus => {
@@ -3199,6 +3326,332 @@ const buildCompletedItemEvent = (item: Record<string, unknown>): { eventType: st
   return null;
 };
 
+type ItemProgressEvent = {
+  eventType: string;
+  label: string;
+  itemId: string | null;
+  itemType: string;
+  text: string;
+  payload?: Record<string, unknown>;
+};
+
+const buildItemProgressEvent = (
+  item: Record<string, unknown>,
+  phase: "started" | "completed"
+): ItemProgressEvent | null => {
+  const type = asString(item.type);
+  const itemId = asString(item.id);
+  if (!type) return null;
+  if (type === "commandExecution") {
+    const command = asString(item.command);
+    const status = asString(item.status);
+    const exitCode = typeof item.exitCode === "number" ? item.exitCode : null;
+    const durationMs = typeof item.durationMs === "number" ? item.durationMs : null;
+    const cwd = asString(item.cwd);
+    const actionText = formatCommandActions(item.commandActions);
+    const lines = [
+      phase === "started" ? "开始执行命令。" : `命令执行${exitCode === 0 || status === "completed" ? "完成" : "结束"}。`,
+      command ? `命令：${truncatePlain(command, 180)}` : null,
+      cwd ? `目录：${truncatePlain(cwd, 160)}` : null,
+      actionText ? `动作：${actionText}` : null,
+      phase === "completed" && exitCode != null ? `结果：exit ${exitCode}` : null,
+      phase === "completed" && durationMs != null ? `耗时：${formatDurationMs(durationMs)}` : null
+    ].filter(Boolean);
+    return {
+      eventType: "codex.command_execution",
+      label: "执行命令",
+      itemId,
+      itemType: type,
+      text: lines.join("\n"),
+      payload: { command, status, exitCode, durationMs, cwd }
+    };
+  }
+  if (type === "fileChange") {
+    const changes = Array.isArray(item.changes) ? item.changes : [];
+    const text = formatFileChangeSummary(changes, phase);
+    if (!text) return null;
+    return {
+      eventType: "codex.file_change",
+      label: "文件变更",
+      itemId,
+      itemType: type,
+      text,
+      payload: { status: asString(item.status), changesCount: changes.length }
+    };
+  }
+  if (type === "mcpToolCall" || type === "dynamicToolCall") {
+    const toolName = formatToolName(item, type);
+    const status = asString(item.status);
+    const durationMs = typeof item.durationMs === "number" ? item.durationMs : null;
+    const error = extractToolError(item);
+    const lines = [
+      phase === "started" ? "开始调用工具。" : "工具调用结束。",
+      toolName ? `工具：${toolName}` : null,
+      status ? `状态：${status}` : null,
+      error ? `异常：${truncatePlain(error, 220)}` : null,
+      phase === "completed" && durationMs != null ? `耗时：${formatDurationMs(durationMs)}` : null
+    ].filter(Boolean);
+    return {
+      eventType: "codex.tool_progress",
+      label: "工具进度",
+      itemId,
+      itemType: type,
+      text: lines.join("\n"),
+      payload: { status, toolName, durationMs, error }
+    };
+  }
+  if (type === "collabAgentToolCall") {
+    const text = formatCollabToolProgress(item, phase);
+    if (!text) return null;
+    return {
+      eventType: "codex.subagent",
+      label: "子 Agent",
+      itemId,
+      itemType: type,
+      text,
+      payload: { status: asString(item.status), tool: asString(item.tool) }
+    };
+  }
+  if (type === "webSearch") {
+    const query = asString(item.query);
+    const action = item.action && typeof item.action === "object" ? (item.action as Record<string, unknown>) : {};
+    const actionText = formatWebSearchAction(action);
+    return {
+      eventType: "codex.tool_progress",
+      label: "资料检索",
+      itemId,
+      itemType: type,
+      text: [phase === "started" ? "开始检索资料。" : "资料检索完成。", query ? `查询：${truncatePlain(query, 220)}` : actionText].filter(Boolean).join("\n"),
+      payload: { query, action: actionText }
+    };
+  }
+  if (type === "imageView" || type === "imageGeneration") {
+    const text = formatImageProgress(item, type, phase);
+    if (!text) return null;
+    return {
+      eventType: "codex.tool_progress",
+      label: "图片处理",
+      itemId,
+      itemType: type,
+      text
+    };
+  }
+  if (type === "enteredReviewMode" || type === "exitedReviewMode" || type === "contextCompaction") {
+    const text = formatStateItemProgress(item, type, phase);
+    if (!text) return null;
+    return {
+      eventType: "codex.tool_progress",
+      label: "处理状态",
+      itemId,
+      itemType: type,
+      text
+    };
+  }
+  return null;
+};
+
+const buildRawResponseItemEvent = (item: Record<string, unknown>): (ItemProgressEvent & { itemId: string | null }) | null => {
+  const type = asString(item.type);
+  const itemId = asString(item.id) ?? asString(item.call_id) ?? asString(item.callId);
+  if (type === "message") {
+    const text = extractTextFromUnknown(item.content);
+    return text
+      ? {
+          eventType: "codex.agent_message",
+          label: "阶段性回复",
+          itemId,
+          itemType: type,
+          text: truncate(text, 2000)
+        }
+      : null;
+  }
+  if (type === "reasoning") {
+    const summary = extractTextArray(item.summary);
+    const content = extractTextArray(item.content);
+    const text = summary ?? content;
+    return text
+      ? {
+          eventType: summary ? "codex.reasoning_summary" : "codex.reasoning",
+          label: "处理摘要",
+          itemId,
+          itemType: type,
+          text: truncate(text, 2000)
+        }
+      : null;
+  }
+  if (type === "function_call" || type === "custom_tool_call" || type === "tool_search_call" || type === "web_search_call") {
+    const name = asString(item.name) ?? asString(item.execution) ?? type;
+    const status = asString(item.status);
+    return {
+      eventType: "codex.tool_progress",
+      label: type === "web_search_call" || type === "tool_search_call" ? "资料检索" : "工具进度",
+      itemId,
+      itemType: type,
+      text: [`${rawResponseTypeText(type)}。`, name ? `名称：${truncatePlain(name, 160)}` : null, status ? `状态：${status}` : null].filter(Boolean).join("\n")
+    };
+  }
+  if (type === "local_shell_call") {
+    const action = item.action && typeof item.action === "object" ? (item.action as Record<string, unknown>) : {};
+    const command = asString(action.command);
+    const status = asString(item.status);
+    return {
+      eventType: "codex.command_execution",
+      label: "执行命令",
+      itemId,
+      itemType: type,
+      text: ["命令执行状态更新。", command ? `命令：${truncatePlain(command, 180)}` : null, status ? `状态：${status}` : null].filter(Boolean).join("\n")
+    };
+  }
+  return null;
+};
+
+const formatFileChangeSummary = (changes: unknown[], phase: "started" | "completed" | "updated"): string | null => {
+  const parsed = changes
+    .map((change) => (change && typeof change === "object" ? (change as Record<string, unknown>) : null))
+    .filter((change): change is Record<string, unknown> => Boolean(change));
+  if (parsed.length === 0) return null;
+  const counts = new Map<string, number>();
+  const files = parsed.slice(0, 6).map((change) => {
+    const kind = formatPatchKind(change.kind);
+    counts.set(kind, (counts.get(kind) ?? 0) + 1);
+    const path = asString(change.path) ?? "未知文件";
+    return `- ${kind}：${truncatePlain(path, 180)}`;
+  });
+  for (const change of parsed.slice(6)) {
+    const kind = formatPatchKind(change.kind);
+    counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  }
+  const countText = [...counts.entries()].map(([kind, count]) => `${kind} ${count}`).join("，");
+  const prefix =
+    phase === "started"
+      ? "开始修改文件。"
+      : phase === "completed"
+        ? "文件修改完成。"
+        : "文件修改内容已更新。";
+  const hidden = parsed.length > files.length ? `\n... 还有 ${parsed.length - files.length} 个文件` : "";
+  return [`${prefix}${countText ? `（${countText}）` : ""}`, files.join("\n") + hidden].filter(Boolean).join("\n");
+};
+
+const formatPatchKind = (kind: unknown): string => {
+  if (typeof kind === "string") return patchKindText(kind);
+  if (kind && typeof kind === "object") {
+    const type = asString((kind as Record<string, unknown>).type);
+    const movePath = asString((kind as Record<string, unknown>).move_path);
+    return movePath ? `${patchKindText(type)} -> ${truncatePlain(movePath, 100)}` : patchKindText(type);
+  }
+  return "修改";
+};
+
+const patchKindText = (type: string | null): string =>
+  ({
+    add: "新增",
+    delete: "删除",
+    update: "修改"
+  })[type ?? ""] ?? "修改";
+
+const formatCommandActions = (value: unknown): string | null => {
+  if (!Array.isArray(value)) return null;
+  const actions = value
+    .map((entry) => (entry && typeof entry === "object" ? (entry as Record<string, unknown>) : null))
+    .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+    .map((entry) => {
+      const type = asString(entry.type);
+      const path = asString(entry.path);
+      const query = asString(entry.query);
+      const name = asString(entry.name);
+      if (type === "read") return `读取 ${name ?? path ?? "文件"}`;
+      if (type === "listFiles") return `查看文件 ${path ?? ""}`.trim();
+      if (type === "search") return `搜索 ${query ?? path ?? ""}`.trim();
+      return null;
+    })
+    .filter((entry): entry is string => Boolean(entry));
+  return actions.length > 0 ? actions.slice(0, 3).join("；") : null;
+};
+
+const formatToolName = (item: Record<string, unknown>, type: string): string | null => {
+  if (type === "mcpToolCall") {
+    const server = asString(item.server);
+    const tool = asString(item.tool);
+    return [server, tool].filter(Boolean).join(".") || null;
+  }
+  const namespace = asString(item.namespace);
+  const tool = asString(item.tool);
+  return [namespace, tool].filter(Boolean).join(".") || null;
+};
+
+const extractToolError = (item: Record<string, unknown>): string | null => {
+  const error = item.error;
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object") return asString((error as Record<string, unknown>).message);
+  return null;
+};
+
+const formatCollabToolProgress = (item: Record<string, unknown>, phase: "started" | "completed"): string | null => {
+  const tool = asString(item.tool);
+  const status = asString(item.status);
+  const model = asString(item.model);
+  const reasoningEffort = asString(item.reasoningEffort);
+  const receiverCount = Array.isArray(item.receiverThreadIds) ? item.receiverThreadIds.length : 0;
+  const lines = [
+    phase === "started" ? "子 Agent 调用开始。" : "子 Agent 调用更新。",
+    tool ? `动作：${tool}` : null,
+    status ? `状态：${status}` : null,
+    receiverCount > 0 ? `数量：${receiverCount}` : null,
+    model ? `模型：${model}` : null,
+    reasoningEffort ? `思考：${reasoningEffort}` : null
+  ].filter(Boolean);
+  return lines.length > 1 ? lines.join("\n") : null;
+};
+
+const formatWebSearchAction = (action: Record<string, unknown>): string | null => {
+  const type = asString(action.type);
+  const query = asString(action.query);
+  const url = asString(action.url);
+  const pattern = asString(action.pattern);
+  if (type === "search") return query ? `查询：${truncatePlain(query, 220)}` : "执行搜索。";
+  if (type === "openPage" || type === "open_page") return url ? `打开页面：${truncatePlain(url, 220)}` : "打开页面。";
+  if (type === "findInPage" || type === "find_in_page") return pattern ? `页内查找：${truncatePlain(pattern, 160)}` : "页内查找。";
+  return null;
+};
+
+const formatImageProgress = (item: Record<string, unknown>, type: string, phase: "started" | "completed"): string | null => {
+  if (type === "imageView") {
+    const path = asString(item.path);
+    return [phase === "started" ? "开始查看图片。" : "图片查看完成。", path ? `文件：${truncatePlain(path, 180)}` : null].filter(Boolean).join("\n");
+  }
+  const status = asString(item.status);
+  const savedPath = asString(item.savedPath);
+  return [
+    phase === "started" ? "开始生成图片。" : "图片生成更新。",
+    status ? `状态：${status}` : null,
+    savedPath ? `文件：${truncatePlain(savedPath, 180)}` : null
+  ].filter(Boolean).join("\n");
+};
+
+const formatStateItemProgress = (item: Record<string, unknown>, type: string, phase: "started" | "completed"): string | null => {
+  const review = asString(item.review);
+  if (type === "enteredReviewMode") return review ? `进入评审模式：${truncatePlain(review, 220)}` : "进入评审模式。";
+  if (type === "exitedReviewMode") return review ? `退出评审模式：${truncatePlain(review, 220)}` : "退出评审模式。";
+  if (type === "contextCompaction") return phase === "completed" ? "上下文压缩完成。" : "开始压缩上下文。";
+  return null;
+};
+
+const rawResponseTypeText = (type: string): string =>
+  ({
+    function_call: "开始调用函数",
+    custom_tool_call: "开始调用工具",
+    tool_search_call: "开始检索资料",
+    web_search_call: "开始网页搜索"
+  })[type] ?? "模型响应更新";
+
+const formatDurationMs = (durationMs: number): string => {
+  if (durationMs < 1000) return `${Math.round(durationMs)}ms`;
+  if (durationMs < 60_000) return `${(durationMs / 1000).toFixed(1)}s`;
+  const minutes = Math.floor(durationMs / 60_000);
+  const seconds = Math.round((durationMs % 60_000) / 1000);
+  return `${minutes}m${seconds}s`;
+};
+
 const formatThreadReport = (
   binding: SessionBinding,
   report: ThreadReport,
@@ -3345,6 +3798,7 @@ const extractTextArray = (value: unknown): string | null => {
 
 const extractTextFromUnknown = (value: unknown): string | null => {
   if (typeof value === "string") return value.trim() || null;
+  if (Array.isArray(value)) return extractTextArray(value);
   if (!value || typeof value !== "object") return null;
   const object = value as Record<string, unknown>;
   for (const key of ["text", "content", "message", "delta", "summary"]) {
@@ -3421,7 +3875,9 @@ const sanitizeProgressText = (text: string): string => {
 };
 
 const sanitizeProcessText = (text: string, maxLength = 1800): string => {
+  if (!text.trim()) return "";
   const sanitized = sanitizeAssistantSummary(text, maxLength);
+  if (!sanitized || sanitized === "有输出，原始内容已保留在本地记录中。") return "";
   return sanitized.length > maxLength ? truncatePlain(sanitized, maxLength) : sanitized;
 };
 

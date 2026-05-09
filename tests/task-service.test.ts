@@ -329,6 +329,41 @@ test("continuing a dedicated task updates the existing status card instead of se
   }
 });
 
+test("dedicated task progress card replies to the existing task card", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    repo.createOrUpdateBinding({
+      codexThreadId: "thr_progress_target",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuTaskCardMessageId: "om_task_card_progress",
+      feishuContainerKind: "dedicated_chat",
+      title: "Progress target",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "item/plan/delta",
+      params: {
+        threadId: "thr_progress_target",
+        turnId: "turn_progress_target",
+        itemId: "plan_progress_target",
+        delta: "正在整理处理步骤。"
+      }
+    });
+    assert.equal(feishu.sent.length, 1);
+    assert.equal(feishu.sent[0]?.type, "card");
+    assert.equal(feishu.sent[0]?.chatId, "task_chat_1");
+    assert.equal(feishu.sent[0]?.root, "om_task_card_progress");
+  } finally {
+    cleanup();
+  }
+});
+
 test("open task action from control chat does not replay task status into the control chat", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
@@ -755,6 +790,137 @@ test("running deltas enqueue readable progress updates for Feishu", async () => 
     assert.equal(feishu.updatedCards.length, 1);
     assert.equal(JSON.stringify(feishu.updatedCards[0]?.card).includes("处理摘要"), true);
     assert.equal(JSON.stringify(feishu.updatedCards[0]?.card).includes("处理步骤"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("codex item lifecycle events update Feishu progress without raw terminal spam", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    const feishu = new MockFeishu();
+    new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_item_progress",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Item progress",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "item/started",
+      params: {
+        threadId: binding.codexThreadId,
+        turnId: "turn_item_progress",
+        item: {
+          type: "commandExecution",
+          id: "cmd_1",
+          command: "npm run check",
+          cwd: dir,
+          status: "inProgress",
+          commandActions: [{ type: "unknown", command: "npm run check" }]
+        }
+      }
+    });
+    await codex.notifications.notification![0]!({
+      method: "item/fileChange/patchUpdated",
+      params: {
+        threadId: binding.codexThreadId,
+        turnId: "turn_item_progress",
+        itemId: "patch_1",
+        changes: [
+          { path: "src/bridge/task-service.ts", kind: { type: "update", move_path: null }, diff: "..." },
+          { path: "tests/task-service.test.ts", kind: { type: "update", move_path: null }, diff: "..." }
+        ]
+      }
+    });
+    await codex.notifications.notification![0]!({
+      method: "item/commandExecution/outputDelta",
+      params: {
+        threadId: binding.codexThreadId,
+        turnId: "turn_item_progress",
+        itemId: "cmd_1",
+        delta: "raw terminal output should stay in local records"
+      }
+    });
+    const latest = JSON.stringify(feishu.updatedCards.at(-1)?.card ?? feishu.sent.at(-1)?.payload ?? {});
+    assert.equal(latest.includes("执行命令"), true);
+    assert.equal(latest.includes("文件变更"), true);
+    assert.equal(latest.includes("src/bridge/task-service.ts"), true);
+    assert.equal(latest.includes("raw terminal output should stay"), false);
+    assert.equal(repo.listEventsForBinding(binding.id).some((event) => event.eventType === "codex.command_output"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("raw response item completion fills Feishu progress and final report fallback", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    codex.threads = [
+      {
+        id: "thr_raw_response",
+        name: "Raw response",
+        preview: "Raw response",
+        cwd: dir,
+        status: { type: "idle" },
+        turns: [{ id: "turn_raw_response", status: "completed", items: [] }],
+        updatedAt: Date.now()
+      }
+    ];
+    const feishu = new MockFeishu();
+    new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_raw_response",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Raw response",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!({
+      method: "rawResponseItem/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turnId: "turn_raw_response",
+        item: {
+          type: "reasoning",
+          summary: [{ type: "summary_text", text: "已经完成原因定位。" }],
+          encrypted_content: null
+        }
+      }
+    });
+    await codex.notifications.notification![0]!({
+      method: "rawResponseItem/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turnId: "turn_raw_response",
+        item: {
+          type: "message",
+          role: "assistant",
+          content: [{ type: "output_text", text: "最终结论：飞书现在能收到 Codex App 输出。" }]
+        }
+      }
+    });
+    await codex.notifications.notification![0]!({
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: { id: "turn_raw_response", status: "completed", items: [] }
+      }
+    });
+    const report = findTaskReportOutbox(repo.listDueOutbox(10));
+    assert.ok(report);
+    const payload = JSON.stringify(report.payload);
+    assert.equal(payload.includes("已经完成原因定位。"), true);
+    assert.equal(payload.includes("最终结论：飞书现在能收到 Codex App 输出。"), true);
   } finally {
     cleanup();
   }
