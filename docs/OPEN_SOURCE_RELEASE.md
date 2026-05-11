@@ -27,8 +27,11 @@ rg -n -e "cli_[A-Za-z0-9]+" -e "App Secret" -e "appSecret" -e "app_secret" -e "t
 ## 文档
 
 - [x] README 是中文主入口。
+- [x] README 有架构图、任务时序图、图片消息流程图。
 - [x] README 有最小启动步骤。
 - [x] README 说明默认不需要公网 IP。
+- [x] README 明确主线是普通 Codex Desktop `desktop_ipc only`，不启动 helper-owned runtime。
+- [x] README 说明飞书图片消息会下载到本机并作为 `localImage` 传给普通 Desktop。
 - [x] README 说明默认权限风险：`danger-full-access` 和 `approvalPolicy=never`。
 - [x] README 明确默认一任务一独立群模式需要 `im:chat`、`im:chat:create`、`im:chat:update`。
 - [x] README 说明 Codex Desktop 单独对话完成提醒和对应配置项。
@@ -73,6 +76,5 @@ GitHub 仓库当前使用默认分支 `main`。
 
 ## 首次开源后的建议
 
-- 补一张架构图。
 - 补一段飞书开放平台截图式配置说明。
 - 继续完善普通 Desktop IPC 接管能力，减少 Codex Desktop 同步困扰。

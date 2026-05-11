@@ -1,17 +1,113 @@
 # Codex Feishu Helper
 
- Codex Feishu Helper 是一个本地桥接服务，用飞书群聊控制本机正在运行的 Codex Desktop 对话。它适合个人把飞书当作 Codex 任务控制台：在主控群里选择项目、创建任务、查看任务列表，在每个任务的独立飞书会话里持续追问和接收进度、结论。
+Codex Feishu Helper 是一个本地桥接服务，用飞书群聊控制本机正在运行的 Codex Desktop 对话。它适合个人把飞书当作 Codex 任务控制台：在主控群里选择项目、创建任务、查看任务列表，在每个任务的独立飞书会话里持续追问和接收进度、结论。
+
+核心路线是 **desktop_ipc only**：bridge 只连接普通 Codex Desktop 暴露的本机 IPC 管道，不启动 helper 自己的 Codex runtime，也不要求补丁版 Desktop、canonical WebSocket 或代理共享启动。飞书发来的消息最终进入同一个普通 Desktop runtime，因此 Desktop 侧能看到真实 thread，飞书侧能继续控制同一个 thread。
 
 当前默认设计是：
 
 - 飞书事件默认走长连接，不要求公网 IP、域名或内网穿透。
 - HTTP 服务默认只监听 `127.0.0.1`，用于健康检查、诊断和可选 HTTP 回调 fallback。
 - 新任务默认创建独立飞书任务会话；如果没有建群权限，可回退为群内话题。
-- Codex 默认模型是 `gpt-5.5`，思考等级是 `xhigh`，权限是 `danger-full-access`，审批策略是 `never`。
+- Codex 默认模型是 `gpt-5.4`，思考等级是 `xhigh`，权限是 `danger-full-access`，审批策略是 `never`。
 - 任务过程会推送结构化进度卡片，完成后推送结构化最终结论。
 - 只在普通 Codex Desktop 里单独发起、没有绑定飞书的对话，结束后也会在主控群提醒，并可一键接管到飞书继续。
 
 Codex Desktop 实时同步的长期优化方案见 [docs/CODEX_DESKTOP_SYNC_OPTIMIZATION.md](docs/CODEX_DESKTOP_SYNC_OPTIMIZATION.md)。
+
+## 原理架构
+
+整体上，项目由三个边界组成：飞书长连接负责接收用户输入，bridge 负责状态和编排，普通 Codex Desktop 负责真正执行任务。
+
+```mermaid
+flowchart LR
+  subgraph Feishu["飞书"]
+    Control["主控群<br/>/codex /projects /tasks"]
+    TaskChat["任务会话<br/>继续追问 / 审批 / 状态"]
+  end
+
+  subgraph Bridge["本机 Codex Feishu Helper"]
+    LC["飞书长连接<br/>im.message.receive_v1<br/>card.action.trigger"]
+    TaskService["TaskService<br/>任务编排 / 队列 / 审批 / 通知"]
+    DB[("SQLite bridge.db<br/>项目 / 绑定 / 事件 / outbox")]
+    Outbox["OutboxWorker<br/>卡片和文本重试发送"]
+  end
+
+  subgraph Desktop["普通 Codex Desktop"]
+    Pipe["Named Pipe<br/>\\\\.\\pipe\\codex-ipc"]
+    Runtime["Desktop 自带 Codex runtime"]
+    Thread["普通 Desktop thread"]
+  end
+
+  Control --> LC
+  TaskChat --> LC
+  LC --> TaskService
+  TaskService <--> DB
+  TaskService <--> Pipe
+  Pipe <--> Runtime
+  Runtime <--> Thread
+  TaskService --> Outbox
+  Outbox --> Control
+  Outbox --> TaskChat
+```
+
+### 新任务流程
+
+用户在飞书发起任务后，bridge 不会创建第二套 Codex 服务。它会请求普通 Desktop 在同一个 IPC/runtime 下创建 thread，然后把这个 thread 和飞书任务会话绑定起来。
+
+```mermaid
+sequenceDiagram
+  participant U as 用户
+  participant F as 飞书
+  participant B as Bridge
+  participant D as 普通 Codex Desktop
+  participant S as SQLite
+
+  U->>F: 在主控群发送需求或点击项目开始
+  F->>B: 长连接投递消息/卡片事件
+  B->>S: 记录 incoming message / pending prompt
+  B->>D: desktop_ipc start-conversation
+  D-->>B: 广播新 thread snapshot
+  B->>S: 写入 session binding
+  B->>F: 创建任务会话并发送状态卡片
+  U->>F: 在任务会话继续追问
+  F->>B: 长连接投递后续消息
+  B->>D: follower start-turn / steer-turn
+  D-->>B: 进度、审批、完成/失败事件
+  B->>F: 更新进度卡片和最终结论
+```
+
+### 图片消息流程
+
+飞书图片不会直接传给模型。bridge 先用飞书资源接口把图片下载到本机，再把本地文件路径作为 Codex Desktop 支持的 `localImage` 输入发送给同一个普通 Desktop thread。
+
+```mermaid
+flowchart TD
+  A["飞书 image 消息"] --> B["解析 image_key / message_id"]
+  B --> C["下载资源<br/>GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=image"]
+  C --> D["保存到<br/>~/.feishu-codex/attachments/..."]
+  D --> E["构造 Codex 输入<br/>text + localImage"]
+  E --> F["发送到普通 Desktop IPC"]
+  F --> G["同一个 Codex Desktop thread 处理图片"]
+```
+
+## 能做什么 / 不做什么
+
+能做：
+
+- 在飞书主控群打开 Codex 控制台、查看项目、查看运行任务和历史任务。
+- 从飞书创建普通 Codex Desktop thread，并在独立任务会话里持续追问。
+- 接管已经在普通 Desktop 中存在的 thread。
+- 把飞书图片消息下载到本机后作为 `localImage` 交给普通 Desktop thread。
+- 把审批、队列、进度、失败、完成结论以飞书卡片/消息形式回传。
+
+不做：
+
+- 不启动 helper-owned Codex runtime。
+- 不要求补丁版 Codex Desktop。
+- 不使用 canonical WebSocket 或 SOCKS 代理作为主线。
+- 不把本机 HTTP 管理接口暴露到公网。
+- 不承诺多人团队权限隔离；当前定位是个人本机控制台。
 
 ## 功能概览
 
@@ -133,6 +229,22 @@ npm run start
 npm run doctor
 ```
 
+启动成功后，日志通常能看到：
+
+```text
+codex desktop ipc transport ready
+codex app workspace sync completed
+feishu long connection ready
+```
+
+然后在飞书主控群发送：
+
+```text
+/codex
+```
+
+如果一切正常，机器人会回复 `Codex 控制台` 卡片。点击 `项目` 应能看到当前普通 Codex Desktop 已记录的 active 工作区。
+
 ### 普通 Desktop IPC 模式
 
 现在优先使用 `desktop_ipc` 连接普通正在运行的 Codex Desktop：
@@ -154,6 +266,12 @@ npm run doctor
 1. 先打开普通 Codex Desktop。
 2. 启动 bridge：控制面板点 `Start Bridge`，或运行 `npm run start`。
 3. 在飞书主控群直接发送任务并选择项目，bridge 会在普通 Desktop 创建新 thread；也可以发送 `/tasks` 查看可接管线程，或发送 `/claim <threadId>` 绑定到飞书继续。
+
+工作区来源：
+
+- bridge 启动时会读取普通 Codex Desktop 的工作区状态并导入为项目。
+- `/codex -> 项目` 会先再次同步工作区，再展示 active 项目。
+- 已归档项目不会出现在项目列表里；未归类 Desktop thread 可以通过 `/unclassified` 归入项目。
 
 如果桌面快捷方式被删，可以重新创建：
 
@@ -282,6 +400,56 @@ node dist/src/main.js serve --config D:\path\config.json
 - `/stop`：停止当前任务。
 - `/retry`：重试失败任务。
 - `/archive`：归档任务。
+
+## 常见问题
+
+### `/codex` 没有反应
+
+先确认 bridge 进程还在：
+
+```powershell
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match 'dist/src/main.js serve' }
+```
+
+再看日志：
+
+```powershell
+Get-Content $env:USERPROFILE\.feishu-codex\bridge.log -Tail 80
+```
+
+正常应该有 `feishu long connection ready`。如果没有，重新启动 bridge 或使用控制面板的 `Start Bridge`。
+
+### 项目列表不全
+
+项目列表只展示 `active` 项目，不展示归档项目。bridge 会从普通 Codex Desktop 工作区状态同步 active 项目；如果刚在 Desktop 新开了工作区，重新发送 `/codex` 并点击 `项目` 会触发一次同步。
+
+### 图片消息失败
+
+图片链路需要飞书资源下载权限。日志里如果出现 `Feishu download message resource failed`，通常是飞书应用缺少资源下载相关 scope，或应用版本没有重新发布授权。正常成功日志包括：
+
+```text
+feishu message received ... attachments: 1
+Feishu download message resource saved
+codex image attachments prepared
+```
+
+### 任务失败但图片已经收到
+
+如果日志显示图片已保存并准备为 `localImage`，失败通常已经进入 Codex runtime 层。例如模型网关返回额度不足、网络错误或 Desktop runtime 错误。此时图片桥接本身是通的，应优先看 `task.failed` 事件里的 runtime error。
+
+### 卡片按钮点击失败
+
+优先使用长连接 `card.action.trigger`。如果飞书端没有把卡片事件投到本地，按钮可能出现 toast 错误。可临时改成命令模式：
+
+```json
+{
+  "feishu": {
+    "interactionMode": "message_command"
+  }
+}
+```
+
+命令模式下卡片会显示对应文本命令，不依赖公网 HTTP callback。
 
 ## 本地 HTTP 服务说明
 

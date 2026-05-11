@@ -1513,6 +1513,39 @@ test("new task action without project shows project selection", async () => {
   }
 });
 
+test("project list renders all active projects instead of truncating at twelve", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    for (let index = 1; index <= 15; index += 1) {
+      repo.upsertProject({
+        id: `proj_many_${index}`,
+        name: `Project ${String(index).padStart(2, "0")}`,
+        rootPath: `${dir}\\project-${index}`
+      });
+    }
+    await service.handleCardAction({
+      actionId: "act_project_list_many",
+      action: "project_list",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_projects",
+      payload: {}
+    });
+    const payload = JSON.stringify(feishu.sent[0]?.payload ?? {});
+    assert.equal(feishu.sent[0]?.type, "card");
+    assert.equal(payload.includes("Project 01"), true);
+    assert.equal(payload.includes("Project 12"), true);
+    assert.equal(payload.includes("Project 13"), true);
+    assert.equal(payload.includes("Project 15"), true);
+  } finally {
+    cleanup();
+  }
+});
+
 test("project new task action creates a draft dedicated task chat", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {

@@ -93,7 +93,7 @@ export class Repository {
 
   listProjects(): Project[] {
     return this.database.db
-      .prepare("SELECT * FROM projects WHERE status = 'active' ORDER BY updated_at DESC")
+      .prepare("SELECT * FROM projects WHERE status = 'active' ORDER BY updated_at DESC, name ASC, root_path ASC")
       .all()
       .map((row) => mapProject(row as DbRow));
   }

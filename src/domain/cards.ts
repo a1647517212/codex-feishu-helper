@@ -173,7 +173,7 @@ export class CardRenderer {
     const elements: Record<string, unknown>[] = [
       text(options.pendingPromptId ? "选择项目后，会用刚才那条需求创建任务会话。" : "选择一个项目后，可以查看这个项目里的对话、运行状态和项目设置。")
     ];
-    for (const project of projects.slice(0, 12)) {
+    for (const project of projects) {
       elements.push(text([`项目：${project.name}`, `目录：${project.rootPath}`].join("\n")));
       pushActionRows(elements, this.interactionMode, [
         button(options.pendingPromptId ? "开始" : "进入", options.pendingPromptId ? "project_start_prompt" : "project_open", {
