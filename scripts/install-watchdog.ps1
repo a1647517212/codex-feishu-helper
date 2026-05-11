@@ -33,7 +33,7 @@ $taskXml = @"
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
     <Author>$author</Author>
-    <Description>Every five minutes, silently keeps the Feishu Codex bridge and its Codex app-server child process alive.</Description>
+    <Description>Every five minutes, silently keeps the Feishu Codex bridge alive.</Description>
   </RegistrationInfo>
   <Triggers>
     <TimeTrigger>

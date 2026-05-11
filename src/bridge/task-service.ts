@@ -5,8 +5,10 @@ import { basename, resolve } from "node:path";
 import { newId } from "../core/ids.js";
 import { asString } from "../core/json.js";
 import type {
+  ActionRequest,
   FeishuCardAction,
   FeishuIncomingMessage,
+  FeishuMessageAttachment,
   NotificationLevel,
   NotificationType,
   PendingApproval,
@@ -35,6 +37,7 @@ import {
   subAgentEventsFromItem
 } from "../domain/subagents.js";
 import type { CodexClient, CodexModelSummary, CodexThreadSummary } from "../codex/client.js";
+import type { CodexLocalImageAttachment } from "../codex/protocol.js";
 import type { FeishuSender, SentMessage } from "../feishu/client.js";
 import type { Logger } from "../logger.js";
 import { DiagnosticsService } from "./diagnostics.js";
@@ -67,6 +70,22 @@ type WorkspaceImportSummary = {
   matched: number;
   skipped: number;
   sources: string[];
+};
+
+type CodexMessageInput = {
+  prompt: string;
+  attachments: CodexLocalImageAttachment[];
+  feishuAttachments: FeishuMessageAttachment[];
+};
+
+type StoredServerRequestPayload = {
+  requestId: string;
+  method: string;
+  threadId: string;
+  turnId: string | null;
+  itemId: string | null;
+  bindingId: string;
+  params: Record<string, unknown>;
 };
 
 export class TaskService {
@@ -276,7 +295,7 @@ export class TaskService {
 
   async reconcilePersistedBindings(): Promise<void> {
     for (const binding of this.repo.listBindings(this.config.bridge.threadListLimit)) {
-      if (binding.status === "waiting_for_prompt" || binding.codexThreadId.startsWith("draft_")) {
+      if (binding.status === "waiting_for_prompt" || binding.codexThreadId.startsWith("draft_") || binding.codexThreadId.startsWith("pending_desktop_")) {
         continue;
       }
       try {
@@ -408,17 +427,18 @@ export class TaskService {
 
   async handleMessage(message: FeishuIncomingMessage): Promise<void> {
     this.security.assertFeishuMessageAllowed(message);
-    const text = message.text.trim();
+    const text = normalizeMessageText(message);
+    const normalizedMessage: FeishuIncomingMessage = { ...message, text };
     const incoming = this.repo.beginIncomingMessage({
-      messageId: message.messageId,
-      chatId: message.chatId,
-      userId: message.userId,
+      messageId: normalizedMessage.messageId,
+      chatId: normalizedMessage.chatId,
+      userId: normalizedMessage.userId,
       text
     });
     if (incoming.duplicate) {
       this.logger.warn("duplicate feishu message ignored", {
-        messageId: message.messageId,
-        chatId: message.chatId,
+        messageId: normalizedMessage.messageId,
+        chatId: normalizedMessage.chatId,
         deliveries: incoming.deliveries
       });
       return;
@@ -436,29 +456,29 @@ export class TaskService {
       return;
     }
     this.repo.upsertTrustedFeishuSubject({
-      chatId: message.chatId,
-      userId: message.userId,
+      chatId: normalizedMessage.chatId,
+      userId: normalizedMessage.userId,
       role: "owner",
       status: "active"
     });
-    if (await this.tryHandleMessageCommand(message, text)) {
+    if (await this.tryHandleMessageCommand(normalizedMessage, text)) {
       return;
     }
-    const rootMessageId = message.rootMessageId ?? message.messageId;
+    const rootMessageId = normalizedMessage.rootMessageId ?? normalizedMessage.messageId;
     const binding =
-      (message.threadId ? this.repo.findBindingByFeishuThreadId(message.chatId, message.threadId) : null) ??
-      (message.parentMessageId ? this.repo.findBindingByTaskCardMessageId(message.chatId, message.parentMessageId) : null) ??
-      this.repo.findBindingByTopic(message.chatId, rootMessageId) ??
-      this.repo.findBindingByChatId(message.chatId);
+      (normalizedMessage.threadId ? this.repo.findBindingByFeishuThreadId(normalizedMessage.chatId, normalizedMessage.threadId) : null) ??
+      (normalizedMessage.parentMessageId ? this.repo.findBindingByTaskCardMessageId(normalizedMessage.chatId, normalizedMessage.parentMessageId) : null) ??
+      this.repo.findBindingByTopic(normalizedMessage.chatId, rootMessageId) ??
+      this.repo.findBindingByChatId(normalizedMessage.chatId);
     if (binding) {
       if (binding.status === "waiting_for_prompt") {
-        await this.startNewTaskFromPrompt(binding, message);
+        await this.startNewTaskFromPrompt(binding, normalizedMessage);
         return;
       }
-      await this.continueBindingFromFeishu(binding, message);
+      await this.continueBindingFromFeishu(binding, normalizedMessage);
       return;
     }
-    await this.createNewTaskFromFeishu(message);
+    await this.createNewTaskFromFeishu(normalizedMessage);
   }
 
   async handleCardAction(action: FeishuCardAction): Promise<Record<string, unknown>> {
@@ -584,7 +604,8 @@ export class TaskService {
       feishuMessageId: message.messageId,
       feishuChatId: message.chatId,
       feishuUserId: message.userId,
-      text: message.text
+      text: message.text,
+      attachments: message.attachments ?? []
     });
     await this.feishu.sendCard(
       message.chatId,
@@ -600,7 +621,9 @@ export class TaskService {
     sourceMessageId: string;
     sourceChatId: string;
     sourceRootMessageId?: string | null;
+    attachments?: FeishuMessageAttachment[];
   }): Promise<void> {
+    if (this.isDesktopIpcMode()) return this.startDesktopIpcProjectTaskFromPrompt(input);
     const title = summarizeTitle(input.prompt);
     const container = await this.ensureTaskContainer(
       {
@@ -651,7 +674,7 @@ export class TaskService {
       sessionBindingId: binding.id,
       codexThreadId: binding.codexThreadId,
       eventType: "task.created_from_feishu",
-      eventPayload: { text: input.prompt },
+      eventPayload: { text: input.prompt, attachments: describeFeishuAttachments(input.attachments) },
       feishuMessageId: input.sourceMessageId
     });
     const startCheckpoint = await this.captureCheckpointForWorkspace({
@@ -662,10 +685,16 @@ export class TaskService {
       turnId: null,
       note: "任务开始前"
     });
-    const turn = await this.codex.startTurn(binding.codexThreadId, input.prompt, {
+    const codexInput = await this.resolveCodexMessageInput({
+      messageId: input.sourceMessageId,
+      prompt: input.prompt,
+      attachments: input.attachments
+    });
+    const turn = await this.codex.startTurn(binding.codexThreadId, codexInput.prompt, {
       cwd: binding.cwd,
       model: resolveBindingModel(binding, input.project, this.config),
-      reasoningEffort: resolveBindingReasoningEffort(binding, input.project, this.config)
+      reasoningEffort: resolveBindingReasoningEffort(binding, input.project, this.config),
+      attachments: codexInput.attachments
     });
     const turnId = extractTurnId(turn);
     if (startCheckpoint && turnId) this.repo.updateWorkspaceCheckpointTurnId(startCheckpoint.id, turnId);
@@ -675,6 +704,7 @@ export class TaskService {
   }
 
   private async startNewTaskFromPrompt(binding: SessionBinding, message: FeishuIncomingMessage): Promise<void> {
+    if (this.isDesktopIpcMode()) return this.startDesktopIpcDraftTaskFromPrompt(binding, message);
     const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
     const thread = await this.codex.startThread({
       cwd: project?.rootPath ?? binding.cwd ?? null,
@@ -683,10 +713,16 @@ export class TaskService {
     });
     const title = summarizeTitle(message.text);
     const startCheckpoint = await this.captureCheckpoint(binding.id, "turn_start", null, "任务开始前");
-    const turn = await this.codex.startTurn(thread.id, message.text, {
+    const codexInput = await this.resolveCodexMessageInput({
+      messageId: message.messageId,
+      prompt: message.text,
+      attachments: message.attachments
+    });
+    const turn = await this.codex.startTurn(thread.id, codexInput.prompt, {
       cwd: thread.cwd ?? project?.rootPath ?? binding.cwd ?? null,
       model: resolveBindingModel(binding, project, this.config),
-      reasoningEffort: resolveBindingReasoningEffort(binding, project, this.config)
+      reasoningEffort: resolveBindingReasoningEffort(binding, project, this.config),
+      attachments: codexInput.attachments
     });
     const turnId = extractTurnId(turn);
     if (startCheckpoint && turnId) this.repo.updateWorkspaceCheckpointTurnId(startCheckpoint.id, turnId);
@@ -714,22 +750,234 @@ export class TaskService {
       sessionBindingId: binding.id,
       codexThreadId: thread.id,
       eventType: "task.created_from_feishu",
-      eventPayload: { text: message.text, fromDraft: true },
+      eventPayload: { text: message.text, fromDraft: true, attachments: describeFeishuAttachments(codexInput.feishuAttachments) },
       feishuMessageId: message.messageId
     });
     await this.updateTaskTitle(binding.id, "running", title);
     await this.updateTaskCard(binding.id);
   }
 
+  private async startDesktopIpcProjectTaskFromPrompt(input: {
+    project: Project;
+    prompt: string;
+    userId: string;
+    sourceMessageId: string;
+    sourceChatId: string;
+    sourceRootMessageId?: string | null;
+    attachments?: FeishuMessageAttachment[];
+  }): Promise<void> {
+    const title = summarizeTitle(input.prompt);
+    const codexInput = await this.resolveCodexMessageInput({
+      messageId: input.sourceMessageId,
+      prompt: input.prompt,
+      attachments: input.attachments
+    });
+    const container = await this.ensureTaskContainer(
+      {
+        chatId: input.project.feishuChatId ?? input.sourceChatId,
+        title,
+        card: this.cards.waitingForPromptCard(input.project)
+      },
+      { userId: input.userId }
+    );
+    if (container.kind === "dedicated_chat") {
+      await this.feishu.sendText(container.chatId, `任务：${title}\n\n后续补充、/status、/logs、/archive 都在这个会话里发送。`);
+      await this.repo.beginIncomingMessage({
+        messageId: `system:${container.chatId}:${input.sourceMessageId}`,
+        chatId: container.chatId,
+        userId: input.userId,
+        text: input.prompt
+      });
+    }
+    const pendingBinding = this.repo.createOrUpdateBinding({
+      projectId: input.project.id,
+      codexThreadId: newId("pending_desktop"),
+      feishuChatId: container.chatId,
+      feishuTopicRootMessageId: container.rootMessageId,
+      feishuThreadId: container.threadId,
+      feishuTaskCardMessageId: container.cardMessageId,
+      feishuContainerKind: container.kind,
+      feishuControlChatId: container.controlChatId,
+      title,
+      cwd: input.project.rootPath,
+      selectedModel: projectModel(input.project, this.config),
+      selectedReasoningEffort: projectReasoningEffort(input.project, this.config),
+      status: "running",
+      createdByFeishuUserId: input.userId,
+      createdFrom: "feishu_new_task"
+    });
+    const startCheckpoint = await this.captureCheckpointForWorkspace({
+      binding: pendingBinding,
+      codexThreadId: pendingBinding.codexThreadId,
+      workspaceRoot: input.project.rootPath,
+      kind: "turn_start",
+      turnId: null,
+      note: "任务开始前"
+    });
+    let thread: CodexThreadSummary;
+    try {
+      thread = await this.codex.startThread({
+        cwd: input.project.rootPath,
+        model: projectModel(input.project, this.config),
+        reasoningEffort: projectReasoningEffort(input.project, this.config),
+        prompt: codexInput.prompt,
+        attachments: codexInput.attachments
+      });
+    } catch (error) {
+      await this.markDesktopThreadCreationFailed({
+        binding: pendingBinding,
+        title,
+        prompt: codexInput.prompt,
+        sourceMessageId: input.sourceMessageId,
+        error
+      });
+      return;
+    }
+    const turnId = latestTurnIdFromThread(thread);
+    this.repo.activateDraftBinding({
+      bindingId: pendingBinding.id,
+      codexThreadId: thread.id,
+      projectId: input.project.id,
+      title,
+      cwd: thread.cwd ?? input.project.rootPath,
+      status: "running",
+      lastTurnId: turnId
+    });
+    if (startCheckpoint && turnId) this.repo.updateWorkspaceCheckpointTurnId(startCheckpoint.id, turnId);
+    const binding = this.repo.findBindingById(pendingBinding.id) ?? pendingBinding;
+    this.repo.upsertThreadOwnership({
+      codexThreadId: thread.id,
+      ownerKind: "feishu_bridge",
+      ownerClientId: this.config.machine.id,
+      confidence: "high"
+    });
+    this.repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: thread.id,
+      codexTurnId: turnId,
+      eventType: "task.created_from_feishu",
+      eventPayload: { text: input.prompt, desktopIpc: true, attachments: describeFeishuAttachments(codexInput.feishuAttachments) },
+      feishuMessageId: input.sourceMessageId
+    });
+    await this.updateTaskTitle(binding.id, "running", title);
+    await this.updateTaskCard(binding.id);
+  }
+
+  private async startDesktopIpcDraftTaskFromPrompt(binding: SessionBinding, message: FeishuIncomingMessage): Promise<void> {
+    const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
+    const title = summarizeTitle(message.text);
+    const cwd = project?.rootPath ?? binding.cwd ?? null;
+    const startCheckpoint = await this.captureCheckpoint(binding.id, "turn_start", null, "任务开始前");
+    const codexInput = await this.resolveCodexMessageInput({
+      messageId: message.messageId,
+      prompt: message.text,
+      attachments: message.attachments
+    });
+    let thread: CodexThreadSummary;
+    try {
+      thread = await this.codex.startThread({
+        cwd,
+        model: projectModel(project, this.config),
+        reasoningEffort: projectReasoningEffort(project, this.config),
+        prompt: codexInput.prompt,
+        attachments: codexInput.attachments
+      });
+    } catch (error) {
+      await this.markDesktopThreadCreationFailed({
+        binding,
+        title,
+        prompt: codexInput.prompt,
+        sourceMessageId: message.messageId,
+        error
+      });
+      return;
+    }
+    const turnId = latestTurnIdFromThread(thread);
+    this.repo.activateDraftBinding({
+      bindingId: binding.id,
+      codexThreadId: thread.id,
+      projectId: project?.id ?? null,
+      title,
+      cwd: thread.cwd ?? cwd,
+      status: "running",
+      lastTurnId: turnId
+    });
+    if (startCheckpoint && turnId) this.repo.updateWorkspaceCheckpointTurnId(startCheckpoint.id, turnId);
+    this.repo.upsertThreadOwnership({
+      codexThreadId: thread.id,
+      ownerKind: "feishu_bridge",
+      ownerClientId: this.config.machine.id,
+      confidence: "high"
+    });
+    this.repo.updateBindingSettings({
+      bindingId: binding.id,
+      selectedModel: binding.selectedModel ?? projectModel(project, this.config),
+      selectedReasoningEffort: binding.selectedReasoningEffort ?? projectReasoningEffort(project, this.config)
+    });
+    this.repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: thread.id,
+      codexTurnId: turnId,
+      eventType: "task.created_from_feishu",
+      eventPayload: { text: message.text, fromDraft: true, desktopIpc: true, attachments: describeFeishuAttachments(codexInput.feishuAttachments) },
+      feishuMessageId: message.messageId
+    });
+    this.repo.updateBindingStatus(binding.id, "running", turnId);
+    await this.updateTaskTitle(binding.id, "running", title);
+    await this.updateTaskCard(binding.id);
+  }
+
+  private async markDesktopThreadCreationFailed(input: {
+    binding: SessionBinding;
+    title: string;
+    prompt: string;
+    sourceMessageId: string;
+    error: unknown;
+  }): Promise<void> {
+    const errorText = input.error instanceof Error ? input.error.message : String(input.error);
+    this.repo.updateBindingStatus(input.binding.id, "failed", null);
+    const binding = this.repo.findBindingById(input.binding.id) ?? input.binding;
+    this.repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      eventType: "task.failed",
+      eventPayload: {
+        text: [
+          "创建普通 Codex Desktop thread 失败。",
+          "飞书桥接没有启动独立 runtime，也没有绑定到其它 Desktop thread。",
+          `错误：${errorText}`
+        ].join("\n"),
+        prompt: input.prompt,
+        desktopIpc: true
+      },
+      feishuMessageId: input.sourceMessageId
+    });
+    await this.updateTaskTitle(binding.id, "failed", input.title);
+    await this.updateTaskCard(binding.id);
+    await this.sendTextToTarget(
+      this.targetForBinding(binding, binding.feishuChatId),
+      [
+        "创建普通 Codex Desktop thread 失败，已标记为失败任务。",
+        "没有启动独立 runtime，也没有绑定到其它 Desktop thread。",
+        `错误：${truncatePlain(errorText, 500)}`
+      ].join("\n")
+    );
+  }
+
   private async continueBindingFromFeishu(binding: SessionBinding, message: FeishuIncomingMessage): Promise<void> {
+    const codexInput = await this.resolveCodexMessageInput({
+      messageId: message.messageId,
+      prompt: message.text,
+      attachments: message.attachments
+    });
     if (binding.status === "running") {
       try {
-        await this.codex.steerTurn(binding.codexThreadId, message.text);
+        await this.codex.steerTurn(binding.codexThreadId, codexInput.prompt, codexInput.attachments);
         this.repo.insertEvent({
           sessionBindingId: binding.id,
           codexThreadId: binding.codexThreadId,
           eventType: "turn.steer_requested_from_feishu",
-          eventPayload: { text: message.text },
+          eventPayload: { text: message.text, attachments: describeFeishuAttachments(codexInput.feishuAttachments) },
           feishuMessageId: message.messageId
         });
         await this.sendTextToTarget(this.targetForBinding(binding, message.chatId), "已追加要求，当前任务会优先按这条继续处理。");
@@ -746,7 +994,8 @@ export class TaskService {
       const queued = this.repo.enqueueMessage({
         sessionBindingId: binding.id,
         feishuMessageId: message.messageId,
-        text: message.text,
+        text: codexInput.prompt,
+        attachments: codexInput.feishuAttachments,
         createdByFeishuUserId: message.userId
       });
       await this.sendTextToTarget(
@@ -762,7 +1011,7 @@ export class TaskService {
       sessionBindingId: binding.id,
       codexThreadId: binding.codexThreadId,
       eventType: "turn.requested_from_feishu",
-      eventPayload: { text: message.text },
+      eventPayload: { text: message.text, attachments: describeFeishuAttachments(codexInput.feishuAttachments) },
       feishuMessageId: message.messageId
     });
     await this.updateTaskTitle(binding.id, "running", binding.title ?? "Codex 任务");
@@ -770,10 +1019,11 @@ export class TaskService {
     await this.codex.resumeThread(binding.codexThreadId);
     const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
     const startCheckpoint = await this.captureCheckpoint(binding.id, "turn_start", null, "继续处理前");
-    const turn = await this.codex.startTurn(binding.codexThreadId, message.text, {
+    const turn = await this.codex.startTurn(binding.codexThreadId, codexInput.prompt, {
       cwd: binding.cwd,
       model: resolveBindingModel(binding, project, this.config),
-      reasoningEffort: resolveBindingReasoningEffort(binding, project, this.config)
+      reasoningEffort: resolveBindingReasoningEffort(binding, project, this.config),
+      attachments: codexInput.attachments
     });
     const turnId = extractTurnId(turn);
     if (startCheckpoint && turnId) this.repo.updateWorkspaceCheckpointTurnId(startCheckpoint.id, turnId);
@@ -879,6 +1129,9 @@ export class TaskService {
       case "approval_list_all":
         await this.sendApprovalListAll(action);
         return { ok: true };
+      case "server_request_list":
+        await this.sendPendingServerRequestList(action);
+        return { ok: true };
       case "task_status":
         await this.sendTaskStatus(action);
         return { ok: true };
@@ -951,6 +1204,12 @@ export class TaskService {
       case "approval_deny":
         await this.resolveApproval(String(action.payload.approvalId ?? ""), "deny", action.userId);
         return { ok: true };
+      case "server_request_detail":
+        await this.sendServerRequestDetail(action);
+        return { ok: true };
+      case "server_request_resolve":
+        await this.resolveServerRequest(action);
+        return { ok: true, text: "已提交到当前 Desktop 任务。" };
       default:
         return { ok: true, ignored: action.action };
     }
@@ -1070,6 +1329,44 @@ export class TaskService {
       if (sub === "task") return base("approval_for_task", { approvalId });
       if (sub === "deny") return base("approval_deny", { approvalId });
       throw new Error("未知审批命令，请使用 /approval list、/approval detail <id>、/approval once <id>、/approval task <id> 或 /approval deny <id>。");
+    }
+    if (command === "request") {
+      const sub = parts[1] ?? "";
+      if (sub === "detail") {
+        return base("server_request_detail", { requestId: requireArgument(parts[2], "/request detail <requestId>") });
+      }
+      if (sub === "allow" || sub === "accept") {
+        return base("server_request_resolve", {
+          requestId: requireArgument(parts[2], "/request allow|accept <requestId>"),
+          resolution: "accept_once"
+        });
+      }
+      if (sub === "session") {
+        return base("server_request_resolve", {
+          requestId: requireArgument(parts[2], "/request session <requestId>"),
+          resolution: "accept_session"
+        });
+      }
+      if (sub === "deny") {
+        return base("server_request_resolve", {
+          requestId: requireArgument(parts[2], "/request deny <requestId>"),
+          resolution: "deny"
+        });
+      }
+      if (sub === "abort" || sub === "cancel") {
+        return base("server_request_resolve", {
+          requestId: requireArgument(parts[2], "/request abort|cancel <requestId>"),
+          resolution: "abort"
+        });
+      }
+      if (sub === "input") {
+        return base("server_request_resolve", {
+          requestId: requireArgument(parts[2], "/request input <requestId> <json>"),
+          resolution: "custom_input",
+          responseJson: requireArgument(parts.slice(3).join(" "), "/request input <requestId> <json>")
+        });
+      }
+      throw new Error("未知请求命令，请使用 /request detail <id>、/request allow <id>、/request session <id>、/request deny <id>、/request abort <id> 或 /request input <id> <json>。");
     }
     return null;
   }
@@ -1302,7 +1599,8 @@ export class TaskService {
       userId: action.userId,
       sourceMessageId: prompt.feishuMessageId,
       sourceChatId: prompt.feishuChatId,
-      sourceRootMessageId: action.rootMessageId
+      sourceRootMessageId: action.rootMessageId,
+      attachments: prompt.attachments
     });
   }
 
@@ -1631,6 +1929,20 @@ export class TaskService {
     await this.feishu.sendCard(chatId, this.cards.approvalListCard(this.repo.listPendingApprovals()), action.rootMessageId);
   }
 
+  private async sendPendingServerRequestList(action: FeishuCardAction): Promise<void> {
+    const chatId = action.chatId || this.config.feishu.defaultChatId || "";
+    const requests = this.repo.listPendingServerRequests().map((request) => {
+      const payload = parseStoredServerRequestPayload(request.payload);
+      return {
+        title: payload ? serverRequestTitleText(payload.method) : "桌面请求",
+        requestId: request.actionId,
+        createdAt: request.createdAt,
+        detail: payload ? `线程：${payload.threadId}` : "请求记录已损坏"
+      };
+    });
+    await this.feishu.sendCard(chatId, this.cards.pendingServerRequestListCard(requests), action.rootMessageId);
+  }
+
   private async sendTaskStatus(action: FeishuCardAction): Promise<void> {
     const binding = this.requireBinding(action);
     await this.sendCardToTarget(
@@ -1794,6 +2106,45 @@ export class TaskService {
     );
   }
 
+  private async sendServerRequestDetail(action: FeishuCardAction): Promise<void> {
+    const request = this.requireStoredServerRequest(String(action.payload.requestId ?? ""));
+    const payload = parseStoredServerRequestPayload(request.payload);
+    const binding = payload ? this.repo.findBindingById(payload.bindingId) : null;
+    await this.sendCardToTarget(
+      binding ? this.targetForBinding(binding, action.chatId) : this.targetForAction(action),
+      this.buildStoredServerRequestDetailCard(request)
+    );
+  }
+
+  private async resolveServerRequest(action: FeishuCardAction): Promise<void> {
+    const request = this.requireStoredServerRequest(String(action.payload.requestId ?? ""));
+    if (request.status === "completed") return;
+    const payload = parseStoredServerRequestPayload(request.payload);
+    if (!payload) throw new Error("请求记录已损坏");
+    const binding = this.repo.findBindingById(payload.bindingId);
+    if (!binding) throw new Error("请求对应的任务不存在");
+    const response = buildStoredServerRequestResponse(request, action.payload, action.formValue ?? null);
+    await this.submitStoredServerRequest(payload, response);
+    this.repo.completeAction(request.actionId, {
+      response,
+      resolution: action.payload.resolution ?? null,
+      formValue: action.formValue ?? null
+    });
+    this.repo.updateBindingStatus(binding.id, "running", payload.turnId);
+    this.repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: payload.threadId,
+      codexTurnId: payload.turnId,
+      eventType: "server_request.resolved",
+      eventPayload: {
+        requestId: payload.requestId,
+        method: payload.method,
+        resolution: action.payload.resolution ?? null
+      }
+    });
+    await this.updateTaskCard(binding.id);
+  }
+
   private async archiveTask(bindingId: string): Promise<void> {
     const binding = this.repo.findBindingById(bindingId);
     if (!binding) throw new Error("任务不存在");
@@ -1941,6 +2292,15 @@ export class TaskService {
       const binding = this.repo.findBindingByThreadId(codexThreadId);
       if (binding) return this.targetForBinding(binding, action.chatId);
     }
+    const requestId = asString(action.payload.requestId);
+    if (requestId) {
+      const request = this.repo.findAction(requestId);
+      const payload = request ? parseStoredServerRequestPayload(request.payload) : null;
+      if (payload) {
+        const binding = this.repo.findBindingById(payload.bindingId);
+        if (binding) return this.targetForBinding(binding, action.chatId);
+      }
+    }
     return this.targetForAction(action);
   }
 
@@ -1957,6 +2317,47 @@ export class TaskService {
       return this.feishu.replyCardInThread(target.rootMessageId ?? target.threadId, card);
     }
     return this.feishu.sendCard(target.chatId, card, target.rootMessageId);
+  }
+
+  private requireStoredServerRequest(requestId: string): ActionRequest {
+    if (!requestId) throw new Error("缺少请求 ID");
+    const request = this.repo.findAction(requestId);
+    if (!request || !request.actionType.startsWith("codex_server_request:")) {
+      throw new Error("请求不存在");
+    }
+    return request;
+  }
+
+  private buildStoredServerRequestCard(request: ActionRequest): ReturnType<CardRenderer["serverRequestCard"]> {
+    const presentation = presentStoredServerRequest(request);
+    return this.cards.serverRequestCard({
+      title: presentation.title,
+      body: presentation.body,
+      form: presentation.form,
+      commands: presentation.commands,
+      buttons: presentation.buttons
+    });
+  }
+
+  private buildStoredServerRequestDetailCard(request: ActionRequest): ReturnType<CardRenderer["serverRequestDetailCard"]> {
+    const presentation = presentStoredServerRequest(request, { detail: true });
+    return this.cards.serverRequestDetailCard({
+      title: presentation.title,
+      body: presentation.body,
+      commands: presentation.commands
+    });
+  }
+
+  private async submitStoredServerRequest(payload: StoredServerRequestPayload, response: Record<string, unknown>): Promise<void> {
+    if (payload.method === "item/tool/requestUserInput") {
+      await this.codex.submitUserInput(payload.threadId, payload.requestId, response);
+      return;
+    }
+    if (payload.method === "mcpServer/elicitation/request") {
+      await this.codex.submitMcpServerElicitationResponse(payload.threadId, payload.requestId, response);
+      return;
+    }
+    await this.codex.respondToServerRequest(payload.requestId, response);
   }
 
   private async resolveApproval(id: string, decision: "once" | "task" | "deny", userId: string): Promise<void> {
@@ -1986,27 +2387,93 @@ export class TaskService {
 
   private async handleCodexServerRequest(message: Record<string, unknown>): Promise<void> {
     const method = String(message.method ?? "");
-    if (method !== "item/commandExecution/requestApproval" && method !== "item/fileChange/requestApproval") {
-      await this.codex.respondToServerRequest(String(message.id ?? ""), { decision: "cancel" });
+    if (method === "account/chatgptAuthTokens/refresh") {
+      this.logger.warn("codex auth refresh request is not handled by the Feishu bridge", {
+        requestId: String(message.id ?? ""),
+        message
+      });
       return;
     }
     const params = message.params && typeof message.params === "object" ? (message.params as Record<string, unknown>) : {};
-    const threadId = String(params.threadId ?? "");
+    const threadId = asString(params.threadId) ?? asString(params.conversationId) ?? "";
     const binding = this.repo.findBindingByThreadId(threadId);
-    if (!binding) return;
+    if (!binding) {
+      await this.codex.respondErrorToServerRequest(String(message.id ?? ""), {
+        message: `No Feishu binding found for thread ${threadId || "<unknown>"}.`,
+        code: -32004
+      }).catch((error) => {
+        this.logger.warn("failed to reject unbound codex server request", { error: String(error), message });
+      });
+      return;
+    }
+    if (method === "item/commandExecution/requestApproval" || method === "item/fileChange/requestApproval") {
+      const command = asString(params.command);
+      const approval = this.repo.upsertPendingApproval({
+        sessionBindingId: binding.id,
+        codexThreadId: threadId,
+        codexTurnId: asString(params.turnId),
+        requestId: String(message.id ?? params.approvalId ?? params.itemId ?? newId("req")),
+        itemId: asString(params.itemId),
+        approvalType: method.includes("commandExecution") ? "command_execution" : "file_change",
+        command,
+        filePaths: asString(params.grantRoot) ? [String(params.grantRoot)] : [],
+        reason: asString(params.reason),
+        riskLevel: method.includes("commandExecution") ? classifyCommandRisk(command) : "medium"
+      });
+      this.repo.updateBindingStatus(binding.id, "waiting_for_approval", asString(params.turnId));
+      this.repo.upsertThreadOwnership({
+        codexThreadId: threadId,
+        ownerKind: "app_server",
+        ownerClientId: this.config.machine.id,
+        confidence: "medium"
+      });
+      const event = this.repo.insertEvent({
+        sessionBindingId: binding.id,
+        codexThreadId: threadId,
+        codexTurnId: asString(params.turnId),
+        eventType: "approval.requested",
+        eventPayload: { approvalId: approval.id, type: approval.approvalType, command: approval.command }
+      });
+      this.repo.enqueueOutbox({
+        sessionBindingId: binding.id,
+        eventSeq: event.seq,
+        notificationType: "approval_required",
+        feishuChatId: binding.feishuChatId,
+        feishuTopicRootMessageId: binding.feishuTopicRootMessageId,
+        feishuThreadId: binding.feishuThreadId,
+        payload: { card: this.cards.approvalCard(approval) },
+        dedupeKey: `approval:${approval.codexThreadId}:${approval.requestId}`
+      });
+      await this.updateTaskCard(binding.id);
+      return;
+    }
     const command = asString(params.command);
-    const approval = this.repo.upsertPendingApproval({
-      sessionBindingId: binding.id,
-      codexThreadId: threadId,
-      codexTurnId: asString(params.turnId),
-      requestId: String(message.id ?? params.approvalId ?? params.itemId ?? newId("req")),
-      itemId: asString(params.itemId),
-      approvalType: method.includes("commandExecution") ? "command_execution" : "file_change",
-      command,
-      filePaths: asString(params.grantRoot) ? [String(params.grantRoot)] : [],
-      reason: asString(params.reason),
-      riskLevel: method.includes("commandExecution") ? classifyCommandRisk(command) : "medium"
+    const requestId = String(message.id ?? params.approvalId ?? params.itemId ?? newId("req"));
+    const stored = this.repo.beginAction({
+      actionId: requestId,
+      actionType: `codex_server_request:${method}`,
+      payload: {
+        requestId,
+        method,
+        threadId,
+        turnId: asString(params.turnId),
+        itemId: asString(params.itemId),
+        bindingId: binding.id,
+        params
+      },
+      requestedByFeishuUserId: null
     });
+    if (stored.existing?.status === "completed") return;
+    if (!isSupportedDeferredServerRequestMethod(method)) {
+      await this.codex.respondErrorToServerRequest(requestId, {
+        message: `Feishu bridge does not support ${method} yet.`,
+        code: -32001
+      });
+      this.repo.failAction(requestId, {
+        error: `unsupported server request: ${method}`
+      });
+      return;
+    }
     this.repo.updateBindingStatus(binding.id, "waiting_for_approval", asString(params.turnId));
     this.repo.upsertThreadOwnership({
       codexThreadId: threadId,
@@ -2018,8 +2485,13 @@ export class TaskService {
       sessionBindingId: binding.id,
       codexThreadId: threadId,
       codexTurnId: asString(params.turnId),
-      eventType: "approval.requested",
-      eventPayload: { approvalId: approval.id, type: approval.approvalType, command: approval.command }
+      eventType: "server_request.requested",
+      eventPayload: {
+        requestId,
+        method,
+        itemId: asString(params.itemId),
+        title: presentStoredServerRequest(stored.action).title
+      }
     });
     this.repo.enqueueOutbox({
       sessionBindingId: binding.id,
@@ -2028,8 +2500,8 @@ export class TaskService {
       feishuChatId: binding.feishuChatId,
       feishuTopicRootMessageId: binding.feishuTopicRootMessageId,
       feishuThreadId: binding.feishuThreadId,
-      payload: { card: this.cards.approvalCard(approval) },
-      dedupeKey: `approval:${approval.codexThreadId}:${approval.requestId}`
+      payload: { card: this.buildStoredServerRequestCard(stored.action) },
+      dedupeKey: `server-request:${binding.codexThreadId}:${requestId}`
     });
     await this.updateTaskCard(binding.id);
   }
@@ -2569,16 +3041,80 @@ export class TaskService {
     await this.codex.resumeThread(binding.codexThreadId);
     const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
     const startCheckpoint = await this.captureCheckpoint(binding.id, "turn_start", null, "队列消息开始前");
+    const codexAttachments = next.attachments
+      .filter((attachment) => attachment.kind === "image" && typeof attachment.localPath === "string" && attachment.localPath.trim())
+      .map((attachment) => ({ path: attachment.localPath as string }));
     await this.codex.startTurn(binding.codexThreadId, next.text, {
       cwd: binding.cwd,
       model: resolveBindingModel(binding, project, this.config),
-      reasoningEffort: resolveBindingReasoningEffort(binding, project, this.config)
+      reasoningEffort: resolveBindingReasoningEffort(binding, project, this.config),
+      attachments: codexAttachments
     }).then((turn) => {
       const turnId = extractTurnId(turn);
       if (startCheckpoint && turnId) this.repo.updateWorkspaceCheckpointTurnId(startCheckpoint.id, turnId);
       if (turnId) this.repo.updateBindingStatus(binding.id, "running", turnId);
       return turn;
     });
+  }
+
+  private async resolveCodexMessageInput(input: {
+    messageId: string;
+    prompt: string;
+    attachments?: FeishuMessageAttachment[] | null;
+  }): Promise<CodexMessageInput> {
+    const prompt = input.prompt.trim() || defaultPromptForAttachments(input.attachments);
+    this.logger.info("resolving codex message input", {
+      messageId: input.messageId,
+      attachmentCount: (input.attachments ?? []).length,
+      promptLength: prompt.length
+    });
+    const downloaded: FeishuMessageAttachment[] = [];
+    const codexAttachments: CodexLocalImageAttachment[] = [];
+    for (const attachment of input.attachments ?? []) {
+      if (attachment.kind !== "image") continue;
+      if (attachment.localPath) {
+        const normalized = { ...attachment, messageId: attachment.messageId ?? input.messageId };
+        downloaded.push(normalized);
+        codexAttachments.push({ path: attachment.localPath });
+        continue;
+      }
+      const download = this.feishu.downloadMessageResource;
+      if (!download) {
+        throw new Error("当前 Feishu client 不支持下载图片资源，无法把图片转交给 Codex Desktop。");
+      }
+      const messageId = attachment.messageId ?? input.messageId;
+      const resource = await download.call(this.feishu, {
+        messageId,
+        fileKey: attachment.key,
+        resourceType: "image",
+        attachment
+      });
+      const resolved = {
+        ...attachment,
+        messageId,
+        localPath: resource.path,
+        mimeType: resource.mimeType ?? attachment.mimeType ?? null,
+        sizeBytes: resource.sizeBytes
+      };
+      downloaded.push(resolved);
+      codexAttachments.push({ path: resource.path });
+    }
+    if (downloaded.length > 0) {
+      this.logger.info("codex image attachments prepared", {
+        messageId: input.messageId,
+        attachmentCount: downloaded.length,
+        promptLength: prompt.length
+      });
+    }
+    return {
+      prompt,
+      attachments: codexAttachments,
+      feishuAttachments: downloaded.length > 0 ? downloaded : sanitizeMessageAttachments(input.attachments)
+    };
+  }
+
+  private isDesktopIpcMode(): boolean {
+    return this.config.codex.connectionMode === "desktop_ipc" || this.codex.connectionKind === "desktop_ipc";
   }
 
   private async captureCheckpoint(
@@ -2687,6 +3223,7 @@ export class TaskService {
   }
 
   private async syncCodexThreadName(binding: SessionBinding, title: string): Promise<void> {
+    if (this.isDesktopIpcMode()) return;
     const setThreadName = (this.codex as unknown as { setThreadName?: (threadId: string, name: string) => Promise<Record<string, unknown>> })
       .setThreadName;
     if (!setThreadName || binding.codexThreadId.startsWith("draft_")) return;
@@ -2827,6 +3364,44 @@ const summarizeTitle = (text: string): string => {
   return compact.length > 40 ? `${compact.slice(0, 40)}...` : compact || "Codex 任务";
 };
 
+const normalizeMessageText = (message: FeishuIncomingMessage): string => {
+  const text = message.text.trim();
+  if (text) return text;
+  return defaultPromptForAttachments(message.attachments);
+};
+
+const defaultPromptForAttachments = (attachments: FeishuMessageAttachment[] | null | undefined): string => {
+  const imageCount = (attachments ?? []).filter((attachment) => attachment.kind === "image").length;
+  if (imageCount <= 0) return "";
+  return imageCount === 1 ? "请查看这张图片。" : `请查看这 ${imageCount} 张图片。`;
+};
+
+const sanitizeMessageAttachments = (
+  attachments: FeishuMessageAttachment[] | null | undefined
+): FeishuMessageAttachment[] =>
+  (attachments ?? [])
+    .filter((attachment) => attachment.kind === "image" && attachment.key.trim())
+    .map((attachment) => ({
+      kind: "image",
+      key: attachment.key,
+      messageId: attachment.messageId ?? null,
+      localPath: attachment.localPath ?? null,
+      mimeType: attachment.mimeType ?? null,
+      sizeBytes: attachment.sizeBytes ?? null
+    }));
+
+const describeFeishuAttachments = (
+  attachments: FeishuMessageAttachment[] | null | undefined
+): Array<Record<string, unknown>> =>
+  sanitizeMessageAttachments(attachments).map((attachment) => ({
+    kind: attachment.kind,
+    key: attachment.key,
+    messageId: attachment.messageId ?? null,
+    localPath: attachment.localPath ?? null,
+    mimeType: attachment.mimeType ?? null,
+    sizeBytes: attachment.sizeBytes ?? null
+  }));
+
 const buildTaskChatName = (config: BridgeConfig, key: string, title: string, status: TaskStatus = "running"): string => {
   const statusPrefix = taskStatusPrefix(status);
   return truncatePlain(`${statusPrefix}${title}`, 60);
@@ -2873,6 +3448,14 @@ const extractTurnId = (result: Record<string, unknown>): string | null => {
   if (!turn || typeof turn !== "object") return null;
   const id = (turn as Record<string, unknown>).id;
   return typeof id === "string" ? id : null;
+};
+
+const latestTurnIdFromThread = (thread: CodexThreadSummary): string | null => {
+  const turns = Array.isArray(thread.raw.turns) ? thread.raw.turns : [];
+  const latest = turns[turns.length - 1];
+  if (!latest || typeof latest !== "object") return null;
+  const object = latest as Record<string, unknown>;
+  return asString(object.id) ?? asString(object.turnId);
 };
 
 const projectModel = (project: Project | null, config: BridgeConfig): string =>
@@ -2963,6 +3546,31 @@ const truncatePlain = (text: string, max: number): string => {
   const compact = text.replace(/\s+/g, " ").trim();
   if (compact.length <= max) return compact;
   return `${compact.slice(0, Math.max(1, max - 3)).trimEnd()}...`;
+};
+
+type PresentedServerRequest = {
+  title: string;
+  body: string;
+  commands: string[];
+  buttons: Array<{
+    label: string;
+    action: string;
+    payload: Record<string, unknown>;
+  }>;
+  form?: {
+    submitLabel?: string;
+    fields: Array<{
+      name: string;
+      label: string;
+      kind: "text" | "textarea" | "select" | "multi_select" | "boolean" | "number";
+      required?: boolean;
+      secret?: boolean;
+      placeholder?: string;
+      value?: string;
+      options?: Array<{ label: string; value: string }>;
+    }>;
+    submitPayload?: Record<string, unknown>;
+  };
 };
 
 const isTerminalStatus = (status: TaskStatus): boolean =>
@@ -3999,3 +4607,733 @@ const workspaceRootsFromStateValue = (value: unknown, source: string): Array<{ r
     .filter((entry): entry is string => typeof entry === "string" && entry.trim().length > 0)
     .map((rootPath) => ({ rootPath, source }));
 };
+
+const presentStoredServerRequest = (request: ActionRequest, options: { detail?: boolean } = {}): PresentedServerRequest => {
+  const payload = parseStoredServerRequestPayload(request.payload);
+  if (!payload) {
+    return {
+      title: "桌面请求",
+      body: "请求记录已损坏，无法展示。",
+      commands: [`/request detail ${request.actionId}`],
+      buttons: []
+    };
+  }
+  return buildStoredServerRequestPresentation(payload, options.detail === true);
+};
+
+const parseStoredServerRequestPayload = (value: Record<string, unknown>): StoredServerRequestPayload | null => {
+  const requestId = asString(value.requestId) ?? asString(value.id);
+  const method = asString(value.method);
+  const threadId = asString(value.threadId);
+  const turnId = asString(value.turnId);
+  const itemId = asString(value.itemId);
+  const bindingId = asString(value.bindingId);
+  const params = value.params && typeof value.params === "object" ? (value.params as Record<string, unknown>) : null;
+  if (!requestId || !method || !threadId || !bindingId || !params) return null;
+  return { requestId, method, threadId, turnId, itemId, bindingId, params };
+};
+
+const buildStoredServerRequestPresentation = (payload: StoredServerRequestPayload, detail: boolean): PresentedServerRequest => {
+  switch (payload.method) {
+    case "execCommandApproval":
+      return buildExecCommandApprovalPresentation(payload, detail);
+    case "applyPatchApproval":
+      return buildApplyPatchApprovalPresentation(payload, detail);
+    case "item/permissions/requestApproval":
+      return buildPermissionsRequestPresentation(payload, detail);
+    case "item/tool/requestUserInput":
+      return buildToolUserInputPresentation(payload, detail);
+    case "mcpServer/elicitation/request":
+      return buildMcpElicitationPresentation(payload, detail);
+    case "item/tool/call":
+      return buildDynamicToolCallPresentation(payload, detail);
+    default:
+      return buildUnknownServerRequestPresentation(payload, detail);
+  }
+};
+
+const buildUnknownServerRequestPresentation = (payload: StoredServerRequestPayload, detail: boolean): PresentedServerRequest => ({
+  title: serverRequestTitleText(payload.method),
+  body: [
+    `**类型**  ${serverRequestTitleText(payload.method)}`,
+    `**线程**  ${payload.threadId}`,
+    payload.turnId ? `**轮次**  ${payload.turnId}` : null,
+    `**请求**  ${payload.requestId}`,
+    detail ? `**参数**\n\n${safeJsonForCard(payload.params, 1800)}` : null
+  ]
+    .filter(Boolean)
+    .join("\n\n"),
+  commands: [`/request detail ${payload.requestId}`],
+  buttons: [buttonDescriptor("详情", "server_request_detail", { requestId: payload.requestId })]
+});
+
+const buildExecCommandApprovalPresentation = (payload: StoredServerRequestPayload, detail: boolean): PresentedServerRequest => {
+  const params = payload.params as Record<string, unknown>;
+  const command = Array.isArray(params.command) ? params.command.map((item) => String(item)).join(" ") : asString(params.command) ?? "";
+  const commandActions = formatCommandActions(params.commandActions) ?? formatParsedCommands(params.parsedCmd) ?? null;
+  const buttons = [
+    buttonDescriptor("允许一次", "server_request_resolve", { requestId: payload.requestId, resolution: "accept_once" }),
+    buttonDescriptor("本轮允许", "server_request_resolve", { requestId: payload.requestId, resolution: "accept_session" }),
+    buttonDescriptor("拒绝", "server_request_resolve", { requestId: payload.requestId, resolution: "deny" }),
+    buttonDescriptor("中止", "server_request_resolve", { requestId: payload.requestId, resolution: "abort" })
+  ];
+  if (params.proposedExecpolicyAmendment) {
+    buttons.splice(2, 0, buttonDescriptor("按提议放行", "server_request_resolve", { requestId: payload.requestId, resolution: "accept_execpolicy" }));
+  }
+  if (Array.isArray(params.proposedNetworkPolicyAmendments) && params.proposedNetworkPolicyAmendments.length > 0) {
+    buttons.splice(3, 0, buttonDescriptor("网络策略放行", "server_request_resolve", { requestId: payload.requestId, resolution: "accept_network_policy" }));
+  }
+  return {
+    title: "命令执行审批",
+    body: [
+      `**类型**  命令执行审批`,
+      `**线程**  ${payload.threadId}`,
+      payload.turnId ? `**轮次**  ${payload.turnId}` : null,
+      `**请求**  ${payload.requestId}`,
+      command ? `**命令**\n\n${truncatePlain(command, 1200)}` : null,
+      params.cwd ? `**目录**  ${truncatePlain(String(params.cwd), 300)}` : null,
+      params.reason ? `**原因**  ${truncatePlain(String(params.reason), 1200)}` : null,
+      commandActions ? `**动作**\n\n${commandActions}` : null,
+      detail ? `**原始参数**\n\n${safeJsonForCard(params, 2600)}` : null
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
+    commands: [`/request detail ${payload.requestId}`, `/request allow ${payload.requestId}`, `/request session ${payload.requestId}`, `/request deny ${payload.requestId}`, `/request abort ${payload.requestId}`],
+    buttons
+  };
+};
+
+const buildApplyPatchApprovalPresentation = (payload: StoredServerRequestPayload, detail: boolean): PresentedServerRequest => {
+  const params = payload.params as Record<string, unknown>;
+  const fileChanges = fileChangesFromMap(params.fileChanges);
+  return {
+    title: "补丁应用审批",
+    body: [
+      `**类型**  补丁应用审批`,
+      `**线程**  ${payload.threadId}`,
+      payload.turnId ? `**轮次**  ${payload.turnId}` : null,
+      `**请求**  ${payload.requestId}`,
+      params.reason ? `**原因**  ${truncatePlain(String(params.reason), 1200)}` : null,
+      params.grantRoot ? `**授权根目录**  ${truncatePlain(String(params.grantRoot), 300)}` : null,
+      fileChanges ? `**文件变更**\n\n${fileChanges}` : null,
+      detail ? `**原始参数**\n\n${safeJsonForCard(params, 2600)}` : null
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
+    commands: [`/request detail ${payload.requestId}`, `/request allow ${payload.requestId}`, `/request session ${payload.requestId}`, `/request deny ${payload.requestId}`, `/request abort ${payload.requestId}`],
+    buttons: [
+      buttonDescriptor("允许一次", "server_request_resolve", { requestId: payload.requestId, resolution: "accept_once" }),
+      buttonDescriptor("本轮允许", "server_request_resolve", { requestId: payload.requestId, resolution: "accept_session" }),
+      buttonDescriptor("拒绝", "server_request_resolve", { requestId: payload.requestId, resolution: "deny" }),
+      buttonDescriptor("中止", "server_request_resolve", { requestId: payload.requestId, resolution: "abort" })
+    ]
+  };
+};
+
+const buildPermissionsRequestPresentation = (payload: StoredServerRequestPayload, detail: boolean): PresentedServerRequest => {
+  const params = payload.params as Record<string, unknown>;
+  const permissions = params.permissions && typeof params.permissions === "object" ? (params.permissions as Record<string, unknown>) : {};
+  return {
+    title: "额外权限请求",
+    body: [
+      `**类型**  额外权限请求`,
+      `**线程**  ${payload.threadId}`,
+      payload.turnId ? `**轮次**  ${payload.turnId}` : null,
+      `**请求**  ${payload.requestId}`,
+      params.reason ? `**原因**  ${truncatePlain(String(params.reason), 1200)}` : null,
+      permissions.fileSystem ? `**文件系统**\n\n${safeJsonForCard(permissions.fileSystem, 1200)}` : null,
+      permissions.network ? `**网络**\n\n${safeJsonForCard(permissions.network, 1200)}` : null,
+      detail ? `**原始参数**\n\n${safeJsonForCard(params, 2600)}` : null
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
+    commands: [`/request detail ${payload.requestId}`, `/request allow ${payload.requestId}`, `/request session ${payload.requestId}`, `/request deny ${payload.requestId}`],
+    buttons: [
+      buttonDescriptor("允许一次", "server_request_resolve", { requestId: payload.requestId, resolution: "permissions_turn" }),
+      buttonDescriptor("本轮允许", "server_request_resolve", { requestId: payload.requestId, resolution: "permissions_session" }),
+      buttonDescriptor("拒绝", "server_request_resolve", { requestId: payload.requestId, resolution: "deny" })
+    ]
+  };
+};
+
+const buildToolUserInputPresentation = (payload: StoredServerRequestPayload, detail: boolean): PresentedServerRequest => {
+  const params = payload.params as Record<string, unknown>;
+  const questions = Array.isArray(params.questions)
+    ? params.questions
+        .map((item) => (item && typeof item === "object" ? (item as Record<string, unknown>) : null))
+        .filter((item): item is Record<string, unknown> => Boolean(item))
+    : [];
+  const buttons: PresentedServerRequest["buttons"] = [];
+  if (questions.length === 1) {
+    const question = questions[0]!;
+    const questionId = asString(question.id) ?? "question";
+    const options = Array.isArray(question.options)
+      ? question.options
+          .map((item) => (item && typeof item === "object" ? (item as Record<string, unknown>) : null))
+          .filter((item): item is Record<string, unknown> => Boolean(item))
+      : [];
+    for (const option of options.slice(0, 4)) {
+      const label = asString(option.label) ?? asString(option.description) ?? "选项";
+      buttons.push(buttonDescriptor(label, "server_request_resolve", { requestId: payload.requestId, resolution: "select_option", questionId, answer: label }));
+    }
+  }
+  return {
+    title: "用户输入请求",
+    body: [
+      `**类型**  用户输入请求`,
+      `**线程**  ${payload.threadId}`,
+      payload.turnId ? `**轮次**  ${payload.turnId}` : null,
+      `**请求**  ${payload.requestId}`,
+      questions.length > 0
+        ? `**问题**\n\n${questions
+            .map((question, index) => {
+              const header = asString(question.header) ?? `问题 ${index + 1}`;
+              const text = asString(question.question) ?? "";
+              const options = Array.isArray(question.options)
+                ? question.options
+                    .map((item) => (item && typeof item === "object" ? (item as Record<string, unknown>) : null))
+                    .filter((item): item is Record<string, unknown> => Boolean(item))
+                    .map((option) => `${asString(option.label) ?? "选项"}${asString(option.description) ? `：${asString(option.description)}` : ""}`)
+                    .join("\n")
+                : "";
+              return [header, text, options].filter(Boolean).join("\n");
+            })
+            .join("\n\n")}`
+        : null,
+      detail ? `**原始参数**\n\n${safeJsonForCard(params, 2600)}` : null
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
+    commands: [`/request detail ${payload.requestId}`, `/request input ${payload.requestId} <json>`],
+    buttons,
+    form: questions.length > 0
+      ? {
+          submitLabel: "提交回答",
+          submitPayload: { requestId: payload.requestId },
+          fields: buildToolUserInputFields(questions)
+        }
+      : undefined
+  };
+};
+
+const buildMcpElicitationPresentation = (payload: StoredServerRequestPayload, detail: boolean): PresentedServerRequest => {
+  const params = payload.params as Record<string, unknown>;
+  const buttons: PresentedServerRequest["buttons"] = [
+    buttonDescriptor("拒绝", "server_request_resolve", { requestId: payload.requestId, resolution: "deny" }),
+    buttonDescriptor("取消", "server_request_resolve", { requestId: payload.requestId, resolution: "cancel" })
+  ];
+  if (params.mode === "url" || mcpElicitationCanAcceptWithoutContent(params.requestedSchema)) {
+    buttons.unshift(buttonDescriptor("接受", "server_request_resolve", { requestId: payload.requestId, resolution: "accept_empty" }));
+  }
+  return {
+    title: "MCP 请求",
+    body: [
+      `**类型**  MCP 请求`,
+      `**线程**  ${payload.threadId}`,
+      payload.turnId ? `**轮次**  ${payload.turnId}` : null,
+      `**服务**  ${truncatePlain(String(params.serverName ?? "未知"), 300)}`,
+      params.message ? `**消息**\n\n${truncatePlain(String(params.message), 1200)}` : null,
+      params.mode === "url" ? `**地址**  ${truncatePlain(String(params.url ?? ""), 1200)}` : null,
+      params.mode === "form" ? `**表单**\n\n${summarizeMcpSchema(params.requestedSchema)}` : null,
+      detail ? `**原始参数**\n\n${safeJsonForCard(params, 2600)}` : null
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
+    commands: [`/request detail ${payload.requestId}`, `/request input ${payload.requestId} <json>`, `/request deny ${payload.requestId}`],
+    buttons,
+    form:
+      params.mode === "form"
+        ? {
+            submitLabel: "提交表单",
+            submitPayload: { requestId: payload.requestId },
+            fields: buildMcpElicitationFields(params.requestedSchema)
+          }
+        : undefined
+  };
+};
+
+const buildDynamicToolCallPresentation = (payload: StoredServerRequestPayload, detail: boolean): PresentedServerRequest => {
+  const params = payload.params as Record<string, unknown>;
+  const toolName =
+    [asString(params.namespace), asString(params.tool)].filter(Boolean).join(".") ||
+    asString(params.tool) ||
+    "unknown tool";
+  return {
+    title: "工具调用请求",
+    body: [
+      `**类型**  工具调用请求`,
+      `**线程**  ${payload.threadId}`,
+      payload.turnId ? `**轮次**  ${payload.turnId}` : null,
+      `**工具**  ${truncatePlain(toolName, 300)}`,
+      params.arguments ? `**参数**\n\n${safeJsonForCard(params.arguments, 1800)}` : null,
+      detail ? `**原始参数**\n\n${safeJsonForCard(params, 2600)}` : null
+    ]
+      .filter(Boolean)
+      .join("\n\n"),
+    commands: [`/request detail ${payload.requestId}`, `/request input ${payload.requestId} <json>`],
+    buttons: [
+      buttonDescriptor("成功", "server_request_resolve", { requestId: payload.requestId, resolution: "tool_success_empty" }),
+      buttonDescriptor("失败", "server_request_resolve", { requestId: payload.requestId, resolution: "tool_failure_empty" })
+    ]
+  };
+};
+
+const buildStoredServerRequestResponse = (
+  request: ActionRequest,
+  actionPayload: Record<string, unknown>,
+  formValue: Record<string, unknown> | null = null
+): Record<string, unknown> => {
+  const payload = parseStoredServerRequestPayload(request.payload);
+  if (!payload) throw new Error("请求记录已损坏");
+  const rawJson = asString(actionPayload.responseJson);
+  if (rawJson) return parseJsonForServerRequest(rawJson);
+  const resolution = asString(actionPayload.resolution) ?? "accept_once";
+  switch (payload.method) {
+    case "execCommandApproval":
+      return buildExecCommandApprovalResponse(payload, actionPayload, resolution);
+    case "applyPatchApproval":
+      return buildApplyPatchApprovalResponse(actionPayload, resolution);
+    case "item/permissions/requestApproval":
+      return buildPermissionsRequestResponse(payload, actionPayload, resolution);
+    case "item/tool/requestUserInput":
+      return buildToolUserInputResponse(payload, actionPayload, formValue);
+    case "mcpServer/elicitation/request":
+      return buildMcpElicitationResponse(payload, actionPayload, formValue, resolution);
+    case "item/tool/call":
+      return buildDynamicToolCallResponse(actionPayload, resolution);
+    default:
+      throw new Error(`不支持的请求类型：${payload.method}`);
+  }
+};
+
+const buildExecCommandApprovalResponse = (payload: StoredServerRequestPayload, actionPayload: Record<string, unknown>, resolution: string): Record<string, unknown> => {
+  const params = payload.params as Record<string, unknown>;
+  if (resolution === "accept_execpolicy" && params.proposedExecpolicyAmendment) {
+    return { decision: { approved_execpolicy_amendment: { proposed_execpolicy_amendment: params.proposedExecpolicyAmendment } } };
+  }
+  if (resolution === "accept_network_policy" && Array.isArray(params.proposedNetworkPolicyAmendments) && params.proposedNetworkPolicyAmendments.length > 0) {
+    return { decision: { network_policy_amendment: { network_policy_amendment: params.proposedNetworkPolicyAmendments[0] } } };
+  }
+  if (resolution === "accept_session") return { decision: "approved_for_session" };
+  if (resolution === "deny") return { decision: "denied" };
+  if (resolution === "abort") return { decision: "abort" };
+  if (resolution === "accept_once") return { decision: "approved" };
+  return buildResponseFromActionPayload(actionPayload, { decision: "abort" });
+};
+
+const buildApplyPatchApprovalResponse = (actionPayload: Record<string, unknown>, resolution: string): Record<string, unknown> => {
+  if (resolution === "accept_session") return { decision: "approved_for_session" };
+  if (resolution === "deny") return { decision: "denied" };
+  if (resolution === "abort") return { decision: "abort" };
+  if (resolution === "accept_once") return { decision: "approved" };
+  return buildResponseFromActionPayload(actionPayload, { decision: "abort" });
+};
+
+const buildPermissionsRequestResponse = (payload: StoredServerRequestPayload, actionPayload: Record<string, unknown>, resolution: string): Record<string, unknown> => {
+  const params = payload.params as Record<string, unknown>;
+  const requested = params.permissions && typeof params.permissions === "object" ? (params.permissions as Record<string, unknown>) : {};
+  const base = {
+    permissions: resolution === "deny" ? { fileSystem: null, network: null } : requested,
+    scope: resolution === "permissions_session" ? "session" : "turn",
+    strictAutoReview: null
+  };
+  return { ...base, ...normalizeResponsePatch(actionPayload) };
+};
+
+const buildToolUserInputResponse = (
+  payload: StoredServerRequestPayload,
+  actionPayload: Record<string, unknown>,
+  formValue: Record<string, unknown> | null
+): Record<string, unknown> => {
+  const questionId = asString(actionPayload.questionId) ?? "";
+  const answer = asString(actionPayload.answer) ?? "";
+  if (questionId && answer) {
+    return { answers: { [questionId]: { answers: [answer] } } };
+  }
+  const answers = buildToolUserInputAnswers(payload.params, formValue);
+  if (Object.keys(answers).length > 0) {
+    return { answers };
+  }
+  return buildResponseFromActionPayload(actionPayload, { answers: {} });
+};
+
+const buildMcpElicitationResponse = (
+  payload: StoredServerRequestPayload,
+  actionPayload: Record<string, unknown>,
+  formValue: Record<string, unknown> | null,
+  resolution: string
+): Record<string, unknown> => {
+  const params = payload.params as Record<string, unknown>;
+  if (resolution === "deny") return { action: "decline", content: null, _meta: params._meta ?? null };
+  if (resolution === "cancel") return { action: "cancel", content: null, _meta: params._meta ?? null };
+  if (resolution === "accept_empty") return { action: "accept", content: null, _meta: params._meta ?? null };
+  if (resolution === "submit_form") {
+    return {
+      action: "accept",
+      content: buildMcpElicitationFormContent(params.requestedSchema, formValue),
+      _meta: params._meta ?? null
+    };
+  }
+  return buildResponseFromActionPayload(actionPayload, { action: "cancel", content: null, _meta: params._meta ?? null });
+};
+
+const buildDynamicToolCallResponse = (actionPayload: Record<string, unknown>, resolution: string): Record<string, unknown> => {
+  if (resolution === "tool_success_empty") return { success: true, contentItems: [] };
+  if (resolution === "tool_failure_empty") return { success: false, contentItems: [] };
+  return buildResponseFromActionPayload(actionPayload, { success: false, contentItems: [] });
+};
+
+const buildResponseFromActionPayload = (actionPayload: Record<string, unknown>, fallback: Record<string, unknown>): Record<string, unknown> => {
+  const response = actionPayload.response;
+  return response && typeof response === "object" ? (response as Record<string, unknown>) : fallback;
+};
+
+const normalizeResponsePatch = (value: Record<string, unknown>): Record<string, unknown> => {
+  const patch: Record<string, unknown> = {};
+  if (value.scope === "session" || value.scope === "turn") patch.scope = value.scope;
+  if (typeof value.strictAutoReview === "boolean" || value.strictAutoReview === null) patch.strictAutoReview = value.strictAutoReview;
+  return patch;
+};
+
+const buildToolUserInputFields = (
+  questions: Record<string, unknown>[]
+): NonNullable<PresentedServerRequest["form"]>["fields"] => {
+  const fields: NonNullable<PresentedServerRequest["form"]>["fields"] = [];
+  for (const [index, question] of questions.entries()) {
+    const questionId = asString(question.id) ?? `question_${index + 1}`;
+    const header = asString(question.header) ?? `问题 ${index + 1}`;
+    const prompt = asString(question.question) ?? header;
+    const isOther = question.isOther === true;
+    const isSecret = question.isSecret === true;
+    const options = Array.isArray(question.options)
+      ? question.options
+          .map((item) => (item && typeof item === "object" ? (item as Record<string, unknown>) : null))
+          .filter((item): item is Record<string, unknown> => Boolean(item))
+          .map((option) => ({
+            label: asString(option.label) ?? "选项",
+            value: asString(option.label) ?? "选项"
+          }))
+      : [];
+    if (options.length > 0) {
+      fields.push({
+        name: questionId,
+        label: `${header}｜${prompt}`,
+        kind: "select",
+        required: true,
+        secret: false,
+        placeholder: "请选择",
+        options
+      });
+      if (isOther) {
+        fields.push({
+          name: `${questionId}__other`,
+          label: `${header}｜补充输入`,
+          kind: isSecret ? "textarea" : "text",
+          required: false,
+          secret: isSecret,
+          placeholder: "需要其他答案时填写"
+        });
+      }
+      continue;
+    }
+    fields.push({
+      name: questionId,
+      label: `${header}｜${prompt}`,
+      kind: isSecret ? "textarea" : "text",
+      required: true,
+      secret: isSecret,
+      placeholder: prompt
+    });
+  }
+  return fields;
+};
+
+const buildToolUserInputAnswers = (
+  params: Record<string, unknown>,
+  formValue: Record<string, unknown> | null
+): Record<string, { answers: string[] }> => {
+  if (!formValue) return {};
+  const questions = Array.isArray(params.questions)
+    ? params.questions
+        .map((item) => (item && typeof item === "object" ? (item as Record<string, unknown>) : null))
+        .filter((item): item is Record<string, unknown> => Boolean(item))
+    : [];
+  const answers: Record<string, { answers: string[] }> = {};
+  for (const question of questions) {
+    const questionId = asString(question.id);
+    if (!questionId) continue;
+    const values = [
+      ...normalizeFormAnswerValue(formValue[questionId]),
+      ...normalizeFormAnswerValue(formValue[`${questionId}__other`])
+    ].map((entry) => entry.trim()).filter(Boolean);
+    if (values.length > 0) {
+      answers[questionId] = { answers: values };
+    }
+  }
+  return answers;
+};
+
+const normalizeFormAnswerValue = (value: unknown): string[] => {
+  if (typeof value === "string") return [value];
+  if (typeof value === "number" || typeof value === "boolean") return [String(value)];
+  if (Array.isArray(value)) return value.flatMap((entry) => normalizeFormAnswerValue(entry));
+  if (value && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    return [
+      ...normalizeFormAnswerValue(object.value),
+      ...normalizeFormAnswerValue(object.values),
+      ...normalizeFormAnswerValue(object.option),
+      ...normalizeFormAnswerValue(object.option_value),
+      ...normalizeFormAnswerValue(object.text),
+      ...normalizeFormAnswerValue(object.input_content)
+    ];
+  }
+  return [];
+};
+
+const buildMcpElicitationFormContent = (
+  schema: unknown,
+  formValue: Record<string, unknown> | null
+): Record<string, unknown> | null => {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return formValue ? { ...formValue } : null;
+  const object = schema as Record<string, unknown>;
+  const properties = object.properties && typeof object.properties === "object" ? (object.properties as Record<string, unknown>) : {};
+  const content: Record<string, unknown> = {};
+  for (const [name, entry] of Object.entries(properties)) {
+    const field = entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
+    const resolved = normalizeMcpFieldValue(field, formValue?.[name]);
+    if (resolved !== undefined) {
+      content[name] = resolved;
+    }
+  }
+  return Object.keys(content).length > 0 ? content : formValue ? { ...formValue } : null;
+};
+
+const normalizeMcpFieldValue = (schema: Record<string, unknown>, raw: unknown): unknown => {
+  const type = asString(schema.type);
+  if (type === "boolean") {
+    const text = normalizeFormAnswerValue(raw)[0]?.toLowerCase();
+    if (text === "true" || text === "1" || text === "yes" || text === "是") return true;
+    if (text === "false" || text === "0" || text === "no" || text === "否") return false;
+    return undefined;
+  }
+  if (type === "number" || type === "integer") {
+    const text = normalizeFormAnswerValue(raw)[0];
+    if (!text) return undefined;
+    const parsed = Number(text);
+    return Number.isFinite(parsed) ? parsed : undefined;
+  }
+  if (type === "array") {
+    const values = normalizeFormAnswerValue(raw)
+      .flatMap((entry) => entry.split(","))
+      .map((entry) => entry.trim())
+      .filter(Boolean);
+    return values.length > 0 ? values : undefined;
+  }
+  const values = normalizeFormAnswerValue(raw);
+  return values.length > 0 ? values[0] : undefined;
+};
+
+const parseJsonForServerRequest = (value: string): Record<string, unknown> => {
+  const parsed = JSON.parse(value) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("请求 JSON 必须是对象");
+  }
+  return parsed as Record<string, unknown>;
+};
+
+const safeJsonForCard = (value: unknown, maxLength: number): string => {
+  try {
+    return truncatePlain(JSON.stringify(value, (_key, entry) => (typeof entry === "bigint" ? String(entry) : entry), 2) ?? "{}", maxLength);
+  } catch {
+    return truncatePlain(String(value), maxLength);
+  }
+};
+
+const buttonDescriptor = (label: string, action: string, payload: Record<string, unknown>): PresentedServerRequest["buttons"][number] => ({
+  label,
+  action,
+  payload
+});
+
+const fileChangesFromMap = (value: unknown): string | null => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const entries = Object.entries(value as Record<string, unknown>)
+    .map(([path, change]) => {
+      const object = change && typeof change === "object" ? (change as Record<string, unknown>) : null;
+      if (!object) return null;
+      return { path, kind: asString(object.type) ?? "update" };
+    })
+    .filter((entry): entry is { path: string; kind: string } => Boolean(entry));
+  if (entries.length === 0) return null;
+  return formatFileChangeSummary(entries.map((entry) => ({ path: entry.path, kind: entry.kind })), "completed");
+};
+
+const formatParsedCommands = (value: unknown): string | null => {
+  if (!Array.isArray(value)) return null;
+  const lines = value
+    .map((entry) => (entry && typeof entry === "object" ? (entry as Record<string, unknown>) : null))
+    .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+    .map((entry) => {
+      const type = asString(entry.type);
+      const path = asString(entry.path);
+      const query = asString(entry.query);
+      const name = asString(entry.name);
+      if (type === "read") return `读取 ${name ?? path ?? "文件"}`;
+      if (type === "list_files") return `查看文件 ${path ?? ""}`.trim();
+      if (type === "search") return `搜索 ${query ?? path ?? ""}`.trim();
+      return null;
+    })
+    .filter((entry): entry is string => Boolean(entry));
+  return lines.length > 0 ? lines.slice(0, 4).join("\n") : null;
+};
+
+const mcpElicitationCanAcceptWithoutContent = (schema: unknown): boolean => {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return true;
+  const object = schema as Record<string, unknown>;
+  const properties = object.properties && typeof object.properties === "object" ? Object.keys(object.properties as Record<string, unknown>) : [];
+  const required = Array.isArray(object.required) ? object.required.filter((entry): entry is string => typeof entry === "string") : [];
+  return properties.length === 0 || required.length === 0;
+};
+
+const summarizeMcpSchema = (schema: unknown): string => {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return "未提供结构化表单。";
+  const object = schema as Record<string, unknown>;
+  const properties = object.properties && typeof object.properties === "object" ? Object.entries(object.properties as Record<string, unknown>) : [];
+  const required = Array.isArray(object.required) ? object.required.filter((entry): entry is string => typeof entry === "string") : [];
+  const lines = properties.slice(0, 8).map(([name, entry]) => {
+    const field = entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
+    const type = asString(field.type) ?? "unknown";
+    const title = asString(field.title);
+    return `- ${name}${title ? `（${title}）` : ""}：${type}${required.includes(name) ? "，必填" : ""}`;
+  });
+  return lines.length > 0 ? lines.join("\n") : "表单没有可展示字段。";
+};
+
+const buildMcpElicitationFields = (
+  schema: unknown
+): NonNullable<PresentedServerRequest["form"]>["fields"] => {
+  if (!schema || typeof schema !== "object" || Array.isArray(schema)) return [];
+  const object = schema as Record<string, unknown>;
+  const properties = object.properties && typeof object.properties === "object" ? Object.entries(object.properties as Record<string, unknown>) : [];
+  const required = Array.isArray(object.required) ? object.required.filter((entry): entry is string => typeof entry === "string") : [];
+  return properties.slice(0, 12).map(([name, entry]) => buildMcpElicitationField(name, entry, required.includes(name))).filter((item): item is NonNullable<PresentedServerRequest["form"]>["fields"][number] => Boolean(item));
+};
+
+const buildMcpElicitationField = (
+  name: string,
+  entry: unknown,
+  required: boolean
+): NonNullable<PresentedServerRequest["form"]>["fields"][number] | null => {
+  const field = entry && typeof entry === "object" ? (entry as Record<string, unknown>) : {};
+  const title = asString(field.title) ?? name;
+  const description = asString(field.description) ?? title;
+  const type = asString(field.type);
+  if (type === "boolean") {
+    return {
+      name,
+      label: title,
+      kind: "boolean",
+      required,
+      placeholder: description,
+      value: typeof field.default === "boolean" ? String(field.default) : undefined
+    };
+  }
+  if (type === "number" || type === "integer") {
+    return {
+      name,
+      label: title,
+      kind: "number",
+      required,
+      placeholder: description,
+      value: field.default == null ? undefined : String(field.default)
+    };
+  }
+  if (type === "array") {
+    const options = mcpEnumOptions((field.items && typeof field.items === "object") ? field.items as Record<string, unknown> : {});
+    return {
+      name,
+      label: title,
+      kind: "multi_select",
+      required,
+      placeholder: description,
+      value: Array.isArray(field.default) ? field.default.join(",") : undefined,
+      options
+    };
+  }
+  const options = mcpEnumOptions(field);
+  if (options.length > 0) {
+    return {
+      name,
+      label: title,
+      kind: "select",
+      required,
+      placeholder: description,
+      value: asString(field.default) ?? undefined,
+      options
+    };
+  }
+  return {
+    name,
+    label: title,
+    kind: field.format === "multiline" ? "textarea" : "text",
+    required,
+    placeholder: description,
+    value: asString(field.default) ?? undefined
+  };
+};
+
+const mcpEnumOptions = (field: Record<string, unknown>): Array<{ label: string; value: string }> => {
+  if (Array.isArray(field.oneOf)) {
+    return field.oneOf
+      .map((entry) => (entry && typeof entry === "object" ? (entry as Record<string, unknown>) : null))
+      .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+      .map((entry) => ({
+        label: asString(entry.title) ?? asString(entry.const) ?? "选项",
+        value: asString(entry.const) ?? asString(entry.title) ?? "选项"
+      }));
+  }
+  if (Array.isArray(field.enum)) {
+    return field.enum
+      .filter((entry): entry is string => typeof entry === "string")
+      .map((entry) => ({ label: entry, value: entry }));
+  }
+  if (field.items && typeof field.items === "object") {
+    const items = field.items as Record<string, unknown>;
+    if (Array.isArray(items.anyOf)) {
+      return items.anyOf
+        .map((entry) => (entry && typeof entry === "object" ? (entry as Record<string, unknown>) : null))
+        .filter((entry): entry is Record<string, unknown> => Boolean(entry))
+        .map((entry) => ({
+          label: asString(entry.title) ?? asString(entry.const) ?? "选项",
+          value: asString(entry.const) ?? asString(entry.title) ?? "选项"
+        }));
+    }
+    if (Array.isArray(items.enum)) {
+      return items.enum
+        .filter((entry): entry is string => typeof entry === "string")
+        .map((entry) => ({ label: entry, value: entry }));
+    }
+  }
+  return [];
+};
+
+const serverRequestTitleText = (method: string): string =>
+  ({
+    execCommandApproval: "命令执行审批",
+    applyPatchApproval: "补丁应用审批",
+    "item/permissions/requestApproval": "额外权限请求",
+    "item/tool/requestUserInput": "用户输入请求",
+    "mcpServer/elicitation/request": "MCP 请求",
+    "item/tool/call": "工具调用请求"
+  })[method] ?? method;
+
+const isSupportedDeferredServerRequestMethod = (method: string): boolean =>
+  [
+    "execCommandApproval",
+    "applyPatchApproval",
+    "item/permissions/requestApproval",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request",
+    "item/tool/call"
+  ].includes(method);

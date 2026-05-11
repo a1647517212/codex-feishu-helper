@@ -38,7 +38,8 @@ test("long connection adapter maps message and card events into task service cal
     const result = await (server as any).handleCardActionEvent({
       context: { open_message_id: "om_root", open_chat_id: "oc_1" },
       operator: { open_id: "ou_1" },
-      action: { tag: "button", value: { action: "task_status", actionId: "act_1", bindingId: "bind_1" } }
+      action: { tag: "button", value: { action: "task_status", actionId: "act_1", bindingId: "bind_1" } },
+      form_value: { field_1: "value_1" }
     });
     assert.deepEqual(received[0], {
       messageId: "om_1",
@@ -53,6 +54,7 @@ test("long connection adapter maps message and card events into task service cal
     await new Promise((resolve) => setImmediate(resolve));
     assert.equal(actions[0].action, "task_status");
     assert.equal(actions[0].chatId, "oc_1");
+    assert.deepEqual(actions[0].formValue, { field_1: "value_1" });
     assert.equal((result.toast as any).content, "已收到，正在处理");
   } finally {
     cleanup();
@@ -81,7 +83,8 @@ test("long connection adapter maps v2 card action context nested under event", a
       event: {
         context: { open_message_id: "om_root", open_chat_id: "oc_1" },
         operator: { open_id: "ou_1" },
-        action: { tag: "button", value: { action: "doctor", actionId: "act_v2" } }
+        action: { tag: "button", value: { action: "doctor", actionId: "act_v2" } },
+        form_value: { token: "secret-value" }
       }
     });
     await new Promise((resolve) => setImmediate(resolve));
@@ -89,6 +92,44 @@ test("long connection adapter maps v2 card action context nested under event", a
     assert.equal(actions[0].actionId, "act_v2");
     assert.equal(actions[0].chatId, "oc_1");
     assert.equal(actions[0].rootMessageId, "om_root");
+    assert.deepEqual(actions[0].formValue, { token: "secret-value" });
+  } finally {
+    cleanup();
+  }
+});
+
+test("long connection adapter accepts image-only messages", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const received: any[] = [];
+    const tasks = {
+      async handleMessage(message: any): Promise<void> {
+        received.push(message);
+      },
+      async processCardActionDeferred(): Promise<void> {}
+    };
+    const diagnostics = {
+      recordFeishuMessage(): void {},
+      recordFeishuCardAction(): void {}
+    };
+    const server = new FeishuLongConnectionServer(config, tasks as any, diagnostics as any, makeLogger(dir));
+    await (server as any).handleMessageEvent({
+      sender: { sender_id: { open_id: "ou_1" }, sender_type: "user" },
+      message: {
+        message_id: "om_img",
+        chat_id: "oc_1",
+        root_id: "om_img",
+        create_time: "1",
+        chat_type: "group",
+        message_type: "image",
+        content: "{\"image_key\":\"img_v3_abc\"}"
+      }
+    });
+
+    assert.equal(received.length, 1);
+    assert.equal(received[0].text, "");
+    assert.deepEqual(received[0].attachments, [{ kind: "image", key: "img_v3_abc", messageId: "om_img" }]);
   } finally {
     cleanup();
   }

@@ -1,7 +1,7 @@
 {
   "name": "codex-feishu-helper",
   "version": "0.1.0",
-  "description": "Local Feishu control bridge for Codex app-server task chats.",
+  "description": "Local Feishu control bridge for ordinary Codex Desktop task chats.",
   "type": "module",
   "bin": {
     "feishu-codex": "./dist/src/main.js"
@@ -11,14 +11,6 @@
     "dev": "tsx src/main.ts serve",
     "start": "node dist/src/main.js serve",
     "doctor": "tsx src/main.ts doctor",
-    "desktop": "powershell -ExecutionPolicy Bypass -File scripts/start-codex-desktop-canonical.ps1",
-    "desktop:copy:status": "powershell -ExecutionPolicy Bypass -File scripts/install-patched-codex-desktop-copy.ps1 -Action status",
-    "desktop:copy": "powershell -ExecutionPolicy Bypass -File scripts/install-patched-codex-desktop-copy.ps1 -Action install",
-    "desktop:copy:remove": "powershell -ExecutionPolicy Bypass -File scripts/install-patched-codex-desktop-copy.ps1 -Action remove",
-    "desktop:patch:status": "node scripts/patch-codex-desktop-ws.mjs status",
-    "desktop:patch": "node scripts/patch-codex-desktop-ws.mjs install",
-    "desktop:patch:restore": "node scripts/patch-codex-desktop-ws.mjs restore",
-    "desktop:shortcut": "powershell -ExecutionPolicy Bypass -File scripts/install-user-shortcuts.ps1",
     "panel": "powershell -ExecutionPolicy Bypass -File scripts/open-control-panel.ps1",
     "shortcuts": "powershell -ExecutionPolicy Bypass -File scripts/install-user-shortcuts.ps1",
     "watchdog": "powershell -ExecutionPolicy Bypass -File scripts/install-watchdog.ps1",
@@ -31,7 +23,7 @@
     "feishu",
     "lark",
     "bridge",
-    "app-server"
+    "desktop-ipc"
   ],
   "author": "",
   "license": "GPL-3.0-only",

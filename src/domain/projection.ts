@@ -11,7 +11,7 @@ export class ProjectionBuilder {
     const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
     const events = this.repo.listEventsForBinding(bindingId, 50);
     const queuedMessages = this.repo.listQueuedMessages(bindingId).length;
-    const pendingApprovals = this.repo.listPendingApprovals(bindingId).length;
+    const pendingApprovals = this.repo.listPendingApprovals(bindingId).length + this.repo.listPendingServerRequests(bindingId).length;
     const lastSummaryEvent = [...events].reverse().find((event) =>
       ["task.completed", "task.failed", "task.summary"].includes(event.eventType)
     );

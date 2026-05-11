@@ -64,6 +64,7 @@ test("running topic replies are queued instead of dropped", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
+    config.feishu.interactionMode = "hybrid";
     const feishu = new MockFeishu();
     const codex = new MockCodex();
     codex.failSteer = true;
@@ -91,10 +92,265 @@ test("running topic replies are queued instead of dropped", async () => {
   }
 });
 
+test("desktop ipc mode keeps new Feishu tasks on project selection before creating ordinary Desktop thread", async () => {
+    const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
+    config.feishu.interactionMode = "hybrid";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_ipc";
+    codex.threads = [{
+      id: "thr_desktop_existing",
+      name: "Desktop existing task",
+      preview: "Desktop existing task",
+      cwd: dir,
+      status: { type: "idle" },
+      updatedAt: Date.now()
+    }];
+    repo.upsertProject({ id: "proj_desktop_ipc_select", name: "Desktop IPC", rootPath: dir });
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+
+    await service.handleMessage({
+      messageId: "msg_desktop_ipc_new",
+      chatId: "chat_1",
+      rootMessageId: "msg_desktop_ipc_new",
+      threadId: null,
+      userId: "user_1",
+      text: "帮我开一个新任务"
+    });
+
+    assert.ok(repo.findPendingProjectPromptByMessageId("msg_desktop_ipc_new"));
+    assert.equal(codex.startedThreads.length, 0);
+    assert.equal(feishu.sent.length, 1);
+    assert.equal(feishu.sent[0]?.type, "card");
+    assert.equal(JSON.stringify(feishu.sent[0]?.payload).includes("开始"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("desktop ipc mode project start action creates ordinary Desktop thread without separate runtime turn", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_ipc";
+    codex.threads = [{
+      id: "thr_desktop_project",
+      name: "Desktop project task",
+      preview: "Desktop project task",
+      cwd: dir,
+      status: { type: "idle" },
+      updatedAt: Date.now()
+    }];
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({ id: "proj_desktop_ipc", name: "Desktop IPC", rootPath: dir });
+    const pendingPrompt = repo.createPendingProjectPrompt({
+      feishuMessageId: "msg_pending_desktop_ipc",
+      feishuChatId: "chat_1",
+      feishuUserId: "user_1",
+      text: "帮我执行新任务"
+    });
+
+    await service.handleCardAction({
+      actionId: "act_desktop_ipc_start",
+      action: "project_start_prompt",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_desktop_ipc_start",
+      payload: { projectId: project.id, pendingPromptId: pendingPrompt.id }
+    });
+
+    assert.equal(repo.getPendingProjectPrompt(pendingPrompt.id)?.status, "used");
+    assert.equal(codex.startedThreads.length, 1);
+    assert.equal(codex.startedThreads[0]?.prompt, "帮我执行新任务");
+    assert.equal(codex.startedThreads[0]?.cwd, dir);
+    assert.equal(codex.turns.length, 0);
+    const binding = repo.listBindings()[0];
+    assert.ok(binding);
+    assert.equal(binding.codexThreadId, "thr_new");
+    assert.equal(binding.status, "running");
+    assert.equal(binding.lastTurnId, "turn_1");
+    const events = repo.listEventsForBinding(binding.id);
+    assert.equal(events.some((event) => event.eventType === "task.created_from_feishu" && (event.eventPayload as any).desktopIpc === true), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("desktop ipc mode starts ordinary Desktop thread with Feishu image attachments", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_ipc";
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({ id: "proj_desktop_ipc_image", name: "Desktop IPC", rootPath: dir });
+
+    await service.handleMessage({
+      messageId: "msg_img_task",
+      chatId: "chat_1",
+      rootMessageId: "msg_img_task",
+      threadId: null,
+      userId: "user_1",
+      text: "",
+      attachments: [{ kind: "image", key: "img_v3_task", messageId: "msg_img_task" }]
+    });
+    const pendingPrompt = repo.findPendingProjectPromptByMessageId("msg_img_task");
+    assert.ok(pendingPrompt);
+    assert.equal(pendingPrompt.text, "请查看这张图片。");
+    assert.equal(pendingPrompt.attachments[0]?.key, "img_v3_task");
+
+    await service.handleCardAction({
+      actionId: "act_desktop_ipc_image_start",
+      action: "project_start_prompt",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "msg_img_task",
+      payload: { projectId: project.id, pendingPromptId: pendingPrompt.id }
+    });
+
+    assert.deepEqual(feishu.downloadedResources, [
+      { messageId: "msg_img_task", fileKey: "img_v3_task", resourceType: "image" }
+    ]);
+    assert.equal(codex.startedThreads[0]?.prompt, "请查看这张图片。");
+    assert.deepEqual(codex.startedThreads[0]?.attachments, [{ path: feishu.resourcePathByKey.get("img_v3_task") ?? (codex.startedThreads[0]?.attachments as any[])[0]?.path }]);
+    const event = repo.listEventsForBinding(repo.listBindings()[0]!.id).find((candidate) => candidate.eventType === "task.created_from_feishu");
+    assert.equal(((event?.eventPayload as any).attachments ?? [])[0]?.key, "img_v3_task");
+  } finally {
+    cleanup();
+  }
+});
+
+test("running Desktop task steers Feishu image attachments into the same ordinary thread", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_ipc";
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    repo.createOrUpdateBinding({
+      codexThreadId: "thr_running_image",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_image",
+      title: "Task",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+
+    await service.handleMessage({
+      messageId: "msg_img_continue",
+      chatId: "chat_1",
+      rootMessageId: "root_image",
+      threadId: null,
+      userId: "user_1",
+      text: "按这张图继续",
+      attachments: [{ kind: "image", key: "img_v3_continue", messageId: "msg_img_continue" }]
+    });
+
+    assert.equal(codex.steerRequests.length, 1);
+    assert.equal(codex.steerRequests[0]?.threadId, "thr_running_image");
+    assert.equal(codex.steerRequests[0]?.text, "按这张图继续");
+    assert.equal((codex.steerRequests[0]?.attachments ?? []).length, 1);
+    assert.deepEqual(feishu.downloadedResources, [
+      { messageId: "msg_img_continue", fileKey: "img_v3_continue", resourceType: "image" }
+    ]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("desktop ipc mode marks project task failed when ordinary Desktop thread creation fails", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_ipc";
+    codex.failStartThread = true;
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({ id: "proj_desktop_ipc_fail", name: "Desktop IPC", rootPath: dir });
+    const pendingPrompt = repo.createPendingProjectPrompt({
+      feishuMessageId: "msg_pending_desktop_ipc_fail",
+      feishuChatId: "chat_1",
+      feishuUserId: "user_1",
+      text: "帮我执行会失败的新任务"
+    });
+
+    await service.handleCardAction({
+      actionId: "act_desktop_ipc_fail_start",
+      action: "project_start_prompt",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_desktop_ipc_fail_start",
+      payload: { projectId: project.id, pendingPromptId: pendingPrompt.id }
+    });
+
+    assert.equal(repo.getPendingProjectPrompt(pendingPrompt.id)?.status, "used");
+    assert.equal(codex.startedThreads.length, 1);
+    assert.equal(codex.turns.length, 0);
+    const binding = repo.listBindings()[0];
+    assert.ok(binding);
+    assert.equal(binding.codexThreadId.startsWith("pending_desktop_"), true);
+    assert.equal(binding.status, "failed");
+    const events = repo.listEventsForBinding(binding.id);
+    assert.equal(events.some((event) => event.eventType === "task.failed" && (event.eventPayload as any).desktopIpc === true), true);
+    assert.equal(JSON.stringify(feishu.sent).includes("没有启动独立 runtime"), true);
+    assert.equal(feishu.updatedChatNames.some((entry) => entry.name.includes("[失败]")), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("desktop ipc mode skips unsupported Codex thread rename sync", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_ipc";
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    repo.createOrUpdateBinding({
+      codexThreadId: "thr_desktop_rename",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Desktop title",
+      status: "completed",
+      createdFrom: "codex_app_claimed"
+    });
+
+    await service.handleMessage({
+      messageId: "msg_desktop_rename_continue",
+      chatId: "task_chat_1",
+      rootMessageId: "task-root",
+      threadId: null,
+      userId: "user_1",
+      text: "继续"
+    });
+
+    assert.equal(feishu.updatedChatNames.some((entry) => entry.chatId === "task_chat_1"), true);
+    assert.equal(codex.renamed.length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
 test("running topic replies prefer steer before falling back to queue", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
+    config.feishu.interactionMode = "hybrid";
     const feishu = new MockFeishu();
     const codex = new MockCodex();
     const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
@@ -905,7 +1161,7 @@ test("raw response item completion fills Feishu progress and final report fallba
         item: {
           type: "message",
           role: "assistant",
-          content: [{ type: "output_text", text: "最终结论：飞书现在能收到 Codex App 输出。" }]
+          content: [{ type: "output_text", text: "最终结论：飞书现在能收到 Codex Desktop 输出。" }]
         }
       }
     });
@@ -920,7 +1176,7 @@ test("raw response item completion fills Feishu progress and final report fallba
     assert.ok(report);
     const payload = JSON.stringify(report.payload);
     assert.equal(payload.includes("已经完成原因定位。"), true);
-    assert.equal(payload.includes("最终结论：飞书现在能收到 Codex App 输出。"), true);
+    assert.equal(payload.includes("最终结论：飞书现在能收到 Codex Desktop 输出。"), true);
   } finally {
     cleanup();
   }
@@ -1567,8 +1823,8 @@ test("codex-only completed thread enqueues one control chat reminder", async () 
     codex.threads = [
       {
         id: "thr_codex_only_done",
-        name: "Codex App only task",
-        preview: "Codex App only task",
+        name: "Codex Desktop only task",
+        preview: "Codex Desktop only task",
         cwd: dir,
         status: { type: "idle" },
         updatedAt: completedAt
@@ -1577,8 +1833,8 @@ test("codex-only completed thread enqueues one control chat reminder", async () 
     (codex as unknown as { readThread: (threadId: string) => Promise<Record<string, unknown>> }).readThread = async () => ({
       thread: {
         id: "thr_codex_only_done",
-        name: "Codex App only task",
-        preview: "Codex App only task",
+        name: "Codex Desktop only task",
+        preview: "Codex Desktop only task",
         cwd: dir,
         status: { type: "idle" },
         updatedAt: completedAt,
@@ -1603,7 +1859,7 @@ test("codex-only completed thread enqueues one control chat reminder", async () 
     assert.equal(outbox[0]?.notificationType, "task_completed");
     assert.equal(outbox[0]?.feishuChatId, "chat_1");
     const payload = JSON.stringify(outbox[0]?.payload.card ?? {});
-    assert.equal(payload.includes("Codex App 任务已完成"), true);
+    assert.equal(payload.includes("Codex Desktop 任务已完成"), true);
     assert.equal(payload.includes("最终结论：这个任务已经处理完成。"), true);
     assert.equal(collectButtons(outbox[0]?.payload.card).some((button) => buttonAction(button) === "claim_thread"), true);
   } finally {
@@ -1739,7 +1995,7 @@ test("unclassified create project action creates project and bind rules", async 
   }
 });
 
-test("runtime bootstrap auto imports Codex App workspace roots", async () => {
+test("runtime bootstrap auto imports Codex Desktop workspace roots", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const firstWorkspace = join(dir, "workspace-one");
@@ -1778,7 +2034,7 @@ test("runtime bootstrap auto imports Codex App workspace roots", async () => {
   }
 });
 
-test("project list auto syncs Codex App workspace roots before rendering", async () => {
+test("project list auto syncs Codex Desktop workspace roots before rendering", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const workspace = join(dir, "workspace-list");
@@ -2079,6 +2335,367 @@ test("approval commands resolve approvals without card callback", async () => {
     assert.equal(codex.responses.length, 1);
     assert.equal(feishu.sent.some((entry) => entry.type === "card"), true);
     assert.equal(feishu.sent.some((entry) => entry.type === "text" && String(entry.payload).includes("已处理")), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("execCommandApproval server request is bridged into Feishu and can be resolved", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_exec_request",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root-exec",
+      feishuContainerKind: "dedicated_chat",
+      title: "Exec request task",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+
+    await codex.requests.serverRequest![0]!({
+      id: "req_exec_1",
+      method: "execCommandApproval",
+      params: {
+        conversationId: binding.codexThreadId,
+        callId: "call_exec_1",
+        approvalId: "approval_exec_1",
+        command: ["npm", "test"],
+        cwd: dir,
+        reason: "运行测试"
+      }
+    });
+
+    assert.equal(repo.findBindingById(binding.id)?.status, "waiting_for_approval");
+    assert.equal(repo.findAction("req_exec_1")?.actionType, "codex_server_request:execCommandApproval");
+    const outbox = repo.listDueOutbox(10);
+    assert.equal(outbox.some((item) => item.dedupeKey === "server-request:thr_exec_request:req_exec_1"), true);
+
+    await service.handleCardAction({
+      actionId: "act_resolve_exec_request",
+      action: "server_request_resolve",
+      userId: "user_1",
+      chatId: "task_chat_1",
+      rootMessageId: "task-root-exec",
+      payload: { requestId: "req_exec_1", resolution: "accept_once" }
+    });
+
+    assert.deepEqual(codex.responses[0], {
+      requestId: "req_exec_1",
+      result: { decision: "approved" }
+    });
+    assert.equal(repo.findAction("req_exec_1")?.status, "completed");
+    assert.equal(repo.findBindingById(binding.id)?.status, "running");
+  } finally {
+    cleanup();
+  }
+});
+
+test("requestUserInput server request supports option shortcut responses", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_user_input_request",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root-user-input",
+      feishuContainerKind: "dedicated_chat",
+      title: "User input request task",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+
+    await codex.requests.serverRequest![0]!({
+      id: "req_user_input_1",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: binding.codexThreadId,
+        turnId: "turn_user_input_1",
+        itemId: "item_user_input_1",
+        questions: [
+          {
+            id: "q1",
+            header: "模式",
+            question: "请选择执行模式",
+            isOther: false,
+            isSecret: false,
+            options: [
+              { label: "继续", description: "按当前方案继续" },
+              { label: "停止", description: "暂停当前动作" }
+            ]
+          }
+        ]
+      }
+    });
+
+    assert.equal(repo.findAction("req_user_input_1")?.actionType, "codex_server_request:item/tool/requestUserInput");
+
+    await service.handleCardAction({
+      actionId: "act_resolve_user_input_request",
+      action: "server_request_resolve",
+      userId: "user_1",
+      chatId: "task_chat_1",
+      rootMessageId: "task-root-user-input",
+      payload: {
+        requestId: "req_user_input_1",
+        resolution: "select_option",
+        questionId: "q1",
+        answer: "继续"
+      }
+    });
+
+    assert.deepEqual(codex.submittedUserInputs[0], {
+      threadId: binding.codexThreadId,
+      requestId: "req_user_input_1",
+      response: {
+        answers: {
+          q1: { answers: ["继续"] }
+        }
+      }
+    });
+    assert.equal(repo.findAction("req_user_input_1")?.status, "completed");
+  } finally {
+    cleanup();
+  }
+});
+
+test("requestUserInput server request renders form card and accepts submitted form values", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.feishu.interactionMode = "hybrid";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_user_input_form",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root-user-input-form",
+      feishuContainerKind: "dedicated_chat",
+      title: "User input form task",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+
+    await codex.requests.serverRequest![0]!({
+      id: "req_user_input_form",
+      method: "item/tool/requestUserInput",
+      params: {
+        threadId: binding.codexThreadId,
+        turnId: "turn_user_input_form",
+        itemId: "item_user_input_form",
+        questions: [
+          {
+            id: "mode",
+            header: "模式",
+            question: "请选择执行模式",
+            isOther: true,
+            isSecret: false,
+            options: [
+              { label: "继续", description: "按当前方案继续" },
+              { label: "停止", description: "暂停当前动作" }
+            ]
+          },
+          {
+            id: "note",
+            header: "备注",
+            question: "补充说明",
+            isOther: false,
+            isSecret: true,
+            options: null
+          }
+        ]
+      }
+    });
+
+    const outbox = repo.listDueOutbox(10);
+    const requestOutbox = outbox.find((item) => item.dedupeKey === "server-request:thr_user_input_form:req_user_input_form");
+    const cardPayload = JSON.stringify(requestOutbox?.payload.card ?? {});
+    assert.equal(cardPayload.includes("select_static"), true);
+    assert.equal(cardPayload.includes("textarea"), true);
+    assert.equal(cardPayload.includes("提交回答"), true);
+
+    await service.handleCardAction({
+      actionId: "act_submit_user_input_form",
+      action: "server_request_resolve",
+      userId: "user_1",
+      chatId: "task_chat_1",
+      rootMessageId: "task-root-user-input-form",
+      payload: {
+        requestId: "req_user_input_form",
+        resolution: "submit_form"
+      },
+      formValue: {
+        mode: "继续",
+        mode__other: "然后补充日志",
+        note: "敏感备注"
+      }
+    });
+
+    assert.deepEqual(codex.submittedUserInputs[0], {
+      threadId: binding.codexThreadId,
+      requestId: "req_user_input_form",
+      response: {
+        answers: {
+          mode: { answers: ["继续", "然后补充日志"] },
+          note: { answers: ["敏感备注"] }
+        }
+      }
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test("mcp elicitation server request can be declined from Feishu", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_mcp_request",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root-mcp",
+      feishuContainerKind: "dedicated_chat",
+      title: "MCP request task",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+
+    await codex.requests.serverRequest![0]!({
+      id: "req_mcp_1",
+      method: "mcpServer/elicitation/request",
+      params: {
+        threadId: binding.codexThreadId,
+        turnId: "turn_mcp_1",
+        serverName: "demo-mcp",
+        mode: "form",
+        _meta: null,
+        message: "需要补充参数",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            token: { type: "string", title: "Token" }
+          },
+          required: ["token"]
+        }
+      }
+    });
+
+    await service.handleCardAction({
+      actionId: "act_resolve_mcp_request",
+      action: "server_request_resolve",
+      userId: "user_1",
+      chatId: "task_chat_1",
+      rootMessageId: "task-root-mcp",
+      payload: { requestId: "req_mcp_1", resolution: "deny" }
+    });
+
+    assert.deepEqual(codex.submittedMcpElicitations[0], {
+      threadId: binding.codexThreadId,
+      requestId: "req_mcp_1",
+      response: {
+        action: "decline",
+        content: null,
+        _meta: null
+      }
+    });
+    assert.equal(repo.findAction("req_mcp_1")?.status, "completed");
+  } finally {
+    cleanup();
+  }
+});
+
+test("mcp elicitation form request renders structured form and accepts submitted values", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.feishu.interactionMode = "hybrid";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_mcp_form_request",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root-mcp-form",
+      feishuContainerKind: "dedicated_chat",
+      title: "MCP form task",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+
+    await codex.requests.serverRequest![0]!({
+      id: "req_mcp_form",
+      method: "mcpServer/elicitation/request",
+      params: {
+        threadId: binding.codexThreadId,
+        turnId: "turn_mcp_form",
+        serverName: "demo-mcp",
+        mode: "form",
+        _meta: { source: "test" },
+        message: "需要结构化参数",
+        requestedSchema: {
+          type: "object",
+          properties: {
+            token: { type: "string", title: "Token", description: "访问令牌" },
+            retry: { type: "boolean", title: "重试" },
+            count: { type: "number", title: "次数" },
+            env: { type: "string", title: "环境", enum: ["dev", "prod"] }
+          },
+          required: ["token", "env"]
+        }
+      }
+    });
+
+    const outbox = repo.listDueOutbox(10);
+    const requestOutbox = outbox.find((item) => item.dedupeKey === "server-request:thr_mcp_form_request:req_mcp_form");
+    const cardPayload = JSON.stringify(requestOutbox?.payload.card ?? {});
+    assert.equal(cardPayload.includes("提交表单"), true);
+    assert.equal(cardPayload.includes("Token"), true);
+    assert.equal(cardPayload.includes("重试"), true);
+    assert.equal(cardPayload.includes("环境"), true);
+
+    await service.handleCardAction({
+      actionId: "act_submit_mcp_form",
+      action: "server_request_resolve",
+      userId: "user_1",
+      chatId: "task_chat_1",
+      rootMessageId: "task-root-mcp-form",
+      payload: {
+        requestId: "req_mcp_form",
+        resolution: "submit_form"
+      },
+      formValue: {
+        token: "abc123",
+        retry: "true",
+        count: "2",
+        env: "prod"
+      }
+    });
+
+    assert.deepEqual(codex.submittedMcpElicitations[0], {
+      threadId: binding.codexThreadId,
+      requestId: "req_mcp_form",
+      response: {
+        action: "accept",
+        content: {
+          token: "abc123",
+          retry: true,
+          count: 2,
+          env: "prod"
+        },
+        _meta: { source: "test" }
+      }
+    });
   } finally {
     cleanup();
   }

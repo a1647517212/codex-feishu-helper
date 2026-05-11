@@ -1,6 +1,9 @@
+import { mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import type { BridgeConfig } from "../config.js";
 import type { Logger } from "../logger.js";
 import type { FeishuCard } from "../domain/cards.js";
+import type { FeishuMessageAttachment } from "../core/types.js";
 
 export interface SentMessage {
   messageId: string;
@@ -27,6 +30,12 @@ export interface FeishuCreatedChat {
   raw: Record<string, unknown>;
 }
 
+export interface DownloadedFeishuResource {
+  path: string;
+  mimeType: string | null;
+  sizeBytes: number;
+}
+
 export interface FeishuSender {
   sendText(chatId: string, text: string, rootMessageId?: string | null): Promise<SentMessage>;
   sendCard(chatId: string, card: FeishuCard, rootMessageId?: string | null): Promise<SentMessage>;
@@ -43,6 +52,12 @@ export interface FeishuSender {
     setBotManager?: boolean;
   }): Promise<FeishuCreatedChat>;
   updateChatName(chatId: string, name: string, description?: string | null): Promise<void>;
+  downloadMessageResource?(input: {
+    messageId: string;
+    fileKey: string;
+    resourceType: "image";
+    attachment?: FeishuMessageAttachment;
+  }): Promise<DownloadedFeishuResource>;
 }
 
 export interface FeishuChatInfoProvider {
@@ -211,6 +226,52 @@ export class FeishuClient implements FeishuSender {
     await this.assertOk(response, "update chat group message type");
   }
 
+  async downloadMessageResource(input: {
+    messageId: string;
+    fileKey: string;
+    resourceType: "image";
+    attachment?: FeishuMessageAttachment;
+  }): Promise<DownloadedFeishuResource> {
+    const token = await this.getTenantAccessToken();
+    const params = new URLSearchParams({ type: input.resourceType });
+    const response = await fetch(
+      `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(input.messageId)}/resources/${encodeURIComponent(input.fileKey)}?${params.toString()}`,
+      {
+        method: "GET",
+        headers: { authorization: `Bearer ${token}` }
+      }
+    );
+    if (!response.ok) {
+      const body = await safeResponseText(response);
+      this.logger.warn("Feishu download message resource failed", { status: response.status, body });
+      throw new Error(`Feishu download message resource failed: HTTP ${response.status} ${body}`);
+    }
+    const mimeType = response.headers.get("content-type");
+    if (looksLikeJson(mimeType)) {
+      const body = await safeResponseText(response);
+      this.logger.warn("Feishu download message resource returned JSON", { status: response.status, body });
+      throw new Error(`Feishu download message resource failed: ${body || "unexpected JSON response"}`);
+    }
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    const extension = imageExtension(mimeType) ?? imageExtension(input.attachment?.mimeType ?? null) ?? ".img";
+    const directory = join(this.config.storage.homeDir, "attachments", sanitizePathSegment(input.messageId));
+    await mkdir(directory, { recursive: true });
+    const path = join(directory, `${sanitizePathSegment(input.fileKey)}${extension}`);
+    await writeFile(path, bytes);
+    this.logger.info("Feishu download message resource saved", {
+      messageId: input.messageId,
+      fileKey: input.fileKey,
+      path,
+      mimeType,
+      sizeBytes: bytes.byteLength
+    });
+    return {
+      path,
+      mimeType,
+      sizeBytes: bytes.byteLength
+    };
+  }
+
   private async createMessage(chatId: string, msgType: "text" | "interactive", content: unknown): Promise<SentMessage> {
     const token = await this.getTenantAccessToken();
     const response = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
@@ -299,6 +360,32 @@ const extractMessage = (body: Record<string, unknown>): SentMessage => {
     threadId: typeof data.thread_id === "string" ? data.thread_id : null,
     raw: body
   };
+};
+
+const safeResponseText = async (response: Response): Promise<string> => {
+  try {
+    return await response.text();
+  } catch {
+    return "";
+  }
+};
+
+const imageExtension = (mimeType: string | null): string | null => {
+  const compact = (mimeType ?? "").split(";")[0]?.trim().toLowerCase();
+  if (compact === "image/png") return ".png";
+  if (compact === "image/jpeg" || compact === "image/jpg") return ".jpg";
+  if (compact === "image/webp") return ".webp";
+  if (compact === "image/gif") return ".gif";
+  if (compact === "image/bmp") return ".bmp";
+  return null;
+};
+
+const looksLikeJson = (mimeType: string | null): boolean =>
+  (mimeType ?? "").split(";")[0]?.trim().toLowerCase() === "application/json";
+
+const sanitizePathSegment = (value: string): string => {
+  const sanitized = value.replace(/[^A-Za-z0-9._-]/g, "_").replace(/^\.+/g, "_").slice(0, 120);
+  return sanitized || "resource";
 };
 
 const getObject = (value: unknown): Record<string, unknown> =>

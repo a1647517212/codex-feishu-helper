@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BridgeDatabase } from "../src/db/database.js";
@@ -7,6 +7,7 @@ import { Logger } from "../src/logger.js";
 import type { BridgeConfig } from "../src/config.js";
 import type { FeishuCard } from "../src/domain/cards.js";
 import type { FeishuSender, SentMessage } from "../src/feishu/client.js";
+import type { FeishuMessageAttachment } from "../src/core/types.js";
 
 export const makeTempRepo = (): {
   dir: string;
@@ -39,17 +40,9 @@ export const makeConfig = (dir: string): BridgeConfig => ({
   server: { host: "127.0.0.1", port: 0, mode: "auto", adminToken: "test-token" },
   codex: {
     command: "codex",
-    args: ["app-server"],
-    connectionMode: "standalone",
-    proxyArgs: ["app-server", "proxy"],
-    websocketListenUrl: "ws://127.0.0.1:47931",
-    websocketUrl: undefined,
-    websocketAttachExisting: true,
-    desktopSocksProxyEnabled: false,
-    desktopSocksProxyHost: "127.0.0.1",
-    desktopSocksProxyPort: 1080,
-    desktopSocksProxyAllowExisting: false,
-    experimentalApi: true,
+    connectionMode: "desktop_ipc",
+    desktopIpcPipePath: "\\\\.\\pipe\\codex-ipc",
+    desktopIpcInitialSnapshotWaitMs: 1500,
     defaultModel: "gpt-5.5",
     defaultReasoningEffort: "xhigh",
     defaultSandboxMode: "danger-full-access",
@@ -105,6 +98,8 @@ export class MockFeishu implements FeishuSender {
   createdChats: Array<{ chatId: string; name: string; input: Record<string, unknown> }> = [];
   updatedChatNames: Array<{ chatId: string; name: string }> = [];
   updatedCards: Array<{ messageId: string; card: FeishuCard }> = [];
+  downloadedResources: Array<{ messageId: string; fileKey: string; resourceType: "image" }> = [];
+  resourcePathByKey = new Map<string, string>();
   failNext = false;
 
   async sendText(chatId: string, text: string, rootMessageId?: string | null): Promise<SentMessage> {
@@ -180,6 +175,22 @@ export class MockFeishu implements FeishuSender {
     this.updatedChatNames.push({ chatId, name });
   }
 
+  async downloadMessageResource(input: {
+    messageId: string;
+    fileKey: string;
+    resourceType: "image";
+    attachment?: FeishuMessageAttachment;
+  }): Promise<{ path: string; mimeType: string | null; sizeBytes: number }> {
+    this.downloadedResources.push({
+      messageId: input.messageId,
+      fileKey: input.fileKey,
+      resourceType: input.resourceType
+    });
+    const path = this.resourcePathByKey.get(input.fileKey) ?? join(mkdtempSync(join(tmpdir(), "codex-feishu-resource-")), `${input.fileKey}.png`);
+    writeFileSync(path, Buffer.from([137, 80, 78, 71]));
+    return { path, mimeType: "image/png", sizeBytes: 4 };
+  }
+
   async getChatInfo() {
     return {
       chatId: "chat_1",
@@ -196,16 +207,17 @@ export class MockFeishu implements FeishuSender {
 
 export class MockCodex {
   status = "connected" as const;
-  connectionKind = "standalone" as const;
-  webSocketUrl = null;
-  desktopSocksProxySnapshot = null;
+  connectionKind: "desktop_ipc" | "not_started" | "unknown" = "desktop_ipc";
+  desktopIpcSnapshot = null;
   notifications: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
   requests: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
-  turns: Array<{ threadId: string; text: string }> = [];
+  turns: Array<{ threadId: string; text: string; attachments?: unknown[] }> = [];
   startedThreads: Array<Record<string, unknown>> = [];
   startedTurns: Array<Record<string, unknown>> = [];
-  steerRequests: Array<{ threadId: string; text: string }> = [];
+  steerRequests: Array<{ threadId: string; text: string; attachments?: unknown[] }> = [];
   responses: Array<{ requestId: string | number; result: Record<string, unknown> }> = [];
+  submittedUserInputs: Array<{ threadId: string; requestId: string; response: Record<string, unknown> }> = [];
+  submittedMcpElicitations: Array<{ threadId: string; requestId: string; response: Record<string, unknown> }> = [];
   interrupted: string[] = [];
   archived: string[] = [];
   unarchived: string[] = [];
@@ -214,6 +226,7 @@ export class MockCodex {
   listCalls: Array<{ limit?: number; pageSize?: number; maxPages?: number }> = [];
   readFailures = new Map<string, Error>();
   failSteer = false;
+  failStartThread = false;
 
   on(event: "notification" | "serverRequest" | "error", handler: (message: any) => void): void {
     const bag = event === "serverRequest" ? this.requests : this.notifications;
@@ -246,7 +259,25 @@ export class MockCodex {
 
   async startThread(params: Record<string, unknown> = {}): Promise<any> {
     this.startedThreads.push(params);
-    return { id: "thr_new", title: null, preview: null, cwd: (params.cwd as string | null | undefined) ?? null, status: "idle", updatedAt: null, raw: {} };
+    if (this.failStartThread) throw new Error("mock start thread failure");
+    return {
+      id: "thr_new",
+      title: null,
+      preview: null,
+      cwd: (params.cwd as string | null | undefined) ?? null,
+      status: "running",
+      updatedAt: null,
+      raw: {
+        turns: [{
+          turnId: "turn_1",
+          status: "running",
+          params: {
+            cwd: (params.cwd as string | null | undefined) ?? null,
+            input: typeof params.prompt === "string" ? [{ type: "text", text: params.prompt, text_elements: [] }] : []
+          }
+        }]
+      }
+    };
   }
 
   async resumeThread(threadId: string): Promise<any> {
@@ -254,14 +285,14 @@ export class MockCodex {
   }
 
   async startTurn(threadId: string, text: string, options: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
-    this.turns.push({ threadId, text });
+    this.turns.push({ threadId, text, attachments: options.attachments as unknown[] | undefined });
     this.startedTurns.push({ threadId, text, ...options });
     return { turn: { id: `turn_${this.turns.length}` } };
   }
 
-  async steerTurn(threadId: string, text: string): Promise<Record<string, unknown>> {
+  async steerTurn(threadId: string, text: string, attachments: unknown[] = []): Promise<Record<string, unknown>> {
     if (this.failSteer) throw new Error("mock steer failure");
-    this.steerRequests.push({ threadId, text });
+    this.steerRequests.push({ threadId, text, attachments });
     return { turnId: `turn_${this.turns.length}` };
   }
 
@@ -287,6 +318,16 @@ export class MockCodex {
 
   async respondToServerRequest(requestId: string | number, result: Record<string, unknown>): Promise<void> {
     this.responses.push({ requestId, result });
+  }
+
+  async submitUserInput(threadId: string, requestId: string, response: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.submittedUserInputs.push({ threadId, requestId, response });
+    return { ok: true };
+  }
+
+  async submitMcpServerElicitationResponse(threadId: string, requestId: string, response: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.submittedMcpElicitations.push({ threadId, requestId, response });
+    return { ok: true };
   }
 }
 

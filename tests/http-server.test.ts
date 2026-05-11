@@ -24,9 +24,8 @@ test("http server exposes health, guarded doctor, and Feishu URL verification", 
         nodeVersion: process.version,
         codexCommand: "codex",
         codexConnectionMode: config.codex.connectionMode,
-        codexConnectionKind: "standalone" as const,
-        codexWebSocketUrl: null,
-        codexDesktopSocksProxy: null,
+        codexConnectionKind: "desktop_ipc" as const,
+        codexDesktopIpc: null,
         codexAvailable: true,
         appServerStatus: "connected" as const,
         feishuConfigured: true,
@@ -35,12 +34,18 @@ test("http server exposes health, guarded doctor, and Feishu URL verification", 
         feishuInteractionMode: config.feishu.interactionMode,
         feishuDefaultChatId: config.feishu.defaultChatId ?? null,
         feishuDefaultChatDiagnostic: null,
+        feishuTaskContainerMode: config.feishu.taskContainerMode,
         databasePath: config.storage.databasePath,
         projectsCount: 0,
         sessionBindingsCount: repo.count("session_bindings"),
         runningTasksCount: 0,
         pendingOutboxCount: 0,
         pendingApprovalsCount: 0,
+        notificationPreferenceCount: 0,
+        trustedSubjectsCount: 0,
+        bridgeDevicesCount: 0,
+        currentDevice: null,
+        trustedSubjects: [],
         lastFeishuMessageAt: null,
         lastFeishuMessageId: null,
         lastFeishuCardActionAt: null,
@@ -101,9 +106,8 @@ test("http callback endpoints are disabled when long connection transport is act
         nodeVersion: process.version,
         codexCommand: "codex",
         codexConnectionMode: config.codex.connectionMode,
-        codexConnectionKind: "standalone" as const,
-        codexWebSocketUrl: null,
-        codexDesktopSocksProxy: null,
+        codexConnectionKind: "desktop_ipc" as const,
+        codexDesktopIpc: null,
         codexAvailable: true,
         appServerStatus: "connected" as const,
         feishuConfigured: true,
@@ -112,12 +116,18 @@ test("http callback endpoints are disabled when long connection transport is act
         feishuInteractionMode: config.feishu.interactionMode,
         feishuDefaultChatId: config.feishu.defaultChatId ?? null,
         feishuDefaultChatDiagnostic: null,
+        feishuTaskContainerMode: config.feishu.taskContainerMode,
         databasePath: config.storage.databasePath,
         projectsCount: 0,
         sessionBindingsCount: repo.count("session_bindings"),
         runningTasksCount: 0,
         pendingOutboxCount: 0,
         pendingApprovalsCount: 0,
+        notificationPreferenceCount: 0,
+        trustedSubjectsCount: 0,
+        bridgeDevicesCount: 0,
+        currentDevice: null,
+        trustedSubjects: [],
         lastFeishuMessageAt: null,
         lastFeishuMessageId: null,
         lastFeishuCardActionAt: null,
@@ -165,9 +175,8 @@ test("http server skips startup in auto mode when both transports use long conne
         nodeVersion: process.version,
         codexCommand: "codex",
         codexConnectionMode: config.codex.connectionMode,
-        codexConnectionKind: "standalone" as const,
-        codexWebSocketUrl: null,
-        codexDesktopSocksProxy: null,
+        codexConnectionKind: "desktop_ipc" as const,
+        codexDesktopIpc: null,
         codexAvailable: true,
         appServerStatus: "connected" as const,
         feishuConfigured: true,
@@ -176,12 +185,18 @@ test("http server skips startup in auto mode when both transports use long conne
         feishuInteractionMode: config.feishu.interactionMode,
         feishuDefaultChatId: config.feishu.defaultChatId ?? null,
         feishuDefaultChatDiagnostic: null,
+        feishuTaskContainerMode: config.feishu.taskContainerMode,
         databasePath: config.storage.databasePath,
         projectsCount: 0,
         sessionBindingsCount: repo.count("session_bindings"),
         runningTasksCount: 0,
         pendingOutboxCount: 0,
         pendingApprovalsCount: 0,
+        notificationPreferenceCount: 0,
+        trustedSubjectsCount: 0,
+        bridgeDevicesCount: 0,
+        currentDevice: null,
+        trustedSubjects: [],
         lastFeishuMessageAt: null,
         lastFeishuMessageId: null,
         lastFeishuCardActionAt: null,
@@ -225,9 +240,8 @@ test("http callback card parser accepts v2 card action context nested under even
         nodeVersion: process.version,
         codexCommand: "codex",
         codexConnectionMode: config.codex.connectionMode,
-        codexConnectionKind: "standalone" as const,
-        codexWebSocketUrl: null,
-        codexDesktopSocksProxy: null,
+        codexConnectionKind: "desktop_ipc" as const,
+        codexDesktopIpc: null,
         codexAvailable: true,
         appServerStatus: "connected" as const,
         feishuConfigured: true,
@@ -236,12 +250,18 @@ test("http callback card parser accepts v2 card action context nested under even
         feishuInteractionMode: config.feishu.interactionMode,
         feishuDefaultChatId: config.feishu.defaultChatId ?? null,
         feishuDefaultChatDiagnostic: null,
+        feishuTaskContainerMode: config.feishu.taskContainerMode,
         databasePath: config.storage.databasePath,
         projectsCount: 0,
         sessionBindingsCount: repo.count("session_bindings"),
         runningTasksCount: 0,
         pendingOutboxCount: 0,
         pendingApprovalsCount: 0,
+        notificationPreferenceCount: 0,
+        trustedSubjectsCount: 0,
+        bridgeDevicesCount: 0,
+        currentDevice: null,
+        trustedSubjects: [],
         lastFeishuMessageAt: null,
         lastFeishuMessageId: null,
         lastFeishuCardActionAt: null,
@@ -266,7 +286,8 @@ test("http callback card parser accepts v2 card action context nested under even
       event: {
         context: { open_message_id: "om_root", open_chat_id: "oc_1" },
         operator: { open_id: "ou_1" },
-        action: { tag: "button", value: { action: "doctor", actionId: "act_v2" } }
+        action: { tag: "button", value: { action: "doctor", actionId: "act_v2" } },
+        form_value: { token: "from-http-callback" }
       }
     });
     await new Promise((resolve) => setImmediate(resolve));
@@ -275,6 +296,92 @@ test("http callback card parser accepts v2 card action context nested under even
     assert.equal(actions[0].action, "doctor");
     assert.equal(actions[0].chatId, "oc_1");
     assert.equal(actions[0].rootMessageId, "om_root");
+    assert.deepEqual(actions[0].formValue, { token: "from-http-callback" });
+  } finally {
+    await server.stop();
+    cleanup();
+  }
+});
+
+test("http callback message parser accepts image-only Feishu messages", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  const config = makeConfig(dir);
+  config.server.port = 0;
+  config.feishu.messageTransport = "http_callback";
+  config.feishu.cardActionTransport = "long_connection";
+  config.feishu.verificationToken = "verify-token";
+  const messages: any[] = [];
+  const diagnostics = {
+    recordError(): void {},
+    recordFeishuMessage(): void {},
+    recordFeishuCardAction(): void {},
+    async snapshot() {
+      return {
+        uptimeSeconds: 1,
+        machineName: "test-machine",
+        platform: "win32",
+        nodeVersion: process.version,
+        codexCommand: "codex",
+        codexConnectionMode: config.codex.connectionMode,
+        codexConnectionKind: "desktop_ipc" as const,
+        codexDesktopIpc: null,
+        codexAvailable: true,
+        appServerStatus: "connected" as const,
+        feishuConfigured: true,
+        feishuMessageTransport: config.feishu.messageTransport,
+        feishuCardActionTransport: config.feishu.cardActionTransport,
+        feishuInteractionMode: config.feishu.interactionMode,
+        feishuDefaultChatId: config.feishu.defaultChatId ?? null,
+        feishuDefaultChatDiagnostic: null,
+        feishuTaskContainerMode: config.feishu.taskContainerMode,
+        databasePath: config.storage.databasePath,
+        projectsCount: 0,
+        sessionBindingsCount: repo.count("session_bindings"),
+        runningTasksCount: 0,
+        pendingOutboxCount: 0,
+        pendingApprovalsCount: 0,
+        notificationPreferenceCount: 0,
+        trustedSubjectsCount: 0,
+        bridgeDevicesCount: 0,
+        currentDevice: null,
+        trustedSubjects: [],
+        lastFeishuMessageAt: null,
+        lastFeishuMessageId: null,
+        lastFeishuCardActionAt: null,
+        lastFeishuCardAction: null,
+        lastFeishuCardActionId: null,
+        lastError: null
+      };
+    }
+  };
+  const tasks = {
+    async handleMessage(message: any): Promise<void> {
+      messages.push(message);
+    },
+    async processCardActionDeferred(): Promise<void> {}
+  };
+  const server = new BridgeHttpServer(config, tasks as any, diagnostics as any, new CardRenderer(), makeLogger(dir));
+  try {
+    await server.start();
+    const response = await postJson(`${server.localUrl()}/feishu/events`, {
+      schema: "2.0",
+      token: "verify-token",
+      header: { event_type: "im.message.receive_v1" },
+      event: {
+        sender: { sender_id: { open_id: "user_1" } },
+        message: {
+          message_id: "om_img_http",
+          chat_id: "chat_1",
+          root_id: "om_img_http",
+          message_type: "image",
+          content: "{\"image_key\":\"img_v3_http\"}"
+        }
+      }
+    });
+
+    assert.equal(response.ok, true);
+    assert.equal(messages.length, 1);
+    assert.deepEqual(messages[0].attachments, [{ kind: "image", key: "img_v3_http", messageId: "om_img_http" }]);
   } finally {
     await server.stop();
     cleanup();

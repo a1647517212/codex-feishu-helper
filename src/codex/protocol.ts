@@ -30,7 +30,7 @@ export class CodexProtocolGuard {
 
   validateClientMethod(method: string): void {
     if (this.knownMethods.size > 0 && !this.knownMethods.has(method)) {
-      throw new Error(`Codex app-server method is not present in generated schema: ${method}`);
+      throw new Error(`Codex protocol method is not present in generated schema: ${method}`);
     }
   }
 }
@@ -48,6 +48,20 @@ export const textInput = (text: string): Record<string, unknown> => ({
   text,
   text_elements: []
 });
+
+export type CodexLocalImageAttachment = {
+  path: string;
+};
+
+export const buildUserInput = (text: string, attachments: CodexLocalImageAttachment[] = []): Record<string, unknown>[] => {
+  const input: Record<string, unknown>[] = [textInput(text)];
+  for (const attachment of attachments) {
+    if (attachment.path.trim()) {
+      input.push({ type: "localImage", path: attachment.path });
+    }
+  }
+  return input;
+};
 
 const readKnownMethods = (schemaPath: string): Set<string> => {
   const schema = JSON.parse(readFileSync(schemaPath, "utf8")) as Record<string, unknown>;

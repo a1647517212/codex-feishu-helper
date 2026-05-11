@@ -1,10 +1,7 @@
 [CmdletBinding()]
 param(
   # Repository root. Defaults to the parent directory of scripts.
-  [string]$RepoRoot = "",
-
-  # Create a shortcut that restarts Codex Desktop without prompting.
-  [switch]$ForceRestartShortcut
+  [string]$RepoRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -62,20 +59,12 @@ function New-DesktopShortcut {
 
 $repoRootPath = Resolve-RequiredPath -PathValue (Resolve-DefaultRepoRoot)
 $controlPanelPath = Join-Path $repoRootPath "scripts\open-control-panel.ps1"
-$desktopLauncherPath = Join-Path $repoRootPath "scripts\start-codex-desktop-canonical.ps1"
 
 if (-not (Test-Path -LiteralPath $controlPanelPath)) {
   throw "Control panel script not found: $controlPanelPath"
 }
-if (-not (Test-Path -LiteralPath $desktopLauncherPath)) {
-  throw "Desktop launcher script not found: $desktopLauncherPath"
-}
 
 $controlPanelArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$controlPanelPath`" -RepoRoot `"$repoRootPath`""
-$desktopArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$desktopLauncherPath`" -RepoRoot `"$repoRootPath`""
-if ($ForceRestartShortcut) {
-  $desktopArgs += " -ForceRestart"
-}
 
 $controlShortcut = New-DesktopShortcut `
   -Name "Codex Feishu Helper" `
@@ -83,11 +72,4 @@ $controlShortcut = New-DesktopShortcut `
   -WorkingDirectory $repoRootPath `
   -Description "Open Codex Feishu Helper control panel"
 
-$desktopShortcut = New-DesktopShortcut `
-  -Name "Codex Shared Server" `
-  -Arguments $desktopArgs `
-  -WorkingDirectory $repoRootPath `
-  -Description "Start Codex Desktop with the bridge-owned canonical app-server"
-
 Write-Output "Installed shortcut: $controlShortcut"
-Write-Output "Installed shortcut: $desktopShortcut"

@@ -299,3 +299,20 @@ test("security policy allows trusted Feishu subjects outside static allowlists",
     cleanup();
   }
 });
+
+test("security policy treats empty or wildcard Feishu allowlists as everyone allowed", () => {
+  const { dir, cleanup } = makeTempRepo();
+  try {
+    const emptyConfig = makeConfig(dir);
+    emptyConfig.feishu.allowedUserIds = [];
+    emptyConfig.feishu.allowedChatIds = [];
+    assert.doesNotThrow(() => new SecurityPolicy(emptyConfig).assertFeishuAllowed("any_user", "any_chat"));
+
+    const wildcardConfig = makeConfig(dir);
+    wildcardConfig.feishu.allowedUserIds = ["*"];
+    wildcardConfig.feishu.allowedChatIds = ["*"];
+    assert.doesNotThrow(() => new SecurityPolicy(wildcardConfig).assertFeishuAllowed("any_user", "any_chat"));
+  } finally {
+    cleanup();
+  }
+});

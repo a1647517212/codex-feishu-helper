@@ -20,6 +20,8 @@ export class BridgeDatabase {
     ensureColumn(this.db, "session_bindings", "feishu_control_chat_id", "TEXT");
     ensureColumn(this.db, "session_bindings", "selected_model", "TEXT");
     ensureColumn(this.db, "session_bindings", "selected_reasoning_effort", "TEXT");
+    ensureColumn(this.db, "pending_project_prompts", "attachments_json", "TEXT");
+    ensureColumn(this.db, "message_queue", "attachments_json", "TEXT");
     ensureColumn(this.db, "notification_outbox", "feishu_thread_id", "TEXT");
   }
 
@@ -114,6 +116,7 @@ CREATE TABLE IF NOT EXISTS pending_project_prompts (
   feishu_chat_id TEXT NOT NULL,
   feishu_user_id TEXT,
   text TEXT NOT NULL,
+  attachments_json TEXT,
   status TEXT NOT NULL,
   created_at TEXT NOT NULL,
   used_at TEXT,
@@ -160,6 +163,7 @@ CREATE TABLE IF NOT EXISTS message_queue (
   session_binding_id TEXT NOT NULL,
   feishu_message_id TEXT NOT NULL,
   text TEXT NOT NULL,
+  attachments_json TEXT,
   status TEXT NOT NULL,
   position INTEGER NOT NULL,
   created_by_feishu_user_id TEXT NOT NULL,

@@ -5,6 +5,7 @@ import type { TaskService } from "../bridge/task-service.js";
 import type { FeishuCardAction } from "../core/types.js";
 import type { Logger } from "../logger.js";
 import { asString } from "../core/json.js";
+import { parseFeishuMessageContent } from "./message-content.js";
 
 export class FeishuLongConnectionServer {
   private wsClient: Lark.WSClient | null = null;
@@ -65,13 +66,14 @@ export class FeishuLongConnectionServer {
     const sender = getObject(data.sender);
     const senderId = getObject(sender.sender_id);
     const message = getObject(data.message);
-    const text = extractText(asString(message.content));
-    if (!text.trim()) return;
+    const { text, attachments } = parseFeishuMessageContent(message);
+    if (!text.trim() && attachments.length === 0) return;
     this.logger.info("feishu message received", {
       messageId: asString(message.message_id),
       chatId: asString(message.chat_id),
       userId: asString(senderId.open_id) ?? asString(senderId.user_id) ?? asString(senderId.union_id),
-      textLength: text.length
+      textLength: text.length,
+      attachments: attachments.length
     });
     this.diagnostics.recordFeishuMessage(String(message.message_id ?? ""));
     await this.taskService.handleMessage({
@@ -82,6 +84,7 @@ export class FeishuLongConnectionServer {
       threadId: asString(message.thread_id),
       userId: String(senderId.open_id ?? senderId.user_id ?? senderId.union_id ?? ""),
       text,
+      ...(attachments.length > 0 ? { attachments } : {}),
       createTime: asString(message.create_time) ?? undefined
     });
   }
@@ -129,7 +132,8 @@ const normalizeCardAction = (data: Record<string, unknown>): FeishuCardAction | 
       userId: normalized.operator.openId,
       chatId: normalized.chatId,
       rootMessageId: asString(value.rootMessageId) ?? normalized.messageId,
-      payload: value
+      payload: value,
+      formValue: extractCardFormValue(data)
     };
   }
   return normalizeLegacyCardAction(data);
@@ -152,7 +156,8 @@ const normalizeLegacyCardAction = (data: Record<string, unknown>): FeishuCardAct
     userId,
     chatId,
     rootMessageId: asString(value.rootMessageId) ?? openMessageId,
-    payload: value
+    payload: value,
+    formValue: extractCardFormValue(data)
   };
 };
 
@@ -161,12 +166,22 @@ const cardActionFallbackId = (event: Lark.CardActionEvent): string => {
   return `card_${event.messageId}_${event.operator.openId}_${event.action.tag}_${value}`;
 };
 
-const extractText = (content: string | null): string => {
-  if (!content) return "";
-  try {
-    const parsed = JSON.parse(content) as Record<string, unknown>;
-    return String(parsed.text ?? parsed.content ?? "");
-  } catch {
-    return content;
+const extractCardFormValue = (data: Record<string, unknown>): Record<string, unknown> | null => {
+  const event = getObject(data.event);
+  const candidates = [
+    data.form_value,
+    data.formValue,
+    data.form_data,
+    data.formData,
+    event.form_value,
+    event.formValue,
+    event.form_data,
+    event.formData
+  ];
+  for (const candidate of candidates) {
+    if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+      return candidate as Record<string, unknown>;
+    }
   }
+  return null;
 };

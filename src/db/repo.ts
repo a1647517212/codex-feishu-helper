@@ -9,6 +9,7 @@ import type {
   ApprovalStatus,
   BridgeDevice,
   CreatedFrom,
+  FeishuMessageAttachment,
   IgnoredThread,
   NotificationLevel,
   NotificationOutboxItem,
@@ -665,6 +666,7 @@ export class Repository {
     feishuChatId: string;
     feishuUserId?: string | null;
     text: string;
+    attachments?: FeishuMessageAttachment[];
   }): PendingProjectPrompt {
     const now = nowIso();
     const existing = this.findPendingProjectPromptByMessageId(input.feishuMessageId);
@@ -672,14 +674,23 @@ export class Repository {
     this.database.db
       .prepare(
         `INSERT INTO pending_project_prompts (
-          id, feishu_message_id, feishu_chat_id, feishu_user_id, text, status, created_at, used_at, selected_project_id
-        ) VALUES (?, ?, ?, ?, ?, 'pending', ?, NULL, NULL)
+          id, feishu_message_id, feishu_chat_id, feishu_user_id, text, attachments_json, status, created_at, used_at, selected_project_id
+        ) VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, NULL, NULL)
         ON CONFLICT(feishu_message_id) DO UPDATE SET
           feishu_chat_id = excluded.feishu_chat_id,
           feishu_user_id = excluded.feishu_user_id,
-          text = excluded.text`
+          text = excluded.text,
+          attachments_json = excluded.attachments_json`
       )
-      .run(id, input.feishuMessageId, input.feishuChatId, input.feishuUserId ?? null, input.text, now);
+      .run(
+        id,
+        input.feishuMessageId,
+        input.feishuChatId,
+        input.feishuUserId ?? null,
+        input.text,
+        stringifyJson(sanitizeAttachments(input.attachments)),
+        now
+      );
     return this.getPendingProjectPrompt(id)!;
   }
 
@@ -712,6 +723,7 @@ export class Repository {
     sessionBindingId: string;
     feishuMessageId: string;
     text: string;
+    attachments?: FeishuMessageAttachment[];
     createdByFeishuUserId: string;
   }): QueuedMessage {
     const existing = this.database.db
@@ -726,11 +738,20 @@ export class Repository {
     this.database.db
       .prepare(
         `INSERT INTO message_queue (
-          id, session_binding_id, feishu_message_id, text, status, position,
+          id, session_binding_id, feishu_message_id, text, attachments_json, status, position,
           created_by_feishu_user_id, created_at
-        ) VALUES (?, ?, ?, ?, 'queued', ?, ?, ?)`
+        ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)`
       )
-      .run(id, input.sessionBindingId, input.feishuMessageId, input.text, position, input.createdByFeishuUserId, nowIso());
+      .run(
+        id,
+        input.sessionBindingId,
+        input.feishuMessageId,
+        input.text,
+        stringifyJson(sanitizeAttachments(input.attachments)),
+        position,
+        input.createdByFeishuUserId,
+        nowIso()
+      );
     return this.getQueuedMessage(id)!;
   }
 
@@ -825,6 +846,18 @@ export class Repository {
       : this.database.db.prepare("SELECT * FROM pending_approvals WHERE status = 'pending' ORDER BY requested_at");
     const rows = bindingId ? stmt.all(bindingId) : stmt.all();
     return rows.map((row) => mapApproval(row as DbRow));
+  }
+
+  listPendingServerRequests(bindingId?: string): ActionRequest[] {
+    const stmt = bindingId
+      ? this.database.db.prepare(
+          "SELECT * FROM action_requests WHERE status = 'processing' AND action_type LIKE 'codex_server_request:%' AND json_extract(payload_json, '$.bindingId') = ? ORDER BY created_at"
+        )
+      : this.database.db.prepare(
+          "SELECT * FROM action_requests WHERE status = 'processing' AND action_type LIKE 'codex_server_request:%' ORDER BY created_at"
+        );
+    const rows = bindingId ? stmt.all(bindingId) : stmt.all();
+    return rows.map((row) => mapAction(row as DbRow));
   }
 
   resolveApproval(id: string, status: ApprovalStatus, resolvedByFeishuUserId: string | null): void {
@@ -1253,6 +1286,7 @@ const mapQueuedMessage = (row: DbRow): QueuedMessage => ({
   sessionBindingId: String(row.session_binding_id),
   feishuMessageId: String(row.feishu_message_id),
   text: String(row.text),
+  attachments: parseAttachments(asString(row.attachments_json)),
   status: String(row.status) as QueueStatus,
   position: Number(row.position),
   createdByFeishuUserId: String(row.created_by_feishu_user_id),
@@ -1367,11 +1401,36 @@ const mapPendingProjectPrompt = (row: DbRow): PendingProjectPrompt => ({
   feishuChatId: String(row.feishu_chat_id),
   feishuUserId: asString(row.feishu_user_id),
   text: String(row.text),
+  attachments: parseAttachments(asString(row.attachments_json)),
   status: String(row.status) as PendingProjectPrompt["status"],
   createdAt: String(row.created_at),
   usedAt: asString(row.used_at),
   selectedProjectId: asString(row.selected_project_id)
 });
+
+const parseAttachments = (value: string | null): FeishuMessageAttachment[] =>
+  sanitizeAttachments(parseJsonArray(value));
+
+const sanitizeAttachments = (value: unknown): FeishuMessageAttachment[] => {
+  if (!Array.isArray(value)) return [];
+  const attachments: FeishuMessageAttachment[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+    const object = entry as Record<string, unknown>;
+    if (object.kind !== "image") continue;
+    const key = asString(object.key);
+    if (!key) continue;
+    attachments.push({
+      kind: "image",
+      key,
+      messageId: asString(object.messageId),
+      localPath: asString(object.localPath),
+      mimeType: asString(object.mimeType),
+      sizeBytes: typeof object.sizeBytes === "number" && Number.isFinite(object.sizeBytes) ? object.sizeBytes : null
+    });
+  }
+  return attachments;
+};
 
 const hashText = (text: string): string => {
   let hash = 2166136261;

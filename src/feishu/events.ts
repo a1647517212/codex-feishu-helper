@@ -1,6 +1,7 @@
 import type { BridgeConfig } from "../config.js";
 import { asString } from "../core/json.js";
 import type { FeishuCardAction, FeishuIncomingMessage } from "../core/types.js";
+import { parseFeishuMessageContent } from "./message-content.js";
 
 export type ParsedFeishuPayload =
   | { type: "url_verification"; challenge: string }
@@ -29,8 +30,8 @@ export class FeishuEventParser {
     const message = event.message && typeof event.message === "object" ? (event.message as Record<string, unknown>) : null;
     const sender = event.sender && typeof event.sender === "object" ? (event.sender as Record<string, unknown>) : null;
     if (!message || !sender) return { type: "ignored", reason: "missing message or sender" };
-    const text = extractText(message);
-    if (!text.trim()) return { type: "ignored", reason: "empty text" };
+    const { text, attachments } = parseFeishuMessageContent(message);
+    if (!text.trim() && attachments.length === 0) return { type: "ignored", reason: "empty text" };
     const senderId = sender.sender_id && typeof sender.sender_id === "object" ? (sender.sender_id as Record<string, unknown>) : {};
     return {
       type: "message",
@@ -42,6 +43,7 @@ export class FeishuEventParser {
         threadId: asString(message.thread_id),
         userId: String(senderId.open_id ?? senderId.user_id ?? senderId.union_id ?? ""),
         text,
+        ...(attachments.length > 0 ? { attachments } : {}),
         createTime: asString(message.create_time) ?? undefined
       }
     };
@@ -73,18 +75,30 @@ export class FeishuEventParser {
       userId: openId,
       chatId: String(value.chatId ?? value.chat_id ?? context.open_chat_id ?? ""),
       rootMessageId: asString(value.rootMessageId) ?? openMessageId,
-      payload: value
+      payload: value,
+      formValue: extractCardFormValue(payload, event)
     };
   }
 }
 
-const extractText = (message: Record<string, unknown>): string => {
-  const content = asString(message.content);
-  if (!content) return "";
-  try {
-    const parsed = JSON.parse(content) as Record<string, unknown>;
-    return String(parsed.text ?? parsed.content ?? "");
-  } catch {
-    return content;
+const extractCardFormValue = (
+  payload: Record<string, unknown>,
+  event: Record<string, unknown> | null
+): Record<string, unknown> | null => {
+  const candidates = [
+    payload.form_value,
+    payload.formValue,
+    payload.formData,
+    payload.form_data,
+    event?.form_value,
+    event?.formValue,
+    event?.form_data,
+    event?.formData
+  ];
+  for (const candidate of candidates) {
+    if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+      return candidate as Record<string, unknown>;
+    }
   }
+  return null;
 };

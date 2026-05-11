@@ -28,10 +28,10 @@ export class SecurityPolicy {
     const allowedUsers = this.config.feishu.allowedUserIds ?? [];
     const allowedChats = this.config.feishu.allowedChatIds ?? [];
     const trustedSubject = this.repo?.findTrustedFeishuSubject(chatId, userId) ?? null;
-    if (allowedUsers.length > 0 && !allowedUsers.includes(userId) && !trustedSubject?.userId) {
+    if (!allowsAllSubjects(allowedUsers) && !allowedUsers.includes(userId) && !trustedSubject?.userId) {
       throw new Error("Feishu user is not allowed to control this bridge.");
     }
-    if (allowedChats.length > 0 && !allowedChats.includes(chatId) && !trustedSubject?.chatId) {
+    if (!allowsAllSubjects(allowedChats) && !allowedChats.includes(chatId) && !trustedSubject?.chatId) {
       if (this.repo?.findBindingByChatId(chatId)) return;
       throw new Error("Feishu chat is not allowed to control this bridge.");
     }
@@ -54,3 +54,5 @@ export class SecurityPolicy {
     return secretFilePatterns.some((pattern) => pattern.test(path));
   }
 }
+
+const allowsAllSubjects = (subjects: string[]): boolean => subjects.length === 0 || subjects.includes("*");

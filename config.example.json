@@ -10,16 +10,9 @@
   },
   "codex": {
     "command": "${CODEX_COMMAND:-codex}",
-    "args": ["app-server"],
-    "connectionMode": "auto",
-    "proxyArgs": ["app-server", "proxy"],
-    "websocketListenUrl": "ws://127.0.0.1:47931",
-    "websocketAttachExisting": true,
-    "desktopSocksProxyEnabled": false,
-    "desktopSocksProxyHost": "127.0.0.1",
-    "desktopSocksProxyPort": 1080,
-    "desktopSocksProxyAllowExisting": false,
-    "experimentalApi": true,
+    "connectionMode": "desktop_ipc",
+    "desktopIpcPipePath": "\\\\.\\pipe\\codex-ipc",
+    "desktopIpcInitialSnapshotWaitMs": 1500,
     "defaultModel": "gpt-5.4",
     "defaultReasoningEffort": "xhigh",
     "defaultSandboxMode": "danger-full-access",
@@ -42,8 +35,8 @@
     "taskChatType": "private",
     "taskChatFallbackToTopic": true,
     "taskChatSetBotManager": true,
-    "allowedUserIds": ["${FEISHU_ALLOWED_USER_IDS}"],
-    "allowedChatIds": ["${FEISHU_ALLOWED_CHAT_IDS}"]
+    "allowedUserIds": ["*"],
+    "allowedChatIds": ["*"]
   },
   "storage": {
     "homeDir": "~/.feishu-codex",

@@ -1,6 +1,6 @@
 # Codex Feishu Helper
 
-Codex Feishu Helper 是一个本地桥接服务，用飞书群聊控制本机 Codex `app-server` 任务。它适合个人把飞书当作 Codex 任务控制台：在主控群里选择项目、创建任务、查看任务列表，在每个任务的独立飞书会话里持续追问和接收进度、结论。
+ Codex Feishu Helper 是一个本地桥接服务，用飞书群聊控制本机正在运行的 Codex Desktop 对话。它适合个人把飞书当作 Codex 任务控制台：在主控群里选择项目、创建任务、查看任务列表，在每个任务的独立飞书会话里持续追问和接收进度、结论。
 
 当前默认设计是：
 
@@ -9,7 +9,7 @@ Codex Feishu Helper 是一个本地桥接服务，用飞书群聊控制本机 Co
 - 新任务默认创建独立飞书任务会话；如果没有建群权限，可回退为群内话题。
 - Codex 默认模型是 `gpt-5.5`，思考等级是 `xhigh`，权限是 `danger-full-access`，审批策略是 `never`。
 - 任务过程会推送结构化进度卡片，完成后推送结构化最终结论。
-- 只在 Codex App 里单独发起、没有绑定飞书的对话，结束后也会在主控群提醒，并可一键接管到飞书继续。
+- 只在普通 Codex Desktop 里单独发起、没有绑定飞书的对话，结束后也会在主控群提醒，并可一键接管到飞书继续。
 
 Codex Desktop 实时同步的长期优化方案见 [docs/CODEX_DESKTOP_SYNC_OPTIMIZATION.md](docs/CODEX_DESKTOP_SYNC_OPTIMIZATION.md)。
 
@@ -21,8 +21,8 @@ Codex Desktop 实时同步的长期优化方案见 [docs/CODEX_DESKTOP_SYNC_OPTI
 - 继续任务：在任务会话里直接发消息即可继续同一个 Codex 线程。
 - 任务列表：查看运行中、已完成、失败、中断、归档任务。
 - 任务设置：在飞书中查看和调整模型、思考等级。
-- Codex App 单独对话提醒：后台扫描最近结束的未绑定本机 Codex 对话，完成/失败/中断后推送到主控群。
-- 诊断恢复：检查飞书权限、长连接、Codex app-server、数据库、消息 outbox。
+- Codex Desktop 单独对话提醒：后台扫描最近结束的未绑定本机 Codex 对话，完成/失败/中断后推送到主控群。
+- 诊断恢复：检查飞书权限、长连接、Codex Desktop IPC、数据库、消息 outbox。
 - 本地守护：Windows 定时任务可每 5 分钟检查并拉起桥接服务。
 
 ## 环境要求
@@ -59,7 +59,6 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1
 - 创建用户配置目录 `%USERPROFILE%\.feishu-codex`。
 - 如果配置不存在，复制 `config.example.json` 为 `%USERPROFILE%\.feishu-codex\config.json`。
 - 在桌面创建 `Codex Feishu Helper` 控制面板快捷方式。
-- 在桌面创建 `Codex Shared Server` 同服启动快捷方式。
 
 日常使用不需要记命令，直接双击桌面的 `Codex Feishu Helper`：
 
@@ -68,17 +67,13 @@ powershell -ExecutionPolicy Bypass -File .\scripts\setup-windows.ps1
 | `Setup / Repair` | 重新检查依赖、构建项目、修复桌面快捷方式 |
 | `Open Config` | 打开 `%USERPROFILE%\.feishu-codex\config.json` |
 | `Start Bridge` | 后台启动飞书桥接服务 |
-| `Launch Shared Desktop` | 用同一个 canonical app-server 启动 Codex Desktop |
-| `Install Patched Desktop` | 复制一份可写 Codex Desktop 并安装直连 WebSocket 补丁，去掉 1080 SOCKS 依赖 |
-| `Remove Patched Desktop` | 删除本工具安装的补丁版 Codex Desktop 副本 |
 | `Install Watchdog` | 安装 5 分钟一次的后台保活任务 |
-| `Refresh` | 刷新配置、构建产物、bridge、app-server、SOCKS、Desktop 状态 |
+| `Refresh` | 刷新配置、构建产物、bridge、Desktop IPC、Desktop 进程状态 |
 
 仓库根目录也提供了两个可双击入口：
 
 - `Install Codex Feishu Helper.cmd`：首次安装或修复。
 - `Codex Feishu Helper.cmd`：打开控制面板。
-- `Start Shared Codex Desktop.cmd`：直接启动同服 Codex Desktop。
 
 首次使用时，在控制面板点 `Open Config`，填写配置：
 
@@ -138,61 +133,34 @@ npm run start
 npm run doctor
 ```
 
-### Canonical WebSocket 模式
+### 普通 Desktop IPC 模式
 
-默认 `connectionMode=auto` 会优先尝试 Desktop proxy，失败后回退到独立 stdio app-server。若希望 bridge 拥有一个 canonical WebSocket app-server，并让 Codex Desktop 尽量接入同一个 runtime，可改成：
+现在优先使用 `desktop_ipc` 连接普通正在运行的 Codex Desktop：
 
 ```json
 {
   "codex": {
-    "connectionMode": "canonical_websocket",
-    "websocketListenUrl": "ws://127.0.0.1:47931",
-    "websocketAttachExisting": true,
-    "desktopSocksProxyEnabled": false,
-    "desktopSocksProxyHost": "127.0.0.1",
-    "desktopSocksProxyPort": 1080
+    "connectionMode": "desktop_ipc",
+    "desktopIpcPipePath": "\\\\.\\pipe\\codex-ipc",
+    "desktopIpcInitialSnapshotWaitMs": 1500
   }
 }
 ```
 
-然后用控制面板的 `Launch Shared Desktop` 打开 Codex Desktop。命令行备用方式：
+该模式只连接普通 Desktop 自带的 `\\\\.\\pipe\\codex-ipc`，不会额外拉起独立 runtime。飞书侧可通过 `/tasks` 接管 Desktop 已打开的 thread；新任务选择项目后，bridge 通过 Desktop IPC host request `start-conversation` 请求普通 Desktop 创建新 thread，等待同一个 Desktop IPC pipe 广播包含同一 prompt 的新 thread snapshot，再绑定到该 Desktop owner client。后续继续 turn、steer、interrupt、设置模型/思考等级同样都走 Desktop owner IPC。
 
-```powershell
-npm run desktop
-```
+使用顺序：
+
+1. 先打开普通 Codex Desktop。
+2. 启动 bridge：控制面板点 `Start Bridge`，或运行 `npm run start`。
+3. 在飞书主控群直接发送任务并选择项目，bridge 会在普通 Desktop 创建新 thread；也可以发送 `/tasks` 查看可接管线程，或发送 `/claim <threadId>` 绑定到飞书继续。
 
 如果桌面快捷方式被删，可以重新创建：
+
 
 ```powershell
 npm run shortcuts
 ```
-
-桌面上的 `Codex Shared Server` 会自动检查 bridge、等待 canonical app-server 和 SOCKS5 代理就绪，然后用同一个 `CODEX_APP_SERVER_WS_URL` 启动 Codex Desktop。若已有 Codex Desktop 正在运行，启动器默认会先询问是否关闭并重启，避免误关当前工作窗口。你也可以创建后在 Windows 桌面上把快捷方式重命名为中文名称。
-
-`websocketAttachExisting=true` 是默认值。它会在 `websocketListenUrl` 已有可用 app-server 时直接接入现有服务，适合 bridge 重启或 watchdog 拉起场景，避免为了重启飞书桥接而中断 Codex Desktop 当前会话。
-
-当前 Codex Desktop 版本会通过 `127.0.0.1:1080` SOCKS5 代理访问 `CODEX_APP_SERVER_WS_URL`。如果不想维护 SOCKS 代理，可以在控制面板点 `Install Patched Desktop`，它会：
-
-- 自动定位当前 Codex Desktop 官方安装目录。
-- 复制一份可写副本到 `%LOCALAPPDATA%\CodexFeishuHelper\CodexDesktopPatched`。
-- 只把副本 `app.asar` 里的 WebSocket transport 硬编码 `SocksProxyAgent("socks5h://127.0.0.1:1080")` 改成直连。
-- 保留 `Remove Patched Desktop` 删除副本，不改 WindowsApps 官方包。
-
-安装补丁版副本后，`Launch Shared Desktop` 会优先启动这个副本。`CODEX_APP_SERVER_WS_URL=ws://127.0.0.1:<port>` 会直连 bridge-owned canonical app-server，不再需要 `desktopSocksProxyEnabled=true`。如果当前已经打开了 Microsoft Store 版 Codex Desktop，它仍在使用自己启动的 app-server；需要点 `Launch Shared Desktop` 重启到补丁版副本后，Desktop 才会和 bridge 使用同一个 canonical app-server。Codex Desktop 每次更新后，重新点一次 `Install Patched Desktop` 即可把新版本复制并补丁。
-
-补丁版副本不会自动继承 Microsoft Store 版的后续升级。它的好处是完全不改官方安装目录，可删除、可重建；代价是官方升级后需要重新执行 `Install Patched Desktop`。如果希望一直使用官方自动升级版本，请优先使用未补丁兼容路径：`desktopSocksProxyEnabled=true`，由 bridge 提供 `127.0.0.1:1080` 到 canonical app-server 的本机 SOCKS5 转发。
-
-理论上最理想的是 bridge 直接接入官方 Desktop 正在使用的 app-server。但当前 Windows 实测 `codex app-server proxy` 仍会失败在 `%USERPROFILE%\.codex\app-server-control\app-server-control.sock`，错误为 `os error 10050`；且该 control 目录当前不存在。因此现阶段不能把“接官方 Desktop 当前 server”当成稳定方案，只能使用 canonical WebSocket 统一 runtime，或等待官方提供稳定的本地 app-server ingress。
-
-命令行备用方式：
-
-```powershell
-npm run desktop:copy:status
-npm run desktop:copy
-npm run desktop:copy:remove
-```
-
-如果不安装补丁，仍可使用旧兼容路径：设置 `desktopSocksProxyEnabled=true`，让 bridge 启动只允许转发到 canonical app-server 的本机 SOCKS5 代理。`/doctor` 会显示 `WebSocket` 和 `Desktop SOCKS` 状态。
 
 如果希望后台保活：
 
@@ -236,9 +204,15 @@ npm run watchdog
 | --- | --- |
 | 自动检查/修复应用回调配置 | `admin:app.info:readonly` 或 `application:application:self_manage` |
 | 后续把更多用户或机器人拉入已有任务群 | `im:chat.members:write_only` |
-| 图片/文件消息 | 媒体上传下载相关权限 |
+| 图片消息转给普通 Codex Desktop | 消息读取相关权限，以及资源下载权限 `im:resource` |
 
 不同租户控制台显示的权限名称可能略有差异，以飞书开放平台实际提示为准。
+
+当前图片消息处理方式：
+
+- 飞书里的 `image` 消息会先通过 `GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=image` 下载到本机 `storage.homeDir/attachments/...`。
+- Bridge 随后把这张本地图片作为 `localImage` 输入发给当前正在运行的普通 Codex Desktop runtime，不会启动单独 runtime，也不会切到别的传输主线。
+- 纯图片消息也可以直接创建新任务；如果没有文字说明，bridge 会用默认提示词 `请查看这张图片。`
 
 如果不想给机器人创建群权限，可以改成主控群内话题 fallback：
 
@@ -274,7 +248,7 @@ node dist/src/main.js serve --config D:\path\config.json
 
 如果直接使用模板里的 `${FEISHU_CODEX_ADMIN_TOKEN}` 但没有设置环境变量，bridge 会在每次启动时生成临时 token。建议正式使用时在 `config.json` 里写固定 `server.adminToken`，这样诊断接口和后台守护更稳定。
 
-默认会扫描 Codex App 最近 24 小时内结束、但还没有绑定飞书的本机对话，并向 `feishu.defaultChatId` 推送一次提醒。提醒卡片包含摘要和 `[在飞书继续]`、`[查看摘要]`、`[忽略]` 操作；同一个 turn 会用 outbox 去重，不会反复提醒。
+默认会扫描普通 Codex Desktop 最近 24 小时内结束、但还没有绑定飞书的本机对话，并向 `feishu.defaultChatId` 推送一次提醒。提醒卡片包含摘要和 `[在飞书继续]`、`[查看摘要]`、`[忽略]` 操作；同一个 turn 会用 outbox 去重，不会反复提醒。
 
 相关配置：
 
@@ -340,7 +314,7 @@ npm test
 npm run check
 ```
 
-生成 Codex app-server schema：
+生成 Codex 协议 schema：
 
 ```powershell
 npm run generate:codex-schema
@@ -350,9 +324,9 @@ npm run generate:codex-schema
 
 - 个人使用优先，默认不做复杂团队权限模型。
 - 建议只在自己的私有主控群中使用。
-- 不要把 `codex app-server` 暴露到公网。
+- 不要把 bridge 管理接口暴露到公网。
 - 默认 `danger-full-access` 和 `approvalPolicy=never` 意味着 Codex 可以直接操作本机文件和命令，请只在可信环境使用。
-- 如果要给多人使用，请先配置 `allowedUserIds` 和 `allowedChatIds`。
+- `allowedUserIds` / `allowedChatIds` 为空数组或 `["*"]` 时允许所有飞书用户/群；要收紧访问时再改成具体 ID。
 
 ## 开源文档
 

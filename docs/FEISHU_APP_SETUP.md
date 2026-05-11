@@ -85,7 +85,13 @@
 | 自动检查应用回调配置 | `admin:app.info:readonly` |
 | 自动修复应用回调配置 | `application:application:self_manage` |
 | 后续把更多用户或机器人拉入已有任务群 | `im:chat.members:write_only` |
-| 图片/文件消息 | 如后续启用文件能力，需要媒体上传下载相关权限 |
+| 图片消息转给普通 Codex Desktop | 消息读取相关权限，以及资源下载权限 `im:resource` |
+
+图片支持说明：
+
+- 当前 bridge 已支持飞书 `image` 消息进入任务流。
+- 实现方式是先下载图片资源到本地，再把本地路径以 `localImage` 形式送给普通 Codex Desktop IPC，同一任务仍然跑在桌面 App 的当前 runtime 里。
+- 纯图片消息如果没有附带文字，会自动补成 `请查看这张图片。`
 
 如果只想使用「主控群 + 群内话题」而不创建独立任务会话，可以暂时不授予 `im:chat:create`，并在配置里改为：
 

@@ -1,314 +1,585 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
-import { createServer } from "node:http";
-import { createConnection, createServer as createTcpServer, type Server as TcpServer, type Socket } from "node:net";
-import type { Duplex } from "node:stream";
+import { createServer as createTcpServer, type Server as TcpServer, type Socket } from "node:net";
+import { join } from "node:path";
 import { CodexClient } from "../src/codex/client.js";
+import { DesktopIpcClient } from "../src/codex/desktop-ipc.js";
 import { makeConfig, makeLogger, makeTempRepo } from "./helpers.js";
 
-test("listThreads scans paginated app-server results with a bounded max page count", async () => {
+test("desktop ipc mode lists observed Desktop threads", async () => {
   const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir);
+  let client: CodexClient | null = null;
   try {
-    const client = new CodexClient(makeConfig(dir), makeLogger(dir));
-    const calls: Array<Record<string, unknown>> = [];
-    const pages = [
-      { data: [{ id: "thr_1", status: { type: "idle" } }], nextCursor: "next_1" },
-      { data: [{ id: "thr_2", status: { type: "active" } }], nextCursor: "next_2" },
-      { data: [{ id: "thr_3", status: { type: "idle" } }], nextCursor: null }
-    ];
-    (client as unknown as { request: (method: string, params: unknown) => Promise<unknown> }).request = async (
-      method,
-      params
-    ) => {
-      assert.equal(method, "thread/list");
-      calls.push(params as Record<string, unknown>);
-      return pages[calls.length - 1];
-    };
+    const config = makeConfig(dir);
+    config.codex.desktopIpcPipePath = ipc.pipePath;
+    config.codex.desktopIpcInitialSnapshotWaitMs = 50;
+    client = new CodexClient(config, makeLogger(dir));
 
-    const threads = await client.listThreads(3, { pageSize: 1, maxPages: 3 });
+    const threads = await client.listThreads(10);
 
-    assert.deepEqual(
-      calls.map((call) => call.cursor ?? null),
-      [null, "next_1", "next_2"]
-    );
-    assert.equal(calls.every((call) => call.sortKey === "updated_at"), true);
     assert.deepEqual(
       threads.map((thread) => [thread.id, thread.status]),
-      [
-        ["thr_1", "idle"],
-        ["thr_2", "running"],
-        ["thr_3", "idle"]
-      ]
+      [["thr_desktop", "completed"]]
     );
   } finally {
+    await client?.stop();
+    await ipc.stop();
     cleanup();
   }
 });
 
-test("startThread and startTurn pass personal default model, reasoning and full access", async () => {
+test("desktop ipc mode startThread and startTurn pass personal defaults to ordinary Desktop", async () => {
   const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir);
+  let client: CodexClient | null = null;
   try {
-    const client = new CodexClient(makeConfig(dir), makeLogger(dir));
-    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
-    (client as unknown as { request: (method: string, params: unknown) => Promise<unknown> }).request = async (
-      method,
-      params
-    ) => {
-      calls.push({ method, params: params as Record<string, unknown> });
-      if (method === "thread/start") {
-        return { thread: { id: "thr_new", status: { type: "idle" } } };
-      }
-      return { turn: { id: "turn_1" } };
-    };
+    const config = makeConfig(dir);
+    config.codex.desktopIpcPipePath = ipc.pipePath;
+    config.codex.desktopIpcInitialSnapshotWaitMs = 50;
+    client = new CodexClient(config, makeLogger(dir));
 
-    await client.startThread({ cwd: dir });
-    await client.startTurn("thr_new", "do it", { cwd: dir });
+    await client.startThread({ cwd: dir, prompt: "创建普通 Desktop 任务" });
+    await client.startTurn("thr_desktop", "do it", { cwd: dir });
 
-    const threadStart = calls.find((call) => call.method === "thread/start")?.params;
-    const turnStart = calls.find((call) => call.method === "turn/start")?.params;
-    assert.equal(threadStart?.model, "gpt-5.5");
-    assert.equal(threadStart?.approvalPolicy, "never");
-    assert.equal(threadStart?.sandbox, "danger-full-access");
-    assert.deepEqual(threadStart?.config, { model_reasoning_effort: "xhigh" });
-    assert.equal(turnStart?.model, "gpt-5.5");
-    assert.equal(turnStart?.effort, "xhigh");
-    assert.equal(turnStart?.approvalPolicy, "never");
-    assert.deepEqual(turnStart?.sandboxPolicy, { type: "dangerFullAccess" });
+    const startConversation = ipc.requests.find((call) => call.method === "start-conversation");
+    const followerStart = ipc.requests.find((call) => call.method === "thread-follower-start-turn");
+    assert.ok(startConversation);
+    assert.ok(followerStart);
+    const startConversationParams = startConversation?.params as Record<string, unknown>;
+    const turnStartParams = ((followerStart?.params as Record<string, unknown>).turnStartParams ?? {}) as Record<string, unknown>;
+    assert.equal(startConversationParams.model, "gpt-5.5");
+    assert.equal(startConversationParams.reasoningEffort, "xhigh");
+    assert.equal(turnStartParams.model, "gpt-5.5");
+    assert.equal(turnStartParams.effort, "xhigh");
+    assert.equal(turnStartParams.approvalPolicy, "never");
+    assert.deepEqual(turnStartParams.sandboxPolicy, { type: "dangerFullAccess" });
   } finally {
+    await client?.stop();
+    await ipc.stop();
     cleanup();
   }
 });
 
-test("setThreadName and listLoadedThreads call app-server helper APIs", async () => {
+test("desktop ipc mode setThreadName and listLoadedThreads operate on observed ordinary Desktop threads", async () => {
   const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir);
+  let client: CodexClient | null = null;
   try {
-    const client = new CodexClient(makeConfig(dir), makeLogger(dir));
-    const calls: Array<{ method: string; params: Record<string, unknown> }> = [];
-    (client as unknown as { request: (method: string, params: unknown) => Promise<unknown> }).request = async (
-      method,
-      params
-    ) => {
-      calls.push({ method, params: params as Record<string, unknown> });
-      if (method === "thread/loaded/list") return { data: ["thr_1", "thr_2"], nextCursor: null };
-      return {};
-    };
+    const config = makeConfig(dir);
+    config.codex.desktopIpcPipePath = ipc.pipePath;
+    config.codex.desktopIpcInitialSnapshotWaitMs = 50;
+    client = new CodexClient(config, makeLogger(dir));
 
-    await client.setThreadName("thr_1", "New title");
+    await client.setThreadName("thr_desktop", "New title");
     const loaded = await client.listLoadedThreads();
 
-    assert.deepEqual(loaded, ["thr_1", "thr_2"]);
-    assert.deepEqual(calls[0], { method: "thread/name/set", params: { threadId: "thr_1", name: "New title" } });
-    assert.equal(calls[1]?.method, "thread/loaded/list");
+    assert.deepEqual(loaded, ["thr_desktop"]);
+    const rename = ipc.requests.find((call) => call.method === "set-thread-title");
+    assert.deepEqual(rename?.params, { conversationId: "thr_desktop", title: "New title" });
   } finally {
+    await client?.stop();
+    await ipc.stop();
     cleanup();
   }
 });
 
-test("unhandled Codex client errors are logged instead of crashing", () => {
+test("codex client error listener can be absent without crashing", () => {
   const { dir, cleanup } = makeTempRepo();
   try {
     const logger = makeLogger(dir);
     const client = new CodexClient(makeConfig(dir), logger);
     assert.doesNotThrow(() => {
-      (client as unknown as { rejectAll: (error: Error) => void }).rejectAll(new Error("proxy failed"));
+      (client as unknown as { handleClientError: (error: Error) => void }).handleClientError(new Error("proxy failed"));
     });
   } finally {
     cleanup();
   }
 });
 
-test("canonical websocket mode starts app-server with --listen and speaks JSON-RPC over WebSocket", async () => {
+test("desktop ipc mode lists ordinary Desktop snapshots without starting a separate runtime", async () => {
   const { dir, cleanup } = makeTempRepo();
-  const server = await startMockCodexWebSocketServer();
+  const ipc = await startMockDesktopIpcServer(dir);
   let client: CodexClient | null = null;
   try {
     const config = makeConfig(dir);
-    config.codex.connectionMode = "canonical_websocket";
-    config.codex.command = process.execPath;
-    config.codex.args = ["-e", "setInterval(() => {}, 1000)"];
-    config.codex.websocketListenUrl = server.wsUrl;
-    config.codex.websocketUrl = server.wsUrl;
-    config.codex.websocketAttachExisting = false;
+    config.codex.desktopIpcPipePath = ipc.pipePath;
+    config.codex.desktopIpcInitialSnapshotWaitMs = 50;
     client = new CodexClient(config, makeLogger(dir));
 
-    const threads = await client.listThreads(2);
+    const threads = await client.listThreads(10);
 
-    assert.equal(client.connectionKind, "canonical_websocket");
-    assert.equal(client.webSocketUrl, server.wsUrl);
-    assert.deepEqual(
-      server.methods.slice(0, 3),
-      ["initialize", "initialized", "thread/list"]
+    assert.equal(client.connectionKind, "desktop_ipc");
+    assert.equal(client.status, "connected");
+    assert.equal(threads.length, 1);
+    assert.equal(threads[0]?.id, "thr_desktop");
+    assert.equal(threads[0]?.title, "Desktop task");
+    assert.equal(threads[0]?.cwd, dir);
+    assert.equal(threads[0]?.status, "completed");
+    assert.equal(client.desktopIpcSnapshot?.observedThreads, 1);
+  } finally {
+    await client?.stop();
+    await ipc.stop();
+    cleanup();
+  }
+});
+
+test("desktop ipc mode targets the Desktop owner client for follower start turn", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir);
+  let client: CodexClient | null = null;
+  try {
+    const config = makeConfig(dir);
+    config.codex.desktopIpcPipePath = ipc.pipePath;
+    config.codex.desktopIpcInitialSnapshotWaitMs = 50;
+    client = new CodexClient(config, makeLogger(dir));
+
+    const result = await client.startTurn("thr_desktop", "继续处理", { cwd: dir });
+
+    assert.deepEqual(result, { ok: true, request: "thread-follower-start-turn" });
+    const forwarded = ipc.requests.find((entry) => entry.method === "thread-follower-start-turn");
+    assert.ok(forwarded);
+    assert.equal(forwarded.targetClientId, "desktop-owner");
+    assert.equal(forwarded.version, 1);
+    assert.equal((forwarded.params as Record<string, unknown>).conversationId, "thr_desktop");
+    const turnStartParams = (forwarded.params as Record<string, unknown>).turnStartParams as Record<string, unknown>;
+    assert.deepEqual(turnStartParams.input, [{ type: "text", text: "继续处理", text_elements: [] }]);
+    assert.equal(turnStartParams.cwd, dir);
+    assert.equal(turnStartParams.model, "gpt-5.5");
+    assert.equal(turnStartParams.effort, "xhigh");
+  } finally {
+    await client?.stop();
+    await ipc.stop();
+    cleanup();
+  }
+});
+
+test("desktop ipc mode creates ordinary Desktop threads through start-conversation and applies goal/title", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir);
+  let client: DesktopIpcClient | null = null;
+  try {
+    client = new DesktopIpcClient(
+      { pipePath: ipc.pipePath, initialSnapshotWaitMs: 50 },
+      makeLogger(dir)
     );
-    assert.equal(threads[0]?.id, "thr_ws");
-  } finally {
-    await client?.stop();
-    await server.stop();
-    cleanup();
-  }
-});
 
-test("canonical websocket mode attaches to an existing app-server when it is already ready", async () => {
-  const { dir, cleanup } = makeTempRepo();
-  const server = await startMockCodexWebSocketServer();
-  let client: CodexClient | null = null;
-  try {
-    const config = makeConfig(dir);
-    config.codex.connectionMode = "canonical_websocket";
-    config.codex.command = process.execPath;
-    config.codex.args = ["-e", "process.exit(55)"];
-    config.codex.websocketListenUrl = server.wsUrl;
-    config.codex.websocketUrl = server.wsUrl;
-    config.codex.websocketAttachExisting = true;
-    client = new CodexClient(config, makeLogger(dir));
-
-    await client.request("thread/list", {});
-
-    assert.equal(client.connectionKind, "canonical_websocket");
-    assert.equal((client as unknown as { proc: unknown | null }).proc, null);
-    assert.deepEqual(server.methods.slice(0, 3), ["initialize", "initialized", "thread/list"]);
-  } finally {
-    await client?.stop();
-    await server.stop();
-    cleanup();
-  }
-});
-
-test("canonical websocket mode can expose the Desktop SOCKS proxy for the configured target", async () => {
-  const { dir, cleanup } = makeTempRepo();
-  const server = await startMockCodexWebSocketServer();
-  const socksPort = await freeTcpPort();
-  let client: CodexClient | null = null;
-  try {
-    const config = makeConfig(dir);
-    config.codex.connectionMode = "canonical_websocket";
-    config.codex.command = process.execPath;
-    config.codex.args = ["-e", "setInterval(() => {}, 1000)"];
-    config.codex.websocketListenUrl = server.wsUrl;
-    config.codex.websocketUrl = server.wsUrl;
-    config.codex.websocketAttachExisting = false;
-    config.codex.desktopSocksProxyEnabled = true;
-    config.codex.desktopSocksProxyPort = socksPort;
-    client = new CodexClient(config, makeLogger(dir));
-
-    await client.request("thread/list", {});
-    const snapshot = client.desktopSocksProxySnapshot;
-    const response = await webSocketJsonRpcThroughSocks(socksPort, "localhost", server.port, {
-      id: 99,
-      method: "thread/list",
-      params: {}
+    const thread = await client.startThread({
+      prompt: "飞书创建普通 Desktop thread",
+      cwd: dir,
+      model: "gpt-5.5",
+      reasoningEffort: "xhigh",
+      approvalPolicy: "never",
+      sandboxMode: "danger-full-access",
+      serviceName: "feishu_codex_bridge_test"
     });
 
-    assert.equal(snapshot?.status, "listening");
-    assert.equal(snapshot?.port, socksPort);
-    assert.equal(snapshot?.allowedPort, server.port);
-    assert.equal(response.id, 99);
-    assert.deepEqual(response.result, {
-      data: [{ id: "thr_ws", name: "WS thread", status: { type: "idle" } }],
-      nextCursor: null
-    });
+    assert.equal(thread.id, "thr_desktop_new");
+    assert.equal(thread.cwd, dir);
+    assert.equal(thread.title, "飞书创建普通 Desktop thread");
+    const startConversation = ipc.requests.find((entry) => entry.method === "start-conversation");
+    assert.ok(startConversation);
+    assert.equal(startConversation?.targetClientId, undefined);
+    const startConversationParams = startConversation?.params as Record<string, unknown>;
+    assert.equal(startConversationParams.hostId, "local");
+    assert.deepEqual(startConversationParams.input, [{ type: "text", text: "飞书创建普通 Desktop thread", text_elements: [] }]);
+    assert.deepEqual(startConversationParams.workspaceRoots, [dir]);
+    assert.equal(startConversationParams.cwd, dir);
+    assert.equal(startConversationParams.model, "gpt-5.5");
+    assert.equal(startConversationParams.reasoningEffort, "xhigh");
+    assert.equal(startConversationParams.workspaceKind, "project");
+    const collaborationMode = startConversationParams.collaborationMode as Record<string, unknown> | undefined;
+    const configPayload = startConversationParams.config as Record<string, unknown> | undefined;
+    assert.equal(collaborationMode?.mode, "default");
+    assert.equal(configPayload?.serviceName, "feishu_codex_bridge_test");
+    assert.equal(ipc.requests.some((entry) => entry.method === "set-thread-goal"), true);
+    assert.equal(ipc.requests.some((entry) => entry.method === "set-thread-title"), true);
   } finally {
     await client?.stop();
-    await server.stop();
+    await ipc.stop();
     cleanup();
   }
 });
 
-test("canonical websocket mode cleans stale process before reconnecting", async () => {
+test("desktop ipc mode passes local image inputs to ordinary Desktop", async () => {
   const { dir, cleanup } = makeTempRepo();
-  const server = await startMockCodexWebSocketServer();
+  const ipc = await startMockDesktopIpcServer(dir);
   let client: CodexClient | null = null;
   try {
     const config = makeConfig(dir);
-    config.codex.connectionMode = "canonical_websocket";
-    config.codex.command = process.execPath;
-    config.codex.args = ["-e", "setInterval(() => {}, 1000)"];
-    config.codex.websocketListenUrl = server.wsUrl;
-    config.codex.websocketUrl = server.wsUrl;
-    config.codex.websocketAttachExisting = false;
+    config.codex.desktopIpcPipePath = ipc.pipePath;
+    config.codex.desktopIpcInitialSnapshotWaitMs = 50;
     client = new CodexClient(config, makeLogger(dir));
 
-    await client.request("thread/list", {});
-    const firstProc = (client as unknown as { proc: { pid?: number } | null }).proc;
-    assert.ok(firstProc?.pid);
-    (client as unknown as { initialized: boolean }).initialized = false;
+    await client.startThread({
+      cwd: dir,
+      prompt: "看图处理",
+      attachments: [{ path: join(dir, "image.png") }]
+    });
+    await client.startTurn("thr_desktop", "继续看图", {
+      cwd: dir,
+      attachments: [{ path: join(dir, "next.png") }]
+    });
+    await client.steerTurn("thr_desktop", "追加图片", [{ path: join(dir, "steer.png") }]);
 
-    await client.request("thread/list", {});
-
-    await assertProcessExited(firstProc.pid);
-    const secondProc = (client as unknown as { proc: { pid?: number } | null }).proc;
-    assert.ok(secondProc?.pid);
-    assert.notEqual(secondProc.pid, firstProc.pid);
+    const startConversation = ipc.requests.find((call) => call.method === "start-conversation");
+    const followerStart = ipc.requests.find((call) => call.method === "thread-follower-start-turn");
+    const followerSteer = ipc.requests.find((call) => call.method === "thread-follower-steer-turn");
+    assert.deepEqual((startConversation?.params as any).input, [
+      { type: "text", text: "看图处理", text_elements: [] },
+      { type: "localImage", path: join(dir, "image.png") }
+    ]);
+    assert.deepEqual(((followerStart?.params as any).turnStartParams as any).input, [
+      { type: "text", text: "继续看图", text_elements: [] },
+      { type: "localImage", path: join(dir, "next.png") }
+    ]);
+    assert.deepEqual((followerSteer?.params as any).input, [
+      { type: "text", text: "追加图片", text_elements: [] },
+      { type: "localImage", path: join(dir, "steer.png") }
+    ]);
   } finally {
     await client?.stop();
-    await server.stop();
+    await ipc.stop();
     cleanup();
   }
 });
 
-const startMockCodexWebSocketServer = async (): Promise<{
-  wsUrl: string;
-  port: number;
-  methods: string[];
+test("desktop ipc mode does not bind a new Desktop thread unless the prompt matches", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir, { startConversationPromptOverride: "别的 Desktop 任务" });
+  let client: DesktopIpcClient | null = null;
+  try {
+    client = new DesktopIpcClient(
+      { pipePath: ipc.pipePath, initialSnapshotWaitMs: 50, creationSnapshotWaitMs: 120 },
+      makeLogger(dir)
+    );
+
+    await assert.rejects(
+      () => client!.startThread({
+        prompt: "飞书创建普通 Desktop thread",
+        cwd: dir,
+        model: "gpt-5.5",
+        reasoningEffort: "xhigh",
+        approvalPolicy: "never",
+        sandboxMode: "danger-full-access",
+        serviceName: "feishu_codex_bridge_test"
+      }),
+      /Timed out waiting for ordinary Codex Desktop/
+    );
+
+    assert.equal(ipc.requests.some((entry) => entry.method === "start-conversation"), true);
+    assert.equal(ipc.requests.some((entry) => entry.method === "set-thread-goal"), false);
+    assert.equal(ipc.requests.some((entry) => entry.method === "set-thread-title"), false);
+  } finally {
+    await client?.stop();
+    await ipc.stop();
+    cleanup();
+  }
+});
+
+test("desktop ipc mode archives, restores and renames ordinary Desktop threads through shared runtime", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir);
+  let client: DesktopIpcClient | null = null;
+  try {
+    client = new DesktopIpcClient(
+      { pipePath: ipc.pipePath, initialSnapshotWaitMs: 50, serviceName: "feishu_codex_bridge_test" },
+      makeLogger(dir)
+    );
+    await client.start();
+
+    await client.setThreadName("thr_desktop", "Renamed from Feishu");
+    assert.equal(client.listThreads(10).find((thread) => thread.id === "thr_desktop")?.title, "Renamed from Feishu");
+
+    await client.archiveThread("thr_desktop");
+    assert.equal(client.listThreads(10).some((thread) => thread.id === "thr_desktop"), false);
+
+    await client.unarchiveThread("thr_desktop");
+    assert.equal(client.listThreads(10).find((thread) => thread.id === "thr_desktop")?.title, "Renamed from Feishu");
+
+    const relevantRequests = ipc.requests.filter((entry) => entry.method !== "initialize");
+    assert.deepEqual(
+      relevantRequests.map((entry) => [entry.method, entry.params]),
+      [
+        ["set-thread-title", { conversationId: "thr_desktop", title: "Renamed from Feishu" }],
+        ["archive-conversation", { conversationId: "thr_desktop", cleanupWorktree: false }],
+        ["unarchive-conversation", { conversationId: "thr_desktop" }]
+      ]
+    );
+  } finally {
+    await client?.stop();
+    await ipc.stop();
+    cleanup();
+  }
+});
+
+test("desktop ipc mode supports compact, collaboration and edit-style thread follower requests", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir);
+  let client: DesktopIpcClient | null = null;
+  try {
+    client = new DesktopIpcClient({ pipePath: ipc.pipePath, initialSnapshotWaitMs: 50 }, makeLogger(dir));
+    await client.start();
+
+    await client.compactThread("thr_desktop");
+    await client.setCollaborationMode("thr_desktop", { mode: "default", settings: { model: "gpt-5.5", reasoning_effort: null, developer_instructions: null } });
+    await client.editLastUserTurn("thr_desktop", "turn_1", "修改后的上一条用户消息");
+    await client.submitUserInput("thr_desktop", "req_input", { answers: { q1: { answers: ["yes"] } } });
+
+    assert.deepEqual(
+      ipc.requests.filter((entry) => entry.method?.startsWith("thread-follower-")).map((entry) => entry.method),
+      [
+        "thread-follower-compact-thread",
+        "thread-follower-set-collaboration-mode",
+        "thread-follower-edit-last-user-turn",
+        "thread-follower-submit-user-input"
+      ]
+    );
+  } finally {
+    await client?.stop();
+    await ipc.stop();
+    cleanup();
+  }
+});
+
+test("desktop ipc mode maps Desktop server requests to bridge request ids and responds over IPC", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir);
+  let client: DesktopIpcClient | null = null;
+  try {
+    client = new DesktopIpcClient({ pipePath: ipc.pipePath, initialSnapshotWaitMs: 50 }, makeLogger(dir));
+    const serverRequests: Record<string, unknown>[] = [];
+    client.on("serverRequest", (message) => serverRequests.push(message));
+    await client.start();
+
+    ipc.sendRequest("desktop-request-1", "item/commandExecution/requestApproval", {
+      threadId: "thr_desktop",
+      turnId: "turn_1",
+      itemId: "item_approval",
+      command: "npm test"
+    });
+    await waitForCondition(() => serverRequests.length === 1, "Desktop server request was not delivered");
+
+    assert.equal(serverRequests[0]?.id, "desktop-request-1");
+    assert.equal(serverRequests[0]?.requestId, "desktop-request-1");
+    assert.equal(serverRequests[0]?.method, "item/commandExecution/requestApproval");
+
+    await client.respondToServerRequest("desktop-request-1", { decision: "approve" });
+    await waitForCondition(() => ipc.responses.length === 1, "Desktop IPC response was not observed");
+
+    assert.deepEqual(ipc.responses[0], {
+      requestId: "desktop-request-1",
+      targetClientId: "desktop-owner",
+      resultType: "success",
+      result: { decision: "approve" }
+    });
+  } finally {
+    await client?.stop();
+    await ipc.stop();
+    cleanup();
+  }
+});
+
+test("desktop ipc mode converts Desktop stream snapshots into bridge turn notifications", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir);
+  let client: CodexClient | null = null;
+  try {
+    const config = makeConfig(dir);
+    config.codex.desktopIpcPipePath = ipc.pipePath;
+    config.codex.desktopIpcInitialSnapshotWaitMs = 50;
+    client = new CodexClient(config, makeLogger(dir));
+    const notifications: Record<string, unknown>[] = [];
+    client.on("notification", (message) => notifications.push(message));
+
+    await client.start();
+
+    assert.ok(notifications.some((message) => message.method === "thread-stream-state-changed"));
+    const completed = notifications.find((message) => message.method === "turn/completed");
+    assert.ok(completed);
+    assert.deepEqual(completed.params, {
+      threadId: "thr_desktop",
+      turn: {
+        params: {
+          threadId: "thr_desktop",
+          cwd: dir,
+          input: [{ type: "text", text: "继续处理", text_elements: [] }]
+        },
+        turnId: "turn_1",
+        id: "turn_1",
+        status: "completed",
+        items: [{ type: "agentMessage", id: "item_1", text: "完成了" }]
+      }
+    });
+  } finally {
+    await client?.stop();
+    await ipc.stop();
+    cleanup();
+  }
+});
+
+test("desktop ipc mode does not duplicate synthetic turn notification for the same snapshot", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir);
+  let client: CodexClient | null = null;
+  try {
+    const config = makeConfig(dir);
+    config.codex.desktopIpcPipePath = ipc.pipePath;
+    config.codex.desktopIpcInitialSnapshotWaitMs = 50;
+    client = new CodexClient(config, makeLogger(dir));
+    const notifications: Record<string, unknown>[] = [];
+    client.on("notification", (message) => notifications.push(message));
+
+    await client.start();
+    ipc.broadcastSnapshot(dir);
+
+    await waitForCondition(
+      () => notifications.filter((message) => message.method === "thread-stream-state-changed").length === 2,
+      "desktop ipc duplicate snapshot was not observed"
+    );
+    assert.equal(notifications.filter((message) => message.method === "turn/completed").length, 1);
+    assert.equal(notifications.filter((message) => message.method === "thread-stream-state-changed").length, 2);
+  } finally {
+    await client?.stop();
+    await ipc.stop();
+    cleanup();
+  }
+});
+
+const startMockDesktopIpcServer = async (cwd: string, options: {
+  startConversationPromptOverride?: string;
+} = {}): Promise<{
+  pipePath: string;
+  requests: Array<{ method: string; targetClientId?: string; version?: number; params?: unknown }>;
+  responses: Array<{ requestId?: string; targetClientId?: string; resultType?: string; result?: unknown }>;
+  broadcastSnapshot: (cwd: string, options?: Partial<DesktopSnapshotOptions>) => void;
+  sendRequest: (requestId: string, method: string, params?: Record<string, unknown>) => void;
   stop: () => Promise<void>;
 }> => {
-  const methods: string[] = [];
-  const sockets = new Set<Duplex>();
-  const server = createServer((req, res) => {
-    if (req.url === "/readyz" || req.url === "/healthz") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end('{"ok":true}');
-      return;
+  const pipePath = process.platform === "win32"
+    ? `\\\\.\\pipe\\codex-feishu-test-${process.pid}-${Date.now()}`
+    : join(process.env.TMPDIR ?? "/tmp", `codex-feishu-test-${process.pid}-${Date.now()}.sock`);
+  const requests: Array<{ method: string; targetClientId?: string; version?: number; params?: unknown }> = [];
+  const responses: Array<{ requestId?: string; targetClientId?: string; resultType?: string; result?: unknown }> = [];
+  const sockets = new Set<Socket>();
+  const broadcastSnapshot = (snapshotCwd: string, options: Partial<DesktopSnapshotOptions> = {}): void => {
+    for (const socket of sockets) {
+      writeDesktopIpcFrame(socket, desktopSnapshotMessage(snapshotCwd, options));
     }
-    res.writeHead(404);
-    res.end();
-  });
-  server.on("upgrade", (req, socket) => {
+  };
+  const sendRequest = (requestId: string, method: string, params: Record<string, unknown> = {}): void => {
+    for (const socket of sockets) {
+      writeDesktopIpcFrame(socket, {
+        type: "request",
+        requestId,
+        sourceClientId: "desktop-owner",
+        method,
+        params
+      });
+    }
+  };
+  const server = createTcpServer((socket) => {
     sockets.add(socket);
     socket.on("close", () => sockets.delete(socket));
-    const key = req.headers["sec-websocket-key"];
-    if (typeof key !== "string") {
-      socket.destroy();
-      return;
-    }
-    const accept = webSocketAccept(key);
-    socket.write(
-      [
-        "HTTP/1.1 101 Switching Protocols",
-        "Upgrade: websocket",
-        "Connection: Upgrade",
-        `Sec-WebSocket-Accept: ${accept}`,
-        "",
-        ""
-      ].join("\r\n")
-    );
-    let buffered = Buffer.alloc(0);
+    let buffer = Buffer.alloc(0);
     socket.on("data", (chunk) => {
-      buffered = Buffer.concat([buffered, chunk]);
+      buffer = Buffer.concat([buffer, chunk]);
       while (true) {
-        const frame = readWebSocketFrame(buffered);
+        const frame = readDesktopIpcFrame(buffer);
         if (!frame) break;
-        buffered = buffered.subarray(frame.consumed);
-        if (frame.opcode === 0x08) {
-          socket.end();
-          return;
+        buffer = buffer.subarray(frame.consumed);
+        const message = frame.message;
+        if (message.type === "request" && message.method === "initialize") {
+          writeDesktopIpcFrame(socket, {
+            type: "response",
+            method: "initialize",
+            requestId: message.requestId,
+            resultType: "success",
+            result: { clientId: "bridge-client" }
+          });
+          writeDesktopIpcFrame(socket, desktopSnapshotMessage(cwd));
+          continue;
         }
-        const message = JSON.parse(frame.text) as Record<string, unknown>;
-        if (typeof message.method === "string") methods.push(message.method);
-        if ("id" in message) {
-          writeWebSocketJson(socket, responseFor(message));
+        if (message.type === "request") {
+          requests.push({
+            method: String(message.method),
+            targetClientId: typeof message.targetClientId === "string" ? message.targetClientId : undefined,
+            version: typeof message.version === "number" ? message.version : undefined,
+            params: message.params
+          });
+          if (message.method === "thread-follower-start-turn") {
+            const params = message.params as Record<string, unknown>;
+            const turnStartParams = params.turnStartParams as Record<string, unknown> | undefined;
+            const input = Array.isArray(turnStartParams?.input) ? turnStartParams.input : [];
+            const textInput = input[0] && typeof input[0] === "object" ? input[0] as Record<string, unknown> : {};
+            broadcastSnapshot(String(turnStartParams?.cwd ?? cwd), {
+              conversationId: String(params.conversationId ?? "thr_desktop_new"),
+              title: "Feishu-created Desktop task",
+              prompt: typeof textInput.text === "string" ? textInput.text : "",
+              turnId: "turn_new",
+              status: "running"
+            });
+          }
+          if (message.method === "start-conversation") {
+            const params = message.params as Record<string, unknown>;
+            const input = Array.isArray(params.input) ? params.input : [];
+            const textInput = input[0] && typeof input[0] === "object" ? input[0] as Record<string, unknown> : {};
+            broadcastSnapshot(String(params.cwd ?? cwd), {
+              conversationId: "thr_desktop_new",
+              title: "Feishu-created Desktop thread",
+              prompt: options.startConversationPromptOverride ?? (typeof textInput.text === "string" ? textInput.text : ""),
+              turnId: "turn_new",
+              status: "running"
+            });
+          }
+          if (message.method === "set-thread-title") {
+            const params = message.params as Record<string, unknown>;
+            const threadId = String(params.conversationId ?? "thr_desktop_new");
+            const title = typeof params.title === "string" ? params.title : "Desktop task";
+            broadcastSnapshot(cwd, {
+              conversationId: threadId,
+              title,
+              prompt: "飞书创建普通 Desktop thread",
+              turnId: "turn_new",
+              status: "running"
+            });
+          }
+          if (message.method === "set-thread-goal" || message.method === "clear-thread-goal") {
+            // No-op for the mock; the client only needs the request to succeed.
+          }
+          if (message.method === "archive-conversation" || message.method === "unarchive-conversation") {
+            // No-op for the mock; the client only needs the request to succeed.
+          }
+          if (message.method === "thread-follower-compact-thread" || message.method === "thread-follower-set-collaboration-mode" || message.method === "thread-follower-edit-last-user-turn" || message.method === "thread-follower-submit-user-input" || message.method === "thread-follower-submit-mcp-server-elicitation-response") {
+            // No-op for the mock; the client only needs the request to succeed.
+          }
+          writeDesktopIpcFrame(socket, {
+            type: "response",
+            method: message.method,
+            requestId: message.requestId,
+            resultType: "success",
+            result: { ok: true, request: message.method }
+          });
+          continue;
+        }
+        if (message.type === "response") {
+          responses.push({
+            requestId: typeof message.requestId === "string" ? message.requestId : undefined,
+            targetClientId: typeof message.targetClientId === "string" ? message.targetClientId : undefined,
+            resultType: typeof message.resultType === "string" ? message.resultType : undefined,
+            result: message.result
+          });
         }
       }
     });
   });
-  await listen(server);
-  const address = server.address();
-  if (!address || typeof address === "string") throw new Error("mock server address is unavailable");
-  const port = address.port;
+  await new Promise<void>((resolve) => server.listen(pipePath, resolve));
   return {
-    wsUrl: `ws://127.0.0.1:${port}`,
-    port,
-    methods,
+    pipePath,
+    requests,
+    responses,
+    broadcastSnapshot,
+    sendRequest,
     stop: async () => {
       for (const socket of sockets) socket.destroy();
       await closeServer(server);
@@ -316,202 +587,78 @@ const startMockCodexWebSocketServer = async (): Promise<{
   };
 };
 
-const responseFor = (message: Record<string, unknown>): Record<string, unknown> => {
-  if (message.method === "initialize") {
-    return { id: message.id, result: { protocolVersion: "test" } };
-  }
-  if (message.method === "thread/list") {
-    return {
-      id: message.id,
-      result: { data: [{ id: "thr_ws", name: "WS thread", status: { type: "idle" } }], nextCursor: null }
-    };
-  }
-  return { id: message.id, result: {} };
+interface DesktopSnapshotOptions {
+  conversationId: string;
+  title: string;
+  prompt: string;
+  turnId: string | null;
+  status: string;
+}
+
+const desktopSnapshotMessage = (cwd: string, options: Partial<DesktopSnapshotOptions> = {}): Record<string, unknown> => {
+  const conversationId = options.conversationId ?? "thr_desktop";
+  const turnId = options.turnId === null ? null : options.turnId ?? "turn_1";
+  const status = options.status ?? "completed";
+  const prompt = options.prompt ?? "继续处理";
+  const turns = turnId
+    ? [
+        {
+          params: { threadId: conversationId, cwd, input: prompt ? [{ type: "text", text: prompt, text_elements: [] }] : [] },
+          turnId,
+          status,
+          items: [{ type: "agentMessage", id: "item_1", text: "完成了" }]
+        }
+      ]
+    : [];
+  return {
+    type: "broadcast",
+    method: "thread-stream-state-changed",
+    sourceClientId: "desktop-owner",
+    version: 6,
+    params: {
+      conversationId,
+      hostId: "local",
+      change: {
+        type: "snapshot",
+        conversationState: {
+          id: conversationId,
+          title: options.title ?? "Desktop task",
+          updatedAt: 1778451000000,
+          source: "desktop",
+          threadRuntimeStatus: { type: status === "running" ? "active" : "idle" },
+          cwd,
+          turns
+        }
+      },
+      version: 6,
+      type: "thread-stream-state-changed"
+    }
+  };
 };
 
-const listen = (server: ReturnType<typeof createServer>): Promise<void> =>
-  new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
-
-const closeServer = (server: ReturnType<typeof createServer>): Promise<void> =>
+const closeServer = (server: TcpServer): Promise<void> =>
   new Promise((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
 
-const freeTcpPort = async (): Promise<number> => {
-  const server: TcpServer = createTcpServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
-  const address = server.address();
-  if (!address || typeof address === "string") throw new Error("free port server address is unavailable");
-  const port = address.port;
-  await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
-  return port;
-};
-
-const assertProcessExited = async (pid: number): Promise<void> => {
-  const deadline = Date.now() + 5000;
+const waitForCondition = async (predicate: () => boolean, message: string, timeoutMs = 1000): Promise<void> => {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0);
-    } catch {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 100));
+    if (predicate()) return;
+    await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  assert.fail(`process ${pid} did not exit`);
+  assert.fail(message);
 };
 
-const webSocketJsonRpcThroughSocks = async (
-  socksPort: number,
-  targetHost: string,
-  targetPort: number,
-  message: Record<string, unknown>
-): Promise<Record<string, unknown>> => {
-  const socket = await connectSocksTunnel(socksPort, targetHost, targetPort);
-  try {
-    const key = Buffer.from("codex-feishu-test").toString("base64");
-    socket.write(
-      [
-        "GET / HTTP/1.1",
-        `Host: ${targetHost}:${targetPort}`,
-        "Upgrade: websocket",
-        "Connection: Upgrade",
-        `Sec-WebSocket-Key: ${key}`,
-        "Sec-WebSocket-Version: 13",
-        "",
-        ""
-      ].join("\r\n")
-    );
-    const handshake = await readSocketUntil(socket, (buffer) => buffer.includes("\r\n\r\n"));
-    assert.match(handshake.toString("utf8"), /^HTTP\/1\.1 101 Switching Protocols/);
-
-    writeMaskedWebSocketJson(socket, message);
-    const response = await readSocketUntil(socket, (buffer) => readWebSocketFrame(buffer) !== null);
-    const frame = readWebSocketFrame(response);
-    assert.ok(frame);
-    return JSON.parse(frame.text) as Record<string, unknown>;
-  } finally {
-    socket.destroy();
-  }
-};
-
-const connectSocksTunnel = async (socksPort: number, targetHost: string, targetPort: number): Promise<Socket> => {
-  const socket = createConnection({ host: "127.0.0.1", port: socksPort });
-  await waitForSocketConnect(socket);
-  socket.write(Buffer.from([0x05, 0x01, 0x00]));
-  const greeting = await readSocketUntil(socket, (buffer) => buffer.length >= 2);
-  assert.deepEqual(Array.from(greeting.subarray(0, 2)), [0x05, 0x00]);
-
-  const host = Buffer.from(targetHost, "utf8");
-  socket.write(Buffer.concat([Buffer.from([0x05, 0x01, 0x00, 0x03, host.length]), host, portBuffer(targetPort)]));
-  const reply = await readSocketUntil(socket, (buffer) => buffer.length >= 10);
-  assert.equal(reply[0], 0x05);
-  assert.equal(reply[1], 0x00);
-  return socket;
-};
-
-const waitForSocketConnect = (socket: Socket): Promise<void> =>
-  new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      cleanup();
-      socket.destroy();
-      reject(new Error("socket connect timed out"));
-    }, 5000);
-    const cleanup = () => {
-      clearTimeout(timeout);
-      socket.off("connect", onConnect);
-      socket.off("error", onError);
-    };
-    const onConnect = () => {
-      cleanup();
-      resolve();
-    };
-    const onError = (error: Error) => {
-      cleanup();
-      reject(error);
-    };
-    socket.once("connect", onConnect);
-    socket.once("error", onError);
-  });
-
-const readSocketUntil = (socket: Socket, predicate: (buffer: Buffer) => boolean): Promise<Buffer> =>
-  new Promise((resolve, reject) => {
-    let buffer = Buffer.alloc(0);
-    const timeout = setTimeout(() => {
-      cleanup();
-      reject(new Error("socket read timed out"));
-    }, 5000);
-    const cleanup = () => {
-      clearTimeout(timeout);
-      socket.off("data", onData);
-      socket.off("error", onError);
-      socket.off("close", onClose);
-    };
-    const onData = (chunk: Buffer) => {
-      buffer = Buffer.concat([buffer, chunk]);
-      if (!predicate(buffer)) return;
-      cleanup();
-      resolve(buffer);
-    };
-    const onError = (error: Error) => {
-      cleanup();
-      reject(error);
-    };
-    const onClose = () => {
-      cleanup();
-      reject(new Error("socket closed before expected data arrived"));
-    };
-    socket.on("data", onData);
-    socket.once("error", onError);
-    socket.once("close", onClose);
-  });
-
-const portBuffer = (port: number): Buffer => Buffer.from([port >> 8, port & 0xff]);
-
-const webSocketAccept = (key: string): string =>
-  createHash("sha1")
-    .update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`)
-    .digest("base64");
-
-const writeWebSocketJson = (socket: NodeJS.WritableStream, value: Record<string, unknown>): void => {
+const writeDesktopIpcFrame = (socket: NodeJS.WritableStream, value: Record<string, unknown>): void => {
   const payload = Buffer.from(JSON.stringify(value), "utf8");
-  const header = payload.length < 126 ? Buffer.from([0x81, payload.length]) : Buffer.from([0x81, 126, payload.length >> 8, payload.length & 0xff]);
+  const header = Buffer.alloc(4);
+  header.writeUInt32LE(payload.length, 0);
   socket.write(Buffer.concat([header, payload]));
 };
 
-const writeMaskedWebSocketJson = (socket: NodeJS.WritableStream, value: Record<string, unknown>): void => {
-  const payload = Buffer.from(JSON.stringify(value), "utf8");
-  const mask = Buffer.from([0x12, 0x34, 0x56, 0x78]);
-  const header =
-    payload.length < 126
-      ? Buffer.from([0x81, 0x80 | payload.length])
-      : Buffer.from([0x81, 0x80 | 126, payload.length >> 8, payload.length & 0xff]);
-  const masked = Buffer.from(payload);
-  for (let index = 0; index < masked.length; index++) {
-    masked[index] = masked[index]! ^ mask[index % 4]!;
-  }
-  socket.write(Buffer.concat([header, mask, masked]));
-};
-
-const readWebSocketFrame = (buffer: Buffer): { opcode: number; text: string; consumed: number } | null => {
-  if (buffer.length < 2) return null;
-  const opcode = buffer[0]! & 0x0f;
-  const masked = (buffer[1]! & 0x80) !== 0;
-  let length = buffer[1]! & 0x7f;
-  let offset = 2;
-  if (length === 126) {
-    if (buffer.length < 4) return null;
-    length = buffer.readUInt16BE(2);
-    offset = 4;
-  }
-  if (length === 127) throw new Error("large websocket frames are not supported in test");
-  const maskOffset = offset;
-  const payloadOffset = masked ? offset + 4 : offset;
-  const consumed = payloadOffset + length;
-  if (buffer.length < consumed) return null;
-  const payload = Buffer.from(buffer.subarray(payloadOffset, payloadOffset + length));
-  if (masked) {
-    const mask = buffer.subarray(maskOffset, maskOffset + 4);
-    for (let index = 0; index < payload.length; index++) {
-      payload[index] = payload[index]! ^ mask[index % 4]!;
-    }
-  }
-  return { opcode, text: payload.toString("utf8"), consumed };
+const readDesktopIpcFrame = (buffer: Buffer): { message: Record<string, unknown>; consumed: number } | null => {
+  if (buffer.length < 4) return null;
+  const length = buffer.readUInt32LE(0);
+  if (buffer.length < 4 + length) return null;
+  const message = JSON.parse(buffer.subarray(4, 4 + length).toString("utf8")) as Record<string, unknown>;
+  return { message, consumed: 4 + length };
 };

@@ -11,7 +11,7 @@ const TaskChatTypeSchema = z.enum(["private", "public"]);
 const SandboxModeSchema = z.enum(["read-only", "workspace-write", "danger-full-access"]);
 const ApprovalPolicySchema = z.enum(["untrusted", "on-failure", "on-request", "never"]);
 const HttpServerModeSchema = z.enum(["auto", "enabled", "disabled"]);
-const CodexConnectionModeSchema = z.enum(["auto", "desktop_proxy", "standalone", "canonical_websocket"]);
+const CodexConnectionModeSchema = z.enum(["desktop_ipc"]);
 
 const stringArrayFromEnv = z
   .union([z.array(z.string()), z.string()])
@@ -44,17 +44,9 @@ const ConfigSchema = z.object({
   codex: z
     .object({
       command: z.string().default("codex"),
-      args: z.array(z.string()).default(["app-server"]),
-      connectionMode: CodexConnectionModeSchema.default("auto"),
-      proxyArgs: z.array(z.string()).default(["app-server", "proxy"]),
-      websocketListenUrl: z.string().default("ws://127.0.0.1:47931"),
-      websocketUrl: z.string().optional(),
-      websocketAttachExisting: z.boolean().default(true),
-      desktopSocksProxyEnabled: z.boolean().default(false),
-      desktopSocksProxyHost: z.string().default("127.0.0.1"),
-      desktopSocksProxyPort: z.number().int().positive().max(65535).default(1080),
-      desktopSocksProxyAllowExisting: z.boolean().default(false),
-      experimentalApi: z.boolean().default(true),
+      connectionMode: CodexConnectionModeSchema.default("desktop_ipc"),
+      desktopIpcPipePath: z.string().default("\\\\.\\pipe\\codex-ipc"),
+      desktopIpcInitialSnapshotWaitMs: z.number().int().nonnegative().default(1500),
       defaultModel: z.string().default("gpt-5.5"),
       defaultReasoningEffort: z.string().default("xhigh"),
       defaultSandboxMode: SandboxModeSchema.default("danger-full-access"),
@@ -65,16 +57,9 @@ const ConfigSchema = z.object({
     })
     .default({
       command: "codex",
-      args: ["app-server"],
-      connectionMode: "auto",
-      proxyArgs: ["app-server", "proxy"],
-      websocketListenUrl: "ws://127.0.0.1:47931",
-      websocketAttachExisting: true,
-      desktopSocksProxyEnabled: false,
-      desktopSocksProxyHost: "127.0.0.1",
-      desktopSocksProxyPort: 1080,
-      desktopSocksProxyAllowExisting: false,
-      experimentalApi: true,
+      connectionMode: "desktop_ipc",
+      desktopIpcPipePath: "\\\\.\\pipe\\codex-ipc",
+      desktopIpcInitialSnapshotWaitMs: 1500,
       defaultModel: "gpt-5.5",
       defaultReasoningEffort: "xhigh",
       defaultSandboxMode: "danger-full-access",

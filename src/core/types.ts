@@ -126,6 +126,7 @@ export interface QueuedMessage {
   sessionBindingId: string;
   feishuMessageId: string;
   text: string;
+  attachments: FeishuMessageAttachment[];
   status: QueueStatus;
   position: number;
   createdByFeishuUserId: string;
@@ -221,6 +222,7 @@ export interface PendingProjectPrompt {
   feishuChatId: string;
   feishuUserId: string | null;
   text: string;
+  attachments: FeishuMessageAttachment[];
   status: "pending" | "used" | "cancelled";
   createdAt: string;
   usedAt: string | null;
@@ -245,16 +247,12 @@ export interface DiagnosticSnapshot {
   nodeVersion: string;
   codexCommand: string;
   codexConnectionMode: string;
-  codexConnectionKind: "desktop_proxy" | "standalone" | "canonical_websocket" | "not_started" | "unknown";
-  codexWebSocketUrl: string | null;
-  codexDesktopSocksProxy: {
-    enabled: boolean;
-    host: string;
-    port: number;
-    status: "not_started" | "listening" | "external_or_occupied" | "error" | "stopped";
-    allowedHost: string;
-    allowedPort: number;
-    lastError: string | null;
+  codexConnectionKind: "desktop_ipc" | "not_started" | "unknown";
+  codexDesktopIpc: {
+    pipePath: string;
+    status: "connected" | "disconnected" | "not_started" | "error";
+    clientId: string | null;
+    observedThreads: number;
   } | null;
   codexAvailable: boolean;
   appServerStatus: "connected" | "disconnected" | "not_started" | "error";
@@ -373,7 +371,17 @@ export interface FeishuIncomingMessage {
   threadId: string | null;
   userId: string;
   text: string;
+  attachments?: FeishuMessageAttachment[];
   createTime?: string;
+}
+
+export interface FeishuMessageAttachment {
+  kind: "image";
+  key: string;
+  messageId?: string | null;
+  localPath?: string | null;
+  mimeType?: string | null;
+  sizeBytes?: number | null;
 }
 
 export interface FeishuCardAction {
@@ -383,4 +391,5 @@ export interface FeishuCardAction {
   chatId: string;
   rootMessageId?: string | null;
   payload: Record<string, unknown>;
+  formValue?: Record<string, unknown> | null;
 }

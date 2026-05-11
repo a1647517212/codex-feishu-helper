@@ -169,7 +169,7 @@ export class CardRenderer {
     projects: Array<{ id: string; name: string; rootPath: string; feishuChatId: string | null }>,
     options: { pendingPromptId?: string | null } = {}
   ): FeishuCard {
-    if (projects.length === 0) return card("选择项目", [text("还没有发现 Codex App 工作区。请先在 Codex App 打开一个项目。")]);
+    if (projects.length === 0) return card("选择项目", [text("还没有发现 Codex Desktop 工作区。请先在 Codex Desktop 打开一个项目。")]);
     const elements: Record<string, unknown>[] = [
       text(options.pendingPromptId ? "选择项目后，会用刚才那条需求创建任务会话。" : "选择一个项目后，可以查看这个项目里的对话、运行状态和项目设置。")
     ];
@@ -548,6 +548,96 @@ export class CardRenderer {
     return card("待确认列表", elements);
   }
 
+  pendingServerRequestListCard(requests: Array<{ title: string; requestId: string; createdAt: string; detail: string }>): FeishuCard {
+    if (requests.length === 0) return card("待处理请求", [text("当前没有待处理请求。")]);
+    const elements: Record<string, unknown>[] = [];
+    for (const request of requests.slice(0, 10)) {
+      elements.push(
+        text(
+          [
+            `类型：${request.title}`,
+            `请求：${request.requestId}`,
+            request.detail,
+            `时间：${request.createdAt}`,
+            `命令：/request detail ${request.requestId}`
+          ]
+            .filter(Boolean)
+            .join("\n")
+        )
+      );
+      pushMaybe(elements, maybeActions(this.interactionMode, [button("查看详情", "server_request_detail", { requestId: request.requestId })]));
+    }
+    return card("待处理请求", elements);
+  }
+
+  serverRequestCard(input: {
+    title: string;
+    body: string;
+    buttons?: Array<{
+      label: string;
+      action: string;
+      payload?: Record<string, unknown>;
+    }>;
+    form?: {
+      submitLabel?: string;
+      fields: Array<{
+        name: string;
+        label: string;
+        kind: "text" | "textarea" | "select" | "multi_select" | "boolean" | "number";
+        required?: boolean;
+        secret?: boolean;
+        placeholder?: string;
+        value?: string;
+        options?: Array<{ label: string; value: string }>;
+      }>;
+      submitPayload?: Record<string, unknown>;
+    };
+    commands?: string[];
+  }): FeishuCard {
+    const elements: Record<string, unknown>[] = [text(input.body)];
+    if (input.form && input.form.fields.length > 0) {
+      elements.push(divider());
+      for (const field of input.form.fields.slice(0, 12)) {
+        pushMaybe(elements, renderServerRequestFormField(field));
+      }
+      pushActionRows(
+        elements,
+        this.interactionMode,
+        [
+          button(input.form.submitLabel ?? "提交", "server_request_resolve", {
+            ...(input.form.submitPayload ?? {}),
+            resolution: "submit_form"
+          })
+        ]
+      );
+    }
+    if (input.buttons && input.buttons.length > 0) {
+      pushActionRows(
+        elements,
+        this.interactionMode,
+        input.buttons.map((item) => button(item.label, item.action, item.payload ?? {}))
+      );
+    }
+    if (input.commands && input.commands.length > 0) {
+      elements.push(divider());
+      elements.push(commandText(input.commands));
+    }
+    return card(input.title, elements);
+  }
+
+  serverRequestDetailCard(input: {
+    title: string;
+    body: string;
+    commands?: string[];
+  }): FeishuCard {
+    const elements: Record<string, unknown>[] = [text(input.body)];
+    if (input.commands && input.commands.length > 0) {
+      elements.push(divider());
+      elements.push(commandText(input.commands));
+    }
+    return card(input.title, elements);
+  }
+
   taskDetailCard(input: {
     bindingId: string;
     title: string;
@@ -738,11 +828,10 @@ export class CardRenderer {
         [
           `电脑：${snapshot.machineName}`,
           `Codex：${snapshot.codexAvailable ? "可用" : "不可用"}`,
-          `app-server：${snapshot.appServerStatus}`,
+          `Desktop运行时：${snapshot.appServerStatus}`,
           `Codex连接：${codexConnectionText(snapshot.codexConnectionMode, snapshot.codexConnectionKind)}`,
-          snapshot.codexWebSocketUrl ? `WebSocket：${snapshot.codexWebSocketUrl}` : null,
-          snapshot.codexDesktopSocksProxy
-            ? `Desktop SOCKS：${snapshot.codexDesktopSocksProxy.host}:${snapshot.codexDesktopSocksProxy.port} / ${snapshot.codexDesktopSocksProxy.status}`
+          snapshot.codexDesktopIpc
+            ? `Desktop IPC：${snapshot.codexDesktopIpc.pipePath} / ${snapshot.codexDesktopIpc.status} / ${snapshot.codexDesktopIpc.observedThreads} 个线程`
             : null,
           `飞书配置：${snapshot.feishuConfigured ? "已配置" : "未完整配置"}`,
           `消息接入：${snapshot.feishuMessageTransport === "long_connection" ? "长连接" : "HTTP 回调"}`,
@@ -1150,6 +1239,137 @@ const pushActionRows = (elements: Record<string, unknown>[], mode: InteractionMo
 const commandText = (commands: string[]): Record<string, unknown> =>
   text(`可直接发送命令：\n${commands.map((command) => `- ${command}`).join("\n")}`);
 
+const renderServerRequestFormField = (field: {
+  name: string;
+  label: string;
+  kind: "text" | "textarea" | "select" | "multi_select" | "boolean" | "number";
+  required?: boolean;
+  secret?: boolean;
+  placeholder?: string;
+  value?: string;
+  options?: Array<{ label: string; value: string }>;
+}): Record<string, unknown> | null => {
+  const title = `${field.label}${field.required ? " *" : ""}`;
+  const hint = field.secret ? "提交后会按保密字段处理。" : null;
+  const labelBlock = text([`**${title}**`, hint].filter(Boolean).join("\n"));
+  const componentId = field.name;
+  const placeholder = field.placeholder ?? field.label;
+  switch (field.kind) {
+    case "text":
+    case "number":
+      return {
+        tag: "column_set",
+        horizontal_align: "left",
+        columns: [
+          {
+            tag: "column",
+            width: "weighted",
+            weight: 1,
+            elements: [
+              labelBlock,
+              {
+                tag: "input",
+                name: componentId,
+                component_id: componentId,
+                placeholder: { tag: "plain_text", content: placeholder },
+                default_value: field.value ?? ""
+              }
+            ]
+          }
+        ]
+      };
+    case "textarea":
+      return {
+        tag: "column_set",
+        horizontal_align: "left",
+        columns: [
+          {
+            tag: "column",
+            width: "weighted",
+            weight: 1,
+            elements: [
+              labelBlock,
+              {
+                tag: "textarea",
+                name: componentId,
+                component_id: componentId,
+                placeholder: { tag: "plain_text", content: placeholder },
+                default_value: field.value ?? ""
+              }
+            ]
+          }
+        ]
+      };
+    case "select":
+      return {
+        tag: "column_set",
+        horizontal_align: "left",
+        columns: [
+          {
+            tag: "column",
+            width: "weighted",
+            weight: 1,
+            elements: [
+              labelBlock,
+              {
+                tag: "select_static",
+                name: componentId,
+                component_id: componentId,
+                placeholder: { tag: "plain_text", content: placeholder },
+                initial_option: field.value ?? undefined,
+                options: (field.options ?? []).slice(0, 50).map((option) => ({
+                  text: { tag: "plain_text", content: option.label },
+                  value: option.value
+                }))
+              }
+            ]
+          }
+        ]
+      };
+    case "multi_select":
+      return sectionBlock(
+        title,
+        [
+          hint,
+          "飞书多选表单控件在当前桥接里先回落为文本输入，请用逗号分隔多个值。",
+          field.options && field.options.length > 0
+            ? `可选：${field.options.map((option) => option.label).join(" / ")}`
+            : null
+        ]
+          .filter(Boolean)
+          .join("\n")
+      );
+    case "boolean":
+      return {
+        tag: "column_set",
+        horizontal_align: "left",
+        columns: [
+          {
+            tag: "column",
+            width: "weighted",
+            weight: 1,
+            elements: [
+              labelBlock,
+              {
+                tag: "select_static",
+                name: componentId,
+                component_id: componentId,
+                placeholder: { tag: "plain_text", content: placeholder },
+                initial_option: field.value ?? undefined,
+                options: [
+                  { text: { tag: "plain_text", content: "是" }, value: "true" },
+                  { text: { tag: "plain_text", content: "否" }, value: "false" }
+                ]
+              }
+            ]
+          }
+        ]
+      };
+    default:
+      return null;
+  }
+};
+
 const button = (label: string, action: string, extra: Record<string, unknown> = {}): Record<string, unknown> => {
   const actionId = `act_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const value = {
@@ -1315,22 +1535,16 @@ const subAgentStatusText = (status: string): string =>
 
 const codexOnlyCompletionTitle = (status: string): string =>
   ({
-    completed: "Codex App 任务已完成",
-    failed: "Codex App 任务失败",
-    interrupted: "Codex App 任务已中断"
-  })[status] ?? "Codex App 任务已结束";
+    completed: "Codex Desktop 任务已完成",
+    failed: "Codex Desktop 任务失败",
+    interrupted: "Codex Desktop 任务已中断"
+  })[status] ?? "Codex Desktop 任务已结束";
 
 const codexConnectionText = (mode: string, kind: string): string => {
-  const modeText =
-    ({ auto: "自动", desktop_proxy: "Desktop代理", standalone: "独立进程", canonical_websocket: "Canonical WebSocket" } as Record<
-      string,
-      string
-    >)[mode] ?? mode;
+  const modeText = ({ desktop_ipc: "Desktop IPC" } as Record<string, string>)[mode] ?? mode;
   const kindText =
     ({
-      desktop_proxy: "已接入 Desktop app-server",
-      standalone: "独立 app-server",
-      canonical_websocket: "Canonical WebSocket app-server",
+      desktop_ipc: "普通 Desktop IPC",
       not_started: "未启动",
       unknown: "未知"
     } as Record<string, string>)[kind] ?? kind;

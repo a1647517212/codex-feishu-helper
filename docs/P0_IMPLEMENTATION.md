@@ -6,14 +6,14 @@ The bridge is implemented in TypeScript on Node.js 22.
 
 Reasons:
 
-- Codex `app-server` uses JSON-RPC over JSONL/WebSocket, which maps naturally to Node streams and TypeScript types.
+- Codex Desktop runtime protocol uses JSON-RPC over JSONL/WebSocket, which maps naturally to Node streams and TypeScript types.
 - Feishu server APIs and card payloads are JSON-first.
 - Node 22 provides built-in `node:sqlite`, so the bridge can use durable SQLite state without an extra native dependency.
 - Windows deployment stays simple: install Node, run `npm install`, then run the bridge.
 
 ## Implemented P0 Components
 
-- `CodexClient`: connects to Codex app-server, preferring `codex app-server proxy` in auto mode and falling back to standalone `codex app-server`; performs `initialize` and `initialized`, wraps thread and turn APIs, captures notifications and server approval requests.
+- `CodexClient`: connects only to the ordinary Codex Desktop IPC pipe, wraps thread and turn APIs on top of Desktop IPC, and captures Desktop notifications plus server requests.
 - `FeishuClient`: sends Feishu text messages, replies, cards, and card updates through Feishu OpenAPI.
 - `FeishuEventParser`: parses URL verification, message events, and card action callbacks.
 - `FeishuLongConnectionServer`: receives Feishu message events and, when enabled, card action callbacks through the official long-connection SDK path.
@@ -21,7 +21,7 @@ Reasons:
 - `TaskService`: maps Feishu task-chat messages to Codex thread operations, queues busy messages, records semantic events, and handles approval buttons.
 - `OutboxWorker`: retries Feishu notifications with dedupe keys.
 - `ProjectionBuilder`: builds Feishu task status cards from semantic events and database state.
-- `DiagnosticsService`: reports Codex availability, app-server status, database path, counts, and last error.
+- `DiagnosticsService`: reports Codex availability, Desktop runtime status, database path, counts, and last error.
 - `BridgeHttpServer`: exposes `/healthz`, `/readyz`, `/doctor`, `/console-card`, plus `/feishu/events` and `/feishu/card` when the corresponding message or card callback transport is explicitly set to HTTP fallback.
 
 ## Local Verification
@@ -48,14 +48,14 @@ Invoke-WebRequest http://127.0.0.1:8787/feishu/events -Method Post -ContentType 
 Observed smoke result:
 
 ```json
-{"health":true,"doctor":true,"appServer":"connected","httpFallbackDisabled":409}
+{"health":true,"doctor":true,"runtime":"connected","httpFallbackDisabled":409}
 ```
 
 ## Second-Pass Acceptance Review
 
 Reviewed against `FEISHU_CODEX_CONTROL_DESIGN.md` P0 and section 44 acceptance items. The implementation now includes these extra hardening points:
 
-- `thread/list` uses cursor pagination with bounded page size and the app-server `updated_at` sort key.
+- `thread/list` uses cursor pagination with bounded page size and the generated protocol `updated_at` sort key.
 - Persisted session bindings are reconciled with `thread/read` during bootstrap, so a restarted bridge can correct stale running or idle status.
 - Busy task-chat replies are retained in `message_queue`; users can open a queue card and cancel individual queued messages.
 - The next queued message is delivered automatically after the current turn completes.
@@ -103,7 +103,7 @@ check passed
 
 Verified with the bot in group `codex-ep` using long connection:
 
-- `/doctor` returned `appServerStatus=connected`, `codexAvailable=true`, `feishuConfigured=true`.
+- `/doctor` returned a healthy Desktop runtime state, `codexAvailable=true`, and `feishuConfigured=true`.
 - Posting `/codex` without `@` produced a `Codex 控制台` interactive card reply in the group.
 - `POST /feishu/events` returned `409` in long-connection mode, confirming HTTP callback fallback is disabled by default.
 - After waiting for long-connection retry windows, the latest `/codex` delivery produced one card and one `incoming_messages` row.
@@ -118,7 +118,7 @@ Verified with the bot in group `codex-ep` using long connection:
 
 - Long connection is still the default for messages and newer card callbacks; message-command mode remains the local-only fallback.
 - Card button callbacks require the Feishu app to subscribe to the newer `card.action.trigger` callback. Prefer long connection for this callback. If the bridge never records `lastFeishuCardActionAt`, the failing path is before `TaskService`; verify the Feishu callback subscription first, then fall back to message commands or add a public callback/relay only if the tenant requires HTTP callbacks.
-- Desktop owner IPC routing is intentionally not implemented in P0.
-- Desktop live refresh is best-effort. In `codex.connectionMode=auto`, the bridge first tries `codex app-server proxy` so it can share the running Desktop app-server and receive the same live notifications. If the Desktop control socket is unavailable, it falls back to a standalone app-server; Feishu remains live, while the Desktop UI may only show persisted updates after its own refresh/restart.
+- Desktop owner IPC routing is now available through `codex.connectionMode=desktop_ipc`. It connects the ordinary Desktop IPC pipe, observes Desktop snapshots, and sends follower requests to the Desktop owner client.
+- In `desktop_ipc`, Feishu controls ordinary Desktop through the Desktop IPC pipe and does not start a separate runtime. New-task entry points create a brand-new ordinary Desktop thread through Desktop IPC host request `start-conversation`, then bind only the new `thread-stream-state-changed` snapshot from the same pipe that contains the same prompt. Follow-up controls route through Desktop owner follower IPC.
 - High-risk approvals do not expose a task-wide trust button.
 - Full local detail pages for large content are reserved for P2.
