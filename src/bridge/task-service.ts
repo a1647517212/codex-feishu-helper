@@ -21,6 +21,7 @@ import type {
   WorkspaceCheckpointKind
 } from "../core/types.js";
 import type { Repository } from "../db/repo.js";
+import { DiagnosticsService } from "./diagnostics.js";
 import { commandApprovalDecision, fileApprovalDecision, classifyCommandRisk } from "../domain/approval.js";
 import { CardRenderer } from "../domain/cards.js";
 import {
@@ -36,11 +37,11 @@ import {
   formatSubAgentLines,
   subAgentEventsFromItem
 } from "../domain/subagents.js";
-import type { CodexClient, CodexModelSummary, CodexThreadSummary } from "../codex/client.js";
+import type { CodexClient, CodexExecutionReadiness, CodexModelSummary, CodexThreadSummary } from "../codex/client.js";
+import { detectDesktopIpcCapabilities } from "../codex/desktop-ipc-capabilities.js";
 import type { CodexLocalImageAttachment } from "../codex/protocol.js";
 import type { FeishuSender, SentMessage } from "../feishu/client.js";
 import type { Logger } from "../logger.js";
-import { DiagnosticsService } from "./diagnostics.js";
 
 type TaskContainer = {
   chatId: string;
@@ -87,6 +88,20 @@ type StoredServerRequestPayload = {
   bindingId: string;
   params: Record<string, unknown>;
 };
+
+function activeTurnIdFromThreadDetail(detail: Record<string, unknown> | null): string | null {
+  if (!detail) return null;
+  const rawThread = detail.thread && typeof detail.thread === "object" ? (detail.thread as Record<string, unknown>) : detail;
+  const turns = Array.isArray(rawThread.turns) ? rawThread.turns : [];
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = turns[index];
+    if (!turn || typeof turn !== "object") continue;
+    const object = turn as Record<string, unknown>;
+    if (!isActiveCodexTurnStatus(object.status)) continue;
+    return asString(object.id) ?? asString(object.turnId) ?? `turn_${index}`;
+  }
+  return null;
+}
 
 export class TaskService {
   private readonly cards: CardRenderer;
@@ -174,17 +189,39 @@ export class TaskService {
       const threads = await this.codex.listThreads(this.config.bridge.threadListLimit);
       let enqueued = 0;
       for (const thread of threads) {
-        if (this.repo.findBindingByThreadId(thread.id)) continue;
+        if (isSubAgentThread(thread)) continue;
+        const binding = this.repo.findBindingByThreadId(thread.id);
         if (this.repo.findIgnoredThread(thread.id)) continue;
         const detail = await this.codex.readThread(thread.id, true).catch((error) => {
           this.logger.warn("codex-only completion thread read failed", { threadId: thread.id, error: String(error) });
           return null;
         });
+        const detailThread = detail ? normalizeThreadFromDetail(thread.id, detail) : thread;
+        if (isSubAgentThread(detailThread)) continue;
+        if (binding) {
+          if (detailThread.status === "running" && binding.status !== "running") {
+            const activeTurnId = activeTurnIdFromThreadDetail(detail) ?? binding.lastTurnId;
+            this.repo.updateBindingStatus(binding.id, "running", activeTurnId);
+            this.repo.insertEvent({
+              sessionBindingId: binding.id,
+              codexThreadId: binding.codexThreadId,
+              codexTurnId: activeTurnId,
+              eventType: "session.reconciled_active_turn",
+              eventPayload: {
+                previousStatus: binding.status,
+                currentStatus: "running",
+                source: "codex_only_completion_scan"
+              }
+            });
+            await this.updateTaskCard(binding.id);
+          }
+          continue;
+        }
+        if (detailThread.status === "running") continue;
         const state = normalizeThreadCompletionState(thread, detail);
         if (!state || !isRecentCodexOnlyCompletion(state.updatedAt, this.config.bridge.codexOnlyCompletionLookbackMs)) {
           continue;
         }
-        const detailThread = detail ? normalizeThreadFromDetail(thread.id, detail) : thread;
         const threadCwd = detailThread.cwd ?? thread.cwd;
         const threadTitle = detailThread.title ?? detailThread.preview ?? thread.title ?? thread.preview ?? thread.id;
         const project = this.repo.findProjectForPath(threadCwd);
@@ -295,12 +332,75 @@ export class TaskService {
 
   async reconcilePersistedBindings(): Promise<void> {
     for (const binding of this.repo.listBindings(this.config.bridge.threadListLimit)) {
-      if (binding.status === "waiting_for_prompt" || binding.codexThreadId.startsWith("draft_") || binding.codexThreadId.startsWith("pending_desktop_")) {
+      if (binding.status === "waiting_for_prompt" || binding.codexThreadId.startsWith("draft_")) {
         continue;
       }
       try {
         const detail = await this.readThreadForReconcile(binding);
         const thread = normalizeThreadFromDetail(binding.codexThreadId, detail);
+        if (thread.status === "running" && binding.status !== "running") {
+          const activeTurnId = activeTurnIdFromThreadDetail(detail) ?? binding.lastTurnId;
+          this.repo.updateBindingStatus(binding.id, "running", activeTurnId);
+          this.repo.insertEvent({
+            sessionBindingId: binding.id,
+            codexThreadId: binding.codexThreadId,
+            codexTurnId: activeTurnId,
+            eventType: "session.reconciled_active_turn",
+            eventPayload: {
+              previousStatus: binding.status,
+              currentStatus: "running",
+              source: "persisted_binding_reconcile"
+            }
+          });
+          await this.updateTaskCard(binding.id);
+          continue;
+        }
+        const latestTerminalTurn = latestTerminalTurnFromThreadDetail(detail);
+        if (latestTerminalTurn && latestTerminalTurn.status !== binding.status) {
+          const turnId = latestTerminalTurn.id;
+          const summaryText =
+            latestTerminalTurn.status === "completed"
+              ? latestTerminalTurn.report?.finalResult
+                ? truncatePlain(singleLine(latestTerminalTurn.report.finalResult), 90)
+                : "已完成。需要细节时发送 /logs 查看任务记录。"
+              : formatTurnTerminalSummary(latestTerminalTurn.status, latestTerminalTurn.raw);
+          const eventType = latestTerminalTurn.status === "completed" ? "task.completed" : `task.${latestTerminalTurn.status}`;
+          const existingTerminalEvent = this.repo
+            .listEventsForBinding(binding.id, 200)
+            .some((event) => event.eventType === eventType && event.codexTurnId === turnId);
+          this.repo.updateBindingStatus(binding.id, latestTerminalTurn.status, turnId);
+          if (!existingTerminalEvent) {
+            this.repo.insertEvent({
+              sessionBindingId: binding.id,
+              codexThreadId: binding.codexThreadId,
+              codexTurnId: turnId,
+              eventType,
+              eventPayload: {
+                text: summaryText,
+                reasoningSummary: latestTerminalTurn.report?.reasoningSummary ?? null,
+                finalResult: latestTerminalTurn.report?.finalResult ?? null,
+                workspaceCheckpointId: null,
+                subAgents: [],
+                turn: latestTerminalTurn.raw,
+                source: "persisted_binding_reconcile"
+              }
+            });
+          }
+          this.repo.insertEvent({
+            sessionBindingId: binding.id,
+            codexThreadId: binding.codexThreadId,
+            codexTurnId: turnId,
+            eventType: "session.reconciled_terminal_turn",
+            eventPayload: {
+              previousStatus: binding.status,
+              currentStatus: latestTerminalTurn.status,
+              turnId
+            }
+          });
+          await this.updateTaskTitle(binding.id, latestTerminalTurn.status, binding.title ?? "Codex 任务");
+          await this.updateTaskCard(binding.id);
+          continue;
+        }
         const historyStatus = this.latestStateFromHistory(binding.id);
         if (thread.status === "idle" && historyStatus && isTerminalStatus(historyStatus)) {
           if (binding.status !== historyStatus) {
@@ -346,7 +446,7 @@ export class TaskService {
 
   private async readThreadForReconcile(binding: SessionBinding): Promise<Record<string, unknown>> {
     try {
-      return await this.codex.readThread(binding.codexThreadId, false);
+      return await this.codex.readThread(binding.codexThreadId, true);
     } catch (error) {
       if (!isTerminalStatus(binding.status)) throw error;
       const unarchive = (this.codex as unknown as { unarchiveThread?: (threadId: string) => Promise<Record<string, unknown>> }).unarchiveThread;
@@ -623,7 +723,10 @@ export class TaskService {
     sourceRootMessageId?: string | null;
     attachments?: FeishuMessageAttachment[];
   }): Promise<void> {
-    if (this.isDesktopIpcMode()) return this.startDesktopIpcProjectTaskFromPrompt(input);
+    const threadCreation = await this.canCreateDesktopThreadFromFeishu();
+    if (!threadCreation.ok) {
+      return this.startDesktopIpcProjectTaskFromPrompt(input, threadCreation.guidance);
+    }
     const title = summarizeTitle(input.prompt);
     const container = await this.ensureTaskContainer(
       {
@@ -646,6 +749,11 @@ export class TaskService {
       cwd: input.project.rootPath,
       model: projectModel(input.project, this.config),
       reasoningEffort: projectReasoningEffort(input.project, this.config)
+    });
+    const codexInput = await this.resolveCodexMessageInput({
+      messageId: input.sourceMessageId,
+      prompt: input.prompt,
+      attachments: input.attachments
     });
     const binding = this.repo.createOrUpdateBinding({
       projectId: input.project.id,
@@ -685,11 +793,6 @@ export class TaskService {
       turnId: null,
       note: "任务开始前"
     });
-    const codexInput = await this.resolveCodexMessageInput({
-      messageId: input.sourceMessageId,
-      prompt: input.prompt,
-      attachments: input.attachments
-    });
     const turn = await this.codex.startTurn(binding.codexThreadId, codexInput.prompt, {
       cwd: binding.cwd,
       model: resolveBindingModel(binding, input.project, this.config),
@@ -704,7 +807,15 @@ export class TaskService {
   }
 
   private async startNewTaskFromPrompt(binding: SessionBinding, message: FeishuIncomingMessage): Promise<void> {
-    if (this.isDesktopIpcMode()) return this.startDesktopIpcDraftTaskFromPrompt(binding, message);
+    const threadCreation = await this.canCreateDesktopThreadFromFeishu();
+    if (!threadCreation.ok) {
+      await this.sendTextToTarget(
+        this.targetForBinding(binding, message.chatId),
+        threadCreation.guidance ?? await this.desktopIpcCreationUnavailableGuidance()
+      );
+      await this.updateTaskCard(binding.id);
+      return;
+    }
     const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
     const thread = await this.codex.startThread({
       cwd: project?.rootPath ?? binding.cwd ?? null,
@@ -765,13 +876,8 @@ export class TaskService {
     sourceChatId: string;
     sourceRootMessageId?: string | null;
     attachments?: FeishuMessageAttachment[];
-  }): Promise<void> {
+  }, guidanceOverride?: string | null): Promise<void> {
     const title = summarizeTitle(input.prompt);
-    const codexInput = await this.resolveCodexMessageInput({
-      messageId: input.sourceMessageId,
-      prompt: input.prompt,
-      attachments: input.attachments
-    });
     const container = await this.ensureTaskContainer(
       {
         chatId: input.project.feishuChatId ?? input.sourceChatId,
@@ -789,9 +895,9 @@ export class TaskService {
         text: input.prompt
       });
     }
-    const pendingBinding = this.repo.createOrUpdateBinding({
+    const binding = this.repo.createOrUpdateBinding({
       projectId: input.project.id,
-      codexThreadId: newId("pending_desktop"),
+      codexThreadId: newId("draft"),
       feishuChatId: container.chatId,
       feishuTopicRootMessageId: container.rootMessageId,
       feishuThreadId: container.threadId,
@@ -802,169 +908,68 @@ export class TaskService {
       cwd: input.project.rootPath,
       selectedModel: projectModel(input.project, this.config),
       selectedReasoningEffort: projectReasoningEffort(input.project, this.config),
-      status: "running",
+      status: "waiting_for_prompt",
       createdByFeishuUserId: input.userId,
       createdFrom: "feishu_new_task"
     });
-    const startCheckpoint = await this.captureCheckpointForWorkspace({
-      binding: pendingBinding,
-      codexThreadId: pendingBinding.codexThreadId,
-      workspaceRoot: input.project.rootPath,
-      kind: "turn_start",
-      turnId: null,
-      note: "任务开始前"
-    });
-    let thread: CodexThreadSummary;
-    try {
-      thread = await this.codex.startThread({
-        cwd: input.project.rootPath,
-        model: projectModel(input.project, this.config),
-        reasoningEffort: projectReasoningEffort(input.project, this.config),
-        prompt: codexInput.prompt,
-        attachments: codexInput.attachments
-      });
-    } catch (error) {
-      await this.markDesktopThreadCreationFailed({
-        binding: pendingBinding,
-        title,
-        prompt: codexInput.prompt,
-        sourceMessageId: input.sourceMessageId,
-        error
-      });
-      return;
-    }
-    const turnId = latestTurnIdFromThread(thread);
-    this.repo.activateDraftBinding({
-      bindingId: pendingBinding.id,
-      codexThreadId: thread.id,
-      projectId: input.project.id,
-      title,
-      cwd: thread.cwd ?? input.project.rootPath,
-      status: "running",
-      lastTurnId: turnId
-    });
-    if (startCheckpoint && turnId) this.repo.updateWorkspaceCheckpointTurnId(startCheckpoint.id, turnId);
-    const binding = this.repo.findBindingById(pendingBinding.id) ?? pendingBinding;
-    this.repo.upsertThreadOwnership({
-      codexThreadId: thread.id,
-      ownerKind: "feishu_bridge",
-      ownerClientId: this.config.machine.id,
-      confidence: "high"
-    });
-    this.repo.insertEvent({
-      sessionBindingId: binding.id,
-      codexThreadId: thread.id,
-      codexTurnId: turnId,
-      eventType: "task.created_from_feishu",
-      eventPayload: { text: input.prompt, desktopIpc: true, attachments: describeFeishuAttachments(codexInput.feishuAttachments) },
-      feishuMessageId: input.sourceMessageId
-    });
-    await this.updateTaskTitle(binding.id, "running", title);
-    await this.updateTaskCard(binding.id);
-  }
-
-  private async startDesktopIpcDraftTaskFromPrompt(binding: SessionBinding, message: FeishuIncomingMessage): Promise<void> {
-    const project = binding.projectId ? this.repo.getProject(binding.projectId) : null;
-    const title = summarizeTitle(message.text);
-    const cwd = project?.rootPath ?? binding.cwd ?? null;
-    const startCheckpoint = await this.captureCheckpoint(binding.id, "turn_start", null, "任务开始前");
-    const codexInput = await this.resolveCodexMessageInput({
-      messageId: message.messageId,
-      prompt: message.text,
-      attachments: message.attachments
-    });
-    let thread: CodexThreadSummary;
-    try {
-      thread = await this.codex.startThread({
-        cwd,
-        model: projectModel(project, this.config),
-        reasoningEffort: projectReasoningEffort(project, this.config),
-        prompt: codexInput.prompt,
-        attachments: codexInput.attachments
-      });
-    } catch (error) {
-      await this.markDesktopThreadCreationFailed({
-        binding,
-        title,
-        prompt: codexInput.prompt,
-        sourceMessageId: message.messageId,
-        error
-      });
-      return;
-    }
-    const turnId = latestTurnIdFromThread(thread);
-    this.repo.activateDraftBinding({
-      bindingId: binding.id,
-      codexThreadId: thread.id,
-      projectId: project?.id ?? null,
-      title,
-      cwd: thread.cwd ?? cwd,
-      status: "running",
-      lastTurnId: turnId
-    });
-    if (startCheckpoint && turnId) this.repo.updateWorkspaceCheckpointTurnId(startCheckpoint.id, turnId);
-    this.repo.upsertThreadOwnership({
-      codexThreadId: thread.id,
-      ownerKind: "feishu_bridge",
-      ownerClientId: this.config.machine.id,
-      confidence: "high"
-    });
-    this.repo.updateBindingSettings({
-      bindingId: binding.id,
-      selectedModel: binding.selectedModel ?? projectModel(project, this.config),
-      selectedReasoningEffort: binding.selectedReasoningEffort ?? projectReasoningEffort(project, this.config)
-    });
-    this.repo.insertEvent({
-      sessionBindingId: binding.id,
-      codexThreadId: thread.id,
-      codexTurnId: turnId,
-      eventType: "task.created_from_feishu",
-      eventPayload: { text: message.text, fromDraft: true, desktopIpc: true, attachments: describeFeishuAttachments(codexInput.feishuAttachments) },
-      feishuMessageId: message.messageId
-    });
-    this.repo.updateBindingStatus(binding.id, "running", turnId);
-    await this.updateTaskTitle(binding.id, "running", title);
-    await this.updateTaskCard(binding.id);
-  }
-
-  private async markDesktopThreadCreationFailed(input: {
-    binding: SessionBinding;
-    title: string;
-    prompt: string;
-    sourceMessageId: string;
-    error: unknown;
-  }): Promise<void> {
-    const errorText = input.error instanceof Error ? input.error.message : String(input.error);
-    this.repo.updateBindingStatus(input.binding.id, "failed", null);
-    const binding = this.repo.findBindingById(input.binding.id) ?? input.binding;
     this.repo.insertEvent({
       sessionBindingId: binding.id,
       codexThreadId: binding.codexThreadId,
-      eventType: "task.failed",
+      eventType: "task.desktop_thread_creation_unavailable",
       eventPayload: {
-        text: [
-          "创建普通 Codex Desktop thread 失败。",
-          "飞书桥接没有启动独立 runtime，也没有绑定到其它 Desktop thread。",
-          `错误：${errorText}`
+        text: guidanceOverride ?? [
+          "当前运行态只能接管已有 Desktop 线程。",
+          "本次需求没有自动创建新对话，也没有发送到 Codex Desktop。",
+          "如需继续，请先发送 /tasks 接管已有线程，再把需求补发到对应任务会话。"
         ].join("\n"),
         prompt: input.prompt,
-        desktopIpc: true
+        desktopIpc: this.codex.connectionKind === "desktop_ipc",
+        desktopProxy: this.codex.connectionKind === "desktop_proxy",
+        attachments: describeFeishuAttachments(input.attachments)
       },
       feishuMessageId: input.sourceMessageId
     });
-    await this.updateTaskTitle(binding.id, "failed", input.title);
+    await this.updateTaskTitle(binding.id, "waiting_for_prompt", title);
     await this.updateTaskCard(binding.id);
     await this.sendTextToTarget(
-      this.targetForBinding(binding, binding.feishuChatId),
+      this.targetForBinding(binding, container.chatId),
       [
-        "创建普通 Codex Desktop thread 失败，已标记为失败任务。",
-        "没有启动独立 runtime，也没有绑定到其它 Desktop thread。",
-        `错误：${truncatePlain(errorText, 500)}`
+        "当前不能从飞书直接新建新对话。",
+        guidanceOverride ?? await this.desktopIpcCreationUnavailableGuidance(),
+        "这条需求已保留在飞书草稿会话里，但还没有发给任何 Desktop 线程。"
       ].join("\n")
     );
   }
 
   private async continueBindingFromFeishu(binding: SessionBinding, message: FeishuIncomingMessage): Promise<void> {
+    if (binding.codexThreadId.startsWith("pending_desktop_")) {
+      this.repo.resetBindingToWaitingForPrompt({
+        bindingId: binding.id,
+        codexThreadId: newId("draft"),
+        projectId: binding.projectId,
+        title: binding.title,
+        cwd: binding.cwd,
+        lastTurnId: null
+      });
+      const repaired = this.repo.findBindingById(binding.id) ?? binding;
+      this.repo.insertEvent({
+        sessionBindingId: repaired.id,
+        codexThreadId: repaired.codexThreadId,
+        eventType: "task.desktop_placeholder_recovered",
+        eventPayload: {
+          previousThreadId: binding.codexThreadId,
+          reason: "legacy_pending_desktop_binding_recovered"
+        },
+        feishuMessageId: message.messageId
+      });
+      await this.updateTaskTitle(repaired.id, "waiting_for_prompt", repaired.title ?? "新任务");
+      await this.updateTaskCard(repaired.id);
+      await this.sendTextToTarget(
+        this.targetForBinding(repaired, message.chatId),
+        "检测到旧的无效 Desktop 占位任务，已自动恢复为可重试草稿。请重新发送需求。"
+      );
+      return;
+    }
     const codexInput = await this.resolveCodexMessageInput({
       messageId: message.messageId,
       prompt: message.text,
@@ -2305,11 +2310,14 @@ export class TaskService {
   }
 
   private async sendTextToTarget(target: FeishuReplyTarget, text: string): Promise<void> {
-    if (target.threadId) {
-      await this.feishu.replyTextInThread(target.rootMessageId ?? target.threadId, text);
-      return;
+    const chunks = splitFeishuText(text, this.config.bridge.maxFeishuTextLength);
+    for (const chunk of chunks) {
+      if (target.threadId) {
+        await this.feishu.replyTextInThread(target.rootMessageId ?? target.threadId, chunk);
+        continue;
+      }
+      await this.feishu.sendText(target.chatId, chunk, target.rootMessageId);
     }
-    await this.feishu.sendText(target.chatId, text, target.rootMessageId);
   }
 
   private async sendCardToTarget(target: FeishuReplyTarget, card: ReturnType<CardRenderer["taskStatusCard"]>): Promise<SentMessage> {
@@ -2547,9 +2555,28 @@ export class TaskService {
       const turnId = asString(turn.id);
       if (!turnId) throw new Error("turn/completed notification missing turn.id");
       const status = normalizeTurnStatus(turn.status);
+      const detail = await this.codex.readThread(threadId, true).catch(() => null);
+      const activeTurnId = activeTurnIdFromThreadDetail(detail);
+      if (isTerminalStatus(status) && activeTurnId && activeTurnId !== turnId) {
+        this.repo.updateBindingStatus(binding.id, "running", activeTurnId);
+        this.repo.insertEvent({
+          sessionBindingId: binding.id,
+          codexThreadId: threadId,
+          codexTurnId: turnId,
+          eventType: "turn.terminal_ignored_due_to_active_turn",
+          eventPayload: {
+            ignoredStatus: status,
+            ignoredTurnId: turnId,
+            activeTurnId,
+            turn
+          }
+        });
+        await this.updateTaskTitle(binding.id, "running", binding.title ?? "Codex 任务");
+        await this.updateTaskCard(binding.id);
+        return;
+      }
       this.repo.updateBindingStatus(binding.id, status, turnId);
       const endCheckpoint = await this.captureCheckpoint(binding.id, "turn_end", turnId, `任务${taskStatusText(status)}`);
-      const detail = await this.codex.readThread(threadId, true).catch(() => null);
       const report =
         status === "completed"
           ? mergeThreadReports(
@@ -2578,7 +2605,7 @@ export class TaskService {
           ? finalResult
             ? truncatePlain(singleLine(finalResult), 90)
             : "已完成。需要细节时发送 /logs 查看任务记录。"
-          : `任务状态：${taskStatusText(status)}。发送 /logs 查看任务记录。`;
+          : formatTurnTerminalSummary(status, turn);
       const event = this.repo.insertEvent({
         sessionBindingId: binding.id,
         codexThreadId: threadId,
@@ -2861,7 +2888,7 @@ export class TaskService {
     delta: string,
     options: { force?: boolean; replace?: boolean } = {}
   ): void {
-    if (!delta.trim() || looksLikeCommandLine(delta.trim())) return;
+    if (!delta.trim()) return;
     const key = `${binding.id}:${turnId ?? "no-turn"}:${itemId ?? label}:${label}`;
     const current = this.progressState.get(key) ?? { text: "", lastSentLength: 0, lastSentAt: 0 };
     const nextText = options.replace ? delta.trim() : `${current.text}${delta}`.trim();
@@ -3115,6 +3142,136 @@ export class TaskService {
 
   private isDesktopIpcMode(): boolean {
     return this.config.codex.connectionMode === "desktop_ipc" || this.codex.connectionKind === "desktop_ipc";
+  }
+
+  private async canCreateDesktopThreadFromFeishu(): Promise<{
+    ok: boolean;
+    guidance: string | null;
+    readiness: CodexExecutionReadiness | null;
+  }> {
+    if (this.config.codex.connectionMode === "desktop_proxy") {
+      try {
+        await this.codex.start();
+      } catch (error) {
+        this.diagnostics.recordError(error);
+        return { ok: false, guidance: null, readiness: null };
+      }
+      if (this.codex.connectionKind !== "desktop_proxy") {
+        return { ok: false, guidance: null, readiness: null };
+      }
+      const readiness = await this.codex.getExecutionReadiness().catch((error) => {
+        this.diagnostics.recordError(error);
+        return null;
+      });
+      if (!readiness) {
+        return { ok: false, guidance: null, readiness: null };
+      }
+      if (!readiness.usable) {
+        const guidance = this.desktopProxyExecutionUnavailableGuidance(readiness);
+        this.diagnostics.recordError(new Error(guidance));
+        return { ok: false, guidance, readiness };
+      }
+      return { ok: true, guidance: null, readiness };
+    }
+    if (this.config.codex.connectionMode === "desktop_ipc") {
+      const capabilities = detectDesktopIpcCapabilities();
+      return { ok: Boolean(capabilities?.supportsHostThreadCreation), guidance: null, readiness: null };
+    }
+    if (this.codex.connectionKind === "desktop_proxy") {
+      const readiness = await this.codex.getExecutionReadiness().catch((error) => {
+        this.diagnostics.recordError(error);
+        return null;
+      });
+      if (!readiness) return { ok: false, guidance: null, readiness: null };
+      if (!readiness.usable) {
+        const guidance = this.desktopProxyExecutionUnavailableGuidance(readiness);
+        this.diagnostics.recordError(new Error(guidance));
+        return { ok: false, guidance, readiness };
+      }
+      return { ok: true, guidance: null, readiness };
+    }
+    if (this.codex.connectionKind === "desktop_ipc") {
+      const capabilities = detectDesktopIpcCapabilities();
+      return { ok: Boolean(capabilities?.supportsHostThreadCreation), guidance: null, readiness: null };
+    }
+    try {
+      await this.codex.start();
+    } catch (error) {
+      this.diagnostics.recordError(error);
+      return { ok: false, guidance: null, readiness: null };
+    }
+    const resolvedConnectionKind: string = this.codex.connectionKind;
+    if (resolvedConnectionKind === "desktop_proxy") {
+      const readiness = await this.codex.getExecutionReadiness().catch((error) => {
+        this.diagnostics.recordError(error);
+        return null;
+      });
+      if (!readiness) return { ok: false, guidance: null, readiness: null };
+      if (!readiness.usable) {
+        const guidance = this.desktopProxyExecutionUnavailableGuidance(readiness);
+        this.diagnostics.recordError(new Error(guidance));
+        return { ok: false, guidance, readiness };
+      }
+      return { ok: true, guidance: null, readiness };
+    }
+    if (resolvedConnectionKind === "desktop_ipc") {
+      const capabilities = detectDesktopIpcCapabilities();
+      return { ok: Boolean(capabilities?.supportsHostThreadCreation), guidance: null, readiness: null };
+    }
+    return { ok: false, guidance: null, readiness: null };
+  }
+
+  private async desktopIpcCreationUnavailableGuidance(): Promise<string> {
+    const capabilities = detectDesktopIpcCapabilities();
+    const followerOnly =
+      capabilities?.supportsFollowerControl === true &&
+      capabilities.supportsHostThreadCreation === false &&
+      capabilities.supportsThreadGoal === false &&
+      capabilities.supportsThreadTitle === false &&
+      capabilities.supportsArchiveControl === false;
+    if (this.config.codex.connectionMode === "desktop_proxy") {
+      return [
+        "当前不能从飞书直接新建真实 Desktop 线程。",
+        "当前配置要求走官方 desktop_proxy 主线；这里的 desktop_proxy 只是兼容模式名，bridge 实际底层使用的是 direct `codex app-server` stdio。",
+        "这次没有成功连上 `codex app-server`，所以新线程没有创建出来。",
+        "请先检查 `codex --version`、`codex app-server` 是否能在本机直接启动，以及 bridge 日志里的具体报错。",
+        "在 direct app-server 恢复前，当前只能先发送 /tasks 接管电脑里已有线程。"
+      ].join("\n");
+    }
+    if (this.config.codex.connectionMode === "desktop_auto") {
+      return [
+        followerOnly
+          ? "当前自动模式已经回退到 Desktop IPC，而且当前安装的 stock Codex Desktop 只暴露了 thread-follower IPC handler，没有暴露官方新线程 host handler。"
+          : "当前自动模式已经回退到 Desktop IPC，但这台普通 Codex Desktop 运行态仍没有可用的官方新线程 handler。",
+        "当前从飞书接管已打开线程可用，但直接新建对话不可用。desktop_auto 还没有回到官方 app-server 主线。",
+        "可以先发送 /tasks 接管电脑里已经存在的任务；如果一定要从飞书新建对话，必须让 desktop_auto 恢复到官方 app-server 主线。"
+      ].join("\n");
+    }
+    return [
+      followerOnly
+        ? "当前安装的 stock Codex Desktop 只暴露了 thread-follower IPC handler，没有暴露官方新线程 host handler。"
+        : "当前普通 Codex Desktop 运行态没有可用的官方新线程 handler。",
+      "也就是说现在可以接管电脑里已有的线程，但不能从飞书直接新建新对话。",
+      "可以先发送 /tasks 接管已有任务；如果一定要从飞书新建对话，需要切回可用的官方 desktop_proxy 主线。"
+    ].join("\n");
+  }
+
+  private desktopProxyExecutionUnavailableGuidance(readiness: CodexExecutionReadiness): string {
+    const authSummary = [
+      readiness.authMethod ? `authMethod=${readiness.authMethod}` : null,
+      readiness.accountType ? `accountType=${readiness.accountType}` : null,
+      readiness.accountEmail ? `account=${readiness.accountEmail}` : null,
+      readiness.requiresOpenaiAuth === true ? "requiresOpenaiAuth=true" : null
+    ].filter(Boolean).join(", ");
+    return [
+      "当前不能从飞书直接新建真实 Desktop 线程。",
+      "当前配置要求走 desktop_proxy 主线，但这里的 desktop_proxy 只是兼容模式名，bridge 实际底层是 direct `codex app-server` stdio。",
+      "这次 direct app-server 虽然能启动，但当前运行态还不能真正执行首轮请求，所以如果继续创建线程会在第一轮直接失败。",
+      readiness.reason ?? "当前 app-server 认证状态不足以执行首轮请求。",
+      authSummary ? `运行态信息：${authSummary}` : null,
+      "这条需求会先保留在飞书草稿会话里，不会再创建一个立刻 401 失败的假成功线程。",
+      "可以先发送 /tasks 接管已有线程；如果要恢复飞书直接新建任务，先修复当前 Codex app-server 的认证可用性。"
+    ].filter(Boolean).join("\n");
   }
 
   private async captureCheckpoint(
@@ -3440,6 +3597,7 @@ const normalizeTurnStatus = (status: unknown): TaskStatus => {
   if (status === "completed") return "completed";
   if (status === "interrupted" || status === "cancelled") return "interrupted";
   if (status === "failed") return "failed";
+  if (status === "running" || status === "active" || status === "inProgress" || status === "in_progress") return "running";
   return "idle";
 };
 
@@ -3540,12 +3698,70 @@ const taskStatusText = (status: TaskStatus): string =>
     archived: "已归档"
   })[status] ?? status;
 
+const formatTurnTerminalSummary = (status: TaskStatus, turn: Record<string, unknown>): string => {
+  const errorSummary = extractTurnErrorSummary(turn);
+  if (errorSummary) return `任务状态：${taskStatusText(status)}。原因：${truncatePlain(singleLine(errorSummary), 180)}。发送 /logs 查看任务记录。`;
+  return `任务状态：${taskStatusText(status)}。发送 /logs 查看任务记录。`;
+};
+
+const extractTurnErrorSummary = (turn: Record<string, unknown>): string | null => {
+  for (const key of ["error", "lastError", "failure", "failureReason", "message"]) {
+    const summary = extractErrorLikeText(turn[key]);
+    if (summary) return summary;
+  }
+  return null;
+};
+
+const extractErrorLikeText = (value: unknown): string | null => {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const object = value as Record<string, unknown>;
+  for (const key of ["message", "reason", "error", "details", "detail", "body"]) {
+    const nested = extractErrorLikeText(object[key]);
+    if (nested) return nested;
+  }
+  return null;
+};
+
 const truncate = (text: string, max: number): string => (text.length > max ? `${text.slice(0, max - 20)}\n...(已截断)` : text);
 
 const truncatePlain = (text: string, max: number): string => {
   const compact = text.replace(/\s+/g, " ").trim();
   if (compact.length <= max) return compact;
   return `${compact.slice(0, Math.max(1, max - 3)).trimEnd()}...`;
+};
+
+const splitFeishuText = (text: string, maxLength: number): string[] => {
+  const limit = Math.max(500, maxLength);
+  if (text.length <= limit) return [text];
+  const bodyLimit = Math.max(400, limit - 24);
+  const chunks: string[] = [];
+  let offset = 0;
+  while (offset < text.length) {
+    const remaining = text.slice(offset);
+    if (remaining.length <= bodyLimit) {
+      chunks.push(remaining);
+      break;
+    }
+    const boundary = bestTextBoundary(remaining, bodyLimit);
+    chunks.push(remaining.slice(0, boundary).trimEnd());
+    offset += boundary;
+    while (text[offset] === "\n") offset += 1;
+  }
+  if (chunks.length <= 1) return chunks;
+  return chunks.map((chunk, index) => `(${index + 1}/${chunks.length})\n${chunk}`);
+};
+
+const bestTextBoundary = (text: string, limit: number): number => {
+  const candidates = [
+    text.lastIndexOf("\n\n", limit),
+    text.lastIndexOf("\n", limit),
+    text.lastIndexOf("。", limit),
+    text.lastIndexOf("；", limit),
+    text.lastIndexOf(". ", limit)
+  ].filter((index) => index >= Math.floor(limit * 0.55));
+  if (candidates.length > 0) return Math.max(...candidates) + 1;
+  return limit;
 };
 
 type PresentedServerRequest = {
@@ -3666,18 +3882,40 @@ const stableSummaryKey = (text: string | null): string => {
 
 const normalizeThreadFromDetail = (threadId: string, detail: Record<string, unknown>): CodexThreadSummary => {
   const rawThread = detail.thread && typeof detail.thread === "object" ? (detail.thread as Record<string, unknown>) : detail;
+  const hasActiveTurn = Boolean(activeTurnIdFromThreadDetail(detail));
+  const rawStatus = rawThread.status && typeof rawThread.status === "object" ? (rawThread.status as { type?: unknown }).type : null;
   return {
     id: String(rawThread.id ?? threadId),
     title: asString(rawThread.name),
     preview: asString(rawThread.preview),
     cwd: asString(rawThread.cwd),
-    status: rawThread.status && typeof rawThread.status === "object" && (rawThread.status as { type?: unknown }).type === "active" ? "running" : "idle",
+    status: rawStatus === "active" || hasActiveTurn ? "running" : "idle",
     updatedAt: typeof rawThread.updatedAt === "number" ? rawThread.updatedAt : null,
     source: rawThread.source ?? null,
     agentNickname: asString(rawThread.agentNickname),
     agentRole: asString(rawThread.agentRole),
     raw: rawThread
   };
+};
+
+const isActiveCodexTurnStatus = (status: unknown): boolean =>
+  status === "running" || status === "active" || status === "inProgress" || status === "in_progress";
+
+const isSubAgentThread = (thread: Pick<CodexThreadSummary, "source" | "agentNickname" | "agentRole">): boolean => {
+  if (thread.agentNickname || thread.agentRole) return true;
+  return isSubAgentSource(thread.source);
+};
+
+const isSubAgentSource = (source: unknown): boolean => {
+  if (typeof source === "string") {
+    const normalized = source.toLowerCase();
+    return normalized.startsWith("subagent") || normalized.startsWith("sub_agent");
+  }
+  if (!source || typeof source !== "object" || Array.isArray(source)) return false;
+  const object = source as Record<string, unknown>;
+  if ("subAgent" in object || "subagent" in object) return true;
+  const kind = asString(object.kind) ?? asString(object.type);
+  return kind ? isSubAgentSource(kind) : false;
 };
 
 type CodexOnlyCompletionState = {
@@ -3687,32 +3925,56 @@ type CodexOnlyCompletionState = {
   report: ThreadReport | null;
 };
 
+type LatestTerminalTurn = {
+  id: string;
+  status: "completed" | "failed" | "interrupted";
+  updatedAt: number | null;
+  report: ThreadReport | null;
+  raw: Record<string, unknown>;
+};
+
 const normalizeThreadCompletionState = (
   summary: CodexThreadSummary,
   detail: Record<string, unknown> | null
 ): CodexOnlyCompletionState | null => {
-  const rawThread = detail && detail.thread && typeof detail.thread === "object"
-    ? (detail.thread as Record<string, unknown>)
-    : detail;
-  const turns = rawThread && typeof rawThread === "object" && Array.isArray(rawThread.turns) ? rawThread.turns : [];
-  for (let index = turns.length - 1; index >= 0; index -= 1) {
-    const turn = turns[index];
-    if (!turn || typeof turn !== "object") continue;
-    const object = turn as Record<string, unknown>;
-    const status = normalizeCodexOnlyTurnStatus(object.status);
-    if (!status) continue;
-    const turnId = asString(object.id) ?? `turn_${index}`;
+  const latestTerminalTurn = latestTerminalTurnFromThreadDetail(detail);
+  if (latestTerminalTurn) {
     return {
-      status,
-      turnId,
-      updatedAt: numberTimestamp(object.completedAt) ?? numberTimestamp(object.updatedAt) ?? numberTimestamp(rawThread?.updatedAt) ?? summary.updatedAt,
-      report: mergeThreadReports(detail ? extractThreadReport(detail) : null, extractTurnReport(object))
+      status: latestTerminalTurn.status,
+      turnId: latestTerminalTurn.id,
+      updatedAt: latestTerminalTurn.updatedAt ?? summary.updatedAt,
+      report: latestTerminalTurn.report
     };
   }
   return null;
 };
 
-const normalizeCodexOnlyTurnStatus = (status: unknown): "completed" | "failed" | "interrupted" | null => {
+const latestTerminalTurnFromThreadDetail = (detail: Record<string, unknown> | null): LatestTerminalTurn | null => {
+  const rawThread = detail && detail.thread && typeof detail.thread === "object"
+    ? (detail.thread as Record<string, unknown>)
+    : detail;
+  if (!rawThread || typeof rawThread !== "object") return null;
+  const turns = rawThread && typeof rawThread === "object" && Array.isArray(rawThread.turns) ? rawThread.turns : [];
+  for (let index = turns.length - 1; index >= 0; index -= 1) {
+    const turn = turns[index];
+    if (!turn || typeof turn !== "object") continue;
+    const object = turn as Record<string, unknown>;
+    if (isActiveCodexTurnStatus(object.status)) return null;
+    const status = normalizeCodexOnlyTurnStatus(object.status);
+    if (!status) continue;
+    const turnId = asString(object.id) ?? asString(object.turnId) ?? `turn_${index}`;
+    return {
+      status,
+      id: turnId,
+      updatedAt: numberTimestamp(object.completedAt) ?? numberTimestamp(object.updatedAt) ?? numberTimestamp(rawThread.updatedAt),
+      report: mergeThreadReports(detail ? extractThreadReport(detail) : null, extractTurnReport(object)),
+      raw: object
+    };
+  }
+  return null;
+};
+
+const normalizeCodexOnlyTurnStatus = (status: unknown): LatestTerminalTurn["status"] | null => {
   if (status === "completed") return "completed";
   if (status === "failed") return "failed";
   if (status === "interrupted" || status === "cancelled") return "interrupted";
@@ -4419,11 +4681,10 @@ const extractTextFromUnknown = (value: unknown): string | null => {
 };
 
 const sanitizeAssistantSummary = (text: string, maxLength = 6000): string => {
-  const withoutCodeBlocks = text.replace(/```[\s\S]*?```/g, "[代码块已省略]");
-  const compact = withoutCodeBlocks
+  const compact = text
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .filter((line) => line && !looksLikeSummaryNoiseLine(line))
+    .filter(Boolean)
     .join(" ")
     .replace(/\s+/g, " ")
     .trim();
@@ -4432,18 +4693,11 @@ const sanitizeAssistantSummary = (text: string, maxLength = 6000): string => {
 
 // Preserve Codex-style Markdown for Feishu report cards while removing noisy shell-only lines.
 const sanitizeAssistantMarkdown = (text: string, maxLength = 6000): string => {
-  const withoutCodeBlocks = text.replace(/```[\s\S]*?```/g, "\n[代码块已省略]\n");
-  const lines = withoutCodeBlocks
+  const lines = text
     .replace(/\r\n?/g, "\n")
     .split("\n")
     .map((line) => line.replace(/[ \t]+$/g, ""));
-  const filtered: string[] = [];
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (trimmed && looksLikeCommandLine(trimmed)) continue;
-    filtered.push(line);
-  }
-  const normalized = filtered
+  const normalized = lines
     .join("\n")
     .replace(/\n{4,}/g, "\n\n\n")
     .trim();
@@ -4451,12 +4705,6 @@ const sanitizeAssistantMarkdown = (text: string, maxLength = 6000): string => {
 };
 
 const singleLine = (text: string): string => text.replace(/\s+/g, " ").trim();
-
-const looksLikeCommandLine = (line: string): boolean =>
-  /^\s*(?:PS\s+[^>]+>\s*|[$>]\s*)?(?:powershell|pwsh|cmd\.exe|node|npm|pnpm|yarn|python|git|rg|Get-Content|Get-ChildItem|Select-String)(?:\s|$)/i.test(line);
-
-const looksLikeSummaryNoiseLine = (line: string): boolean =>
-  looksLikeCommandLine(line) || line.length > 180;
 
 const formatPlanProgress = (value: unknown): string | null => {
   if (!Array.isArray(value)) return null;

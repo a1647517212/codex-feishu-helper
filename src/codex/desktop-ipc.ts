@@ -233,34 +233,92 @@ export class DesktopIpcClient extends EventEmitter<DesktopIpcClientEvents> {
     const beforeIds = new Set(this.conversations.keys());
     const startedAt = Date.now();
     const hostId = this.currentHostId();
-    await this.hostRequest(
-      "start-conversation",
-      buildStartConversationRequest({
-        hostId,
-        prompt,
-        attachments: options.attachments ?? [],
-        cwd: options.cwd ?? null,
-        model: options.model ?? null,
-        reasoningEffort: options.reasoningEffort ?? null,
-        approvalPolicy: options.approvalPolicy,
-        sandboxMode: options.sandboxMode,
-        serviceName: options.serviceName
-      }),
-      180000
-    );
-    const snapshot = await this.waitForNewConversationSnapshot({
-      beforeIds,
+    const requestBase = {
       prompt,
+      attachments: options.attachments ?? [],
       cwd: options.cwd ?? null,
-      startedAt,
-      timeoutMs: this.options.creationSnapshotWaitMs ?? 120000
-    });
-    await this.setThreadGoal(snapshot.conversationId, prompt).catch((error) => {
-      this.logger.warn("failed to set desktop thread goal after creation", {
-        conversationId: snapshot.conversationId,
-        error: String(error)
+      model: options.model ?? null,
+      reasoningEffort: options.reasoningEffort ?? null,
+      approvalPolicy: options.approvalPolicy,
+      sandboxMode: options.sandboxMode,
+      serviceName: options.serviceName
+    };
+    let snapshot: DesktopConversationSnapshot | null = null;
+    try {
+      await this.hostRequest(
+        "start-conversation",
+        buildStartConversationRequest({
+          hostId,
+          ...requestBase
+        }),
+        180000
+      );
+      snapshot = await this.waitForNewConversationSnapshot({
+        beforeIds,
+        prompt,
+        cwd: options.cwd ?? null,
+        startedAt,
+        timeoutMs: this.options.creationSnapshotWaitMs ?? 120000
       });
-    });
+    } catch (error) {
+      const matchedSnapshot = this.findNewConversationSnapshot({
+        beforeIds,
+        prompt,
+        cwd: options.cwd ?? null,
+        startedAt
+      });
+      if (matchedSnapshot) {
+        snapshot = matchedSnapshot;
+      } else if (isNoClientFoundError(error) && hostId) {
+        this.logger.warn("desktop ipc start-conversation failed for remembered host, retrying without hostId", {
+          hostId,
+          error: String(error)
+        });
+        try {
+          await this.hostRequest(
+            "start-conversation",
+            buildStartConversationRequest({
+              hostId: null,
+              ...requestBase
+            }),
+            180000
+          );
+          snapshot = await this.waitForNewConversationSnapshot({
+            beforeIds,
+            prompt,
+            cwd: options.cwd ?? null,
+            startedAt,
+            timeoutMs: this.options.creationSnapshotWaitMs ?? 120000
+          });
+        } catch (retryError) {
+          snapshot = this.findNewConversationSnapshot({
+            beforeIds,
+            prompt,
+            cwd: options.cwd ?? null,
+            startedAt
+          });
+          if (!snapshot && isExplicitThreadCreationFailure(retryError)) {
+            snapshot = await this.tryThreadStartFallback({
+              ...requestBase,
+              beforeIds,
+              startedAt
+            });
+          }
+          if (!snapshot) throw retryError;
+        }
+      } else if (isExplicitThreadCreationFailure(error)) {
+        snapshot = await this.tryThreadStartFallback({
+          ...requestBase,
+          beforeIds,
+          startedAt
+        });
+      } else {
+        throw error;
+      }
+    }
+    if (!snapshot) {
+      throw new Error("Desktop IPC did not return a usable thread snapshot for the new conversation.");
+    }
     const title = deriveThreadTitle(prompt);
     if (title) {
       await this.setThreadName(snapshot.conversationId, title).catch((error) => {
@@ -679,7 +737,7 @@ export class DesktopIpcClient extends EventEmitter<DesktopIpcClientEvents> {
   }
 
   private syntheticNotificationsFromSnapshot(snapshot: DesktopConversationSnapshot): Record<string, unknown>[] {
-    const latestTurn = latestTurnFromConversation(snapshot.state);
+    const latestTurn = activeTurnFromConversation(snapshot.state) ?? latestTurnFromConversation(snapshot.state);
     if (!latestTurn) return [];
     const turnId = typeof latestTurn.turnId === "string" ? latestTurn.turnId : null;
     if (!turnId) return [];
@@ -749,7 +807,14 @@ export class DesktopIpcClient extends EventEmitter<DesktopIpcClientEvents> {
     const deadline = Date.now() + input.timeoutMs;
     while (Date.now() < deadline) {
       const snapshot = this.conversations.get(input.conversationId) ?? null;
-      if (snapshot && snapshot.observedAt >= input.startedAt && conversationContainsPrompt(snapshot.state, input.prompt)) {
+      if (
+        snapshot &&
+        snapshot.observedAt >= input.startedAt &&
+        (
+          conversationContainsPromptSince(snapshot.state, input.prompt, input.startedAt) ||
+          conversationContainsPrompt(snapshot.state, input.prompt)
+        )
+      ) {
         return snapshot;
       }
       await new Promise((resolve) => setTimeout(resolve, 100));
@@ -771,9 +836,60 @@ export class DesktopIpcClient extends EventEmitter<DesktopIpcClientEvents> {
       ? candidates.filter((snapshot) => conversationMatchesCwd(snapshot.state, input.cwd!))
       : candidates;
     for (const snapshot of cwdCandidates) {
-      if (conversationContainsPrompt(snapshot.state, input.prompt) || !input.prompt) return snapshot;
+      if (!input.prompt || conversationContainsPromptSince(snapshot.state, input.prompt, input.startedAt)) {
+        return snapshot;
+      }
+      if (input.prompt && conversationContainsPrompt(snapshot.state, input.prompt)) {
+        return snapshot;
+      }
     }
     return null;
+  }
+
+  private async tryThreadStartFallback(input: {
+    prompt: string;
+    attachments: CodexLocalImageAttachment[];
+    cwd: string | null;
+    model: string | null;
+    reasoningEffort: string | null;
+    approvalPolicy: string;
+    sandboxMode: string;
+    serviceName: string;
+    beforeIds: Set<string>;
+    startedAt: number;
+  }): Promise<DesktopConversationSnapshot> {
+    this.logger.warn("desktop ipc falling back to official thread/start new-thread path", {
+      cwd: input.cwd,
+      model: input.model,
+      serviceName: input.serviceName
+    });
+    await this.hostRequest(
+      "thread/start",
+      buildThreadStartRequest({
+        cwd: input.cwd,
+        model: input.model,
+        approvalPolicy: input.approvalPolicy,
+        sandboxMode: input.sandboxMode,
+        serviceName: input.serviceName
+      }),
+      180000
+    );
+    const snapshot = await this.waitForNewConversationSnapshot({
+      beforeIds: input.beforeIds,
+      prompt: "",
+      cwd: input.cwd,
+      startedAt: input.startedAt,
+      timeoutMs: this.options.creationSnapshotWaitMs ?? 120000
+    });
+    await this.startTurn(snapshot.conversationId, input.prompt, {
+      cwd: input.cwd,
+      model: input.model,
+      reasoningEffort: input.reasoningEffort,
+      approvalPolicy: input.approvalPolicy,
+      sandboxPolicy: sandboxPolicyFromMode(input.sandboxMode),
+      attachments: input.attachments
+    });
+    return snapshot;
   }
 
   private currentHostId(): string {
@@ -845,7 +961,7 @@ const objectRecord = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" ? (value as Record<string, unknown>) : {};
 
 const buildStartConversationRequest = (input: {
-  hostId: string;
+  hostId: string | null;
   prompt: string;
   attachments: CodexLocalImageAttachment[];
   cwd: string | null;
@@ -854,32 +970,61 @@ const buildStartConversationRequest = (input: {
   approvalPolicy: string;
   sandboxMode: string;
   serviceName: string;
+}): Record<string, unknown> => {
+  const request: Record<string, unknown> = {
+    input: buildUserInput(input.prompt, input.attachments),
+    workspaceRoots: input.cwd ? [input.cwd] : [],
+    cwd: input.cwd,
+    fileAttachments: [],
+    addedFiles: [],
+    agentMode: "default",
+    model: input.model,
+    serviceTier: null,
+    reasoningEffort: input.reasoningEffort,
+    collaborationMode: {
+      mode: "default",
+      settings: {
+        model: input.model ?? "",
+        reasoning_effort: input.reasoningEffort,
+        developer_instructions: null
+      }
+    },
+    config: {
+      approvalPolicy: input.approvalPolicy,
+      sandboxMode: input.sandboxMode,
+      serviceName: input.serviceName
+    },
+    workspaceKind: "project"
+  };
+  if (input.hostId) request.hostId = input.hostId;
+  return request;
+};
+
+const buildThreadStartRequest = (input: {
+  cwd: string | null;
+  model: string | null;
+  approvalPolicy: string;
+  sandboxMode: string;
+  serviceName: string;
 }): Record<string, unknown> => ({
-  hostId: input.hostId,
-  input: buildUserInput(input.prompt, input.attachments),
-  workspaceRoots: input.cwd ? [input.cwd] : [],
   cwd: input.cwd,
-  fileAttachments: [],
-  addedFiles: [],
-  agentMode: "default",
   model: input.model,
-  serviceTier: null,
-  reasoningEffort: input.reasoningEffort,
-  collaborationMode: {
-    mode: "default",
-    settings: {
-      model: input.model ?? "",
-      reasoning_effort: input.reasoningEffort,
-      developer_instructions: null
-    }
-  },
-  config: {
-    approvalPolicy: input.approvalPolicy,
-    sandboxMode: input.sandboxMode,
-    serviceName: input.serviceName
-  },
-  workspaceKind: "project"
+  approvalPolicy: input.approvalPolicy,
+  sandbox: sandboxModeToThreadStart(input.sandboxMode),
+  serviceName: input.serviceName,
+  experimentalRawEvents: false,
+  persistExtendedHistory: true
 });
+
+const isNoClientFoundError = (error: unknown): boolean => {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.includes("no-client-found");
+};
+
+const isExplicitThreadCreationFailure = (error: unknown): boolean => {
+  const text = error instanceof Error ? error.message : String(error);
+  return text.includes("no-client-found");
+};
 
 const desktopMessageAsRecord = (message: DesktopIpcMessage): Record<string, unknown> => {
   const record = message as unknown as Record<string, unknown>;
@@ -922,6 +1067,7 @@ const conversationStatus = (state: Record<string, unknown>): ReturnType<typeof t
   const runtimeStatus = objectRecord(state.threadRuntimeStatus);
   const fromRuntime = toTaskStatus(runtimeStatus);
   if (fromRuntime !== "idle") return fromRuntime;
+  if (activeTurnFromConversation(state)) return "running";
   const turns = Array.isArray(state.turns) ? state.turns : [];
   const latest = objectRecord(turns[turns.length - 1]);
   const status = typeof latest.status === "string" ? latest.status : null;
@@ -949,6 +1095,12 @@ const sandboxPolicyFromMode = (mode: string): Record<string, unknown> => {
     excludeTmpdirEnvVar: false,
     excludeSlashTmp: false
   };
+};
+
+const sandboxModeToThreadStart = (mode: string): string => {
+  if (mode === "danger-full-access") return "danger-full-access";
+  if (mode === "read-only") return "read-only";
+  return "workspace-write";
 };
 
 const latestCwd = (state: Record<string, unknown>): string | null => {
@@ -996,6 +1148,37 @@ const conversationContainsPrompt = (state: Record<string, unknown>, prompt: stri
   return false;
 };
 
+const conversationContainsPromptSince = (state: Record<string, unknown>, prompt: string, startedAt: number): boolean => {
+  const normalizedPrompt = normalizeTextForMatch(prompt);
+  if (!normalizedPrompt) return false;
+  const turns = Array.isArray(state.turns) ? state.turns : [];
+  for (const turn of turns) {
+    const turnObject = objectRecord(turn);
+    const activityAt = turnActivityAtMs(turnObject);
+    if (activityAt == null || activityAt < startedAt) continue;
+    const params = objectRecord(turnObject.params);
+    if (inputItemsContainText(params.input, normalizedPrompt)) return true;
+    if (inputItemsContainText(turnObject.input, normalizedPrompt)) return true;
+    if (inputItemsContainText(turnObject.items, normalizedPrompt)) return true;
+  }
+  return false;
+};
+
+const conversationLooksNewSince = (state: Record<string, unknown>, startedAt: number): boolean => {
+  const turns = Array.isArray(state.turns) ? state.turns : [];
+  if (turns.length === 0) {
+    return typeof state.updatedAt === "number" && state.updatedAt >= startedAt;
+  }
+  let hasRecentTurn = false;
+  for (const turn of turns) {
+    const activityAt = turnActivityAtMs(objectRecord(turn));
+    if (activityAt == null) return false;
+    if (activityAt < startedAt) return false;
+    hasRecentTurn = true;
+  }
+  return hasRecentTurn;
+};
+
 const conversationMatchesCwd = (state: Record<string, unknown>, cwd: string): boolean => {
   const expected = normalizeFsPath(cwd);
   const actual = latestCwd(state);
@@ -1019,11 +1202,27 @@ const normalizeTextForMatch = (value: string): string => value.replace(/\s+/g, "
 const normalizeFsPath = (value: string): string =>
   value.trim().replace(/[\\/]+/g, "/").replace(/\/+$/g, "").toLowerCase();
 
+const turnActivityAtMs = (turn: Record<string, unknown>): number | null => {
+  const timestamps = [
+    typeof turn.turnStartedAtMs === "number" ? turn.turnStartedAtMs : null,
+    typeof turn.finalAssistantStartedAtMs === "number" ? turn.finalAssistantStartedAtMs : null,
+    typeof turn.updatedAt === "number" ? turn.updatedAt : null,
+    typeof turn.completedAtMs === "number" ? turn.completedAtMs : null
+  ].filter((value): value is number => typeof value === "number" && Number.isFinite(value));
+  if (timestamps.length === 0) return null;
+  return Math.max(...timestamps);
+};
+
 const activeTurnIdFromConversation = (state: Record<string, unknown>): string | null => {
+  const activeTurn = activeTurnFromConversation(state);
+  return typeof activeTurn?.turnId === "string" ? activeTurn.turnId : null;
+};
+
+const activeTurnFromConversation = (state: Record<string, unknown>): Record<string, unknown> | null => {
   for (const turn of turnsNewestFirst(state)) {
     const status = typeof turn.status === "string" ? turn.status : null;
     const turnId = typeof turn.turnId === "string" ? turn.turnId : null;
-    if (turnId && (status === "running" || status === "active")) return turnId;
+    if (turnId && isActiveDesktopTurnStatus(status ?? "")) return turn;
   }
   return null;
 };

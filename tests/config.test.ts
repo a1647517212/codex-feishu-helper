@@ -68,3 +68,126 @@ test("config accepts ordinary Desktop IPC settings", () => {
     rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
+
+test("config defaults to desktop_auto so bridge can prefer proxy and still detect ipc fallback", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-feishu-config-"));
+  try {
+    const configPath = join(dir, "config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        storage: {
+          homeDir: dir,
+          databasePath: join(dir, "bridge.db"),
+          logPath: join(dir, "bridge.log")
+        },
+        feishu: {
+          appId: "app",
+          appSecret: "secret"
+        }
+      }),
+      "utf8"
+    );
+
+    const config = loadConfig(configPath);
+    assert.equal(config.codex.connectionMode, "desktop_auto");
+  } finally {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("config example now recommends desktop_proxy for real Feishu-origin new threads", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-feishu-config-"));
+  try {
+    const configPath = join(dir, "config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        storage: {
+          homeDir: dir,
+          databasePath: join(dir, "bridge.db"),
+          logPath: join(dir, "bridge.log")
+        },
+        codex: {
+          connectionMode: "desktop_proxy",
+          desktopProxyCommand: "codex"
+        },
+        feishu: {
+          appId: "app",
+          appSecret: "secret"
+        }
+      }),
+      "utf8"
+    );
+
+    const config = loadConfig(configPath);
+    assert.equal(config.codex.connectionMode, "desktop_proxy");
+    assert.equal(config.codex.desktopProxyCommand, "codex");
+  } finally {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("config accepts official Desktop proxy settings", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-feishu-config-"));
+  try {
+    const configPath = join(dir, "config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        storage: {
+          homeDir: dir,
+          databasePath: join(dir, "bridge.db"),
+          logPath: join(dir, "bridge.log")
+        },
+        codex: {
+          connectionMode: "desktop_proxy",
+          desktopProxyCommand: "codex"
+        },
+        feishu: {
+          appId: "app",
+          appSecret: "secret"
+        }
+      }),
+      "utf8"
+    );
+
+    const config = loadConfig(configPath);
+
+    assert.equal(config.codex.connectionMode, "desktop_proxy");
+    assert.equal(config.codex.desktopProxyCommand, "codex");
+  } finally {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});
+
+test("config accepts desktop_auto settings", () => {
+  const dir = mkdtempSync(join(tmpdir(), "codex-feishu-config-"));
+  try {
+    const configPath = join(dir, "config.json");
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        storage: {
+          homeDir: dir,
+          databasePath: join(dir, "bridge.db"),
+          logPath: join(dir, "bridge.log")
+        },
+        codex: {
+          connectionMode: "desktop_auto",
+          desktopProxyCommand: "codex"
+        },
+        feishu: {
+          appId: "app",
+          appSecret: "secret"
+        }
+      }),
+      "utf8"
+    );
+
+    const config = loadConfig(configPath);
+    assert.equal(config.codex.connectionMode, "desktop_auto");
+  } finally {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  }
+});

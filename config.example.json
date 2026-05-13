@@ -10,7 +10,8 @@
   },
   "codex": {
     "command": "${CODEX_COMMAND:-codex}",
-    "connectionMode": "desktop_ipc",
+    "connectionMode": "desktop_proxy",
+    "desktopProxyCommand": "codex",
     "desktopIpcPipePath": "\\\\.\\pipe\\codex-ipc",
     "desktopIpcInitialSnapshotWaitMs": 1500,
     "defaultModel": "gpt-5.4",

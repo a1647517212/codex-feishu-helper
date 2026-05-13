@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer as createTcpServer, type Server as TcpServer, type Socket } from "node:net";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { CodexClient } from "../src/codex/client.js";
 import { DesktopIpcClient } from "../src/codex/desktop-ipc.js";
@@ -12,6 +13,7 @@ test("desktop ipc mode lists observed Desktop threads", async () => {
   let client: CodexClient | null = null;
   try {
     const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
     config.codex.desktopIpcPipePath = ipc.pipePath;
     config.codex.desktopIpcInitialSnapshotWaitMs = 50;
     client = new CodexClient(config, makeLogger(dir));
@@ -29,12 +31,176 @@ test("desktop ipc mode lists observed Desktop threads", async () => {
   }
 });
 
+test("desktop proxy mode starts official app-server transport and handles thread basics", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  let client: CodexClient | null = null;
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_proxy";
+    config.codex.desktopProxyCommand = `node ${join(process.cwd(), "tests", "fixtures", "mock-codex-proxy.mjs")}`;
+    client = new CodexClient(config, makeLogger(dir));
+
+    const threads = await client.listThreads(10);
+    const started = await client.startThread({ cwd: dir });
+    await client.setThreadGoal(started.id, "通过官方 app-server 设置线程目标");
+    await client.clearThreadGoal(started.id);
+    const turn = await client.startTurn(started.id, "继续处理", { cwd: dir });
+    await client.setThreadName(started.id, "Proxy renamed");
+    const loaded = await client.listLoadedThreads();
+    const detail = await client.readThread(started.id);
+
+    assert.equal(client.connectionKind, "desktop_proxy");
+    assert.equal(client.status, "connected");
+    assert.equal(threads[0]?.id, "thr_proxy");
+    assert.equal(started.id, "thr_proxy");
+    assert.equal((turn.turn as Record<string, unknown>).id, "turn_1");
+    assert.deepEqual(loaded, ["thr_proxy"]);
+    assert.equal((detail.thread as Record<string, unknown>).goal, null);
+    assert.equal(client.desktopProxySnapshot?.status, "connected");
+  } finally {
+    await client?.stop();
+    cleanup();
+  }
+});
+
+test("desktop proxy execution readiness reflects app-server auth state", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  let client: CodexClient | null = null;
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_proxy";
+    config.codex.desktopProxyCommand = `node ${join(process.cwd(), "tests", "fixtures", "mock-codex-proxy.mjs")}`;
+    client = new CodexClient(config, makeLogger(dir));
+
+    const readiness = await client.getExecutionReadiness();
+
+    assert.equal(readiness.connectionKind, "desktop_proxy");
+    assert.equal(readiness.usable, true);
+    assert.equal(readiness.authMethod, "chatgpt");
+    assert.equal(readiness.requiresOpenaiAuth, true);
+    assert.equal(readiness.accountType, "chatgpt");
+    assert.equal(readiness.accountEmail, "proxy@example.com");
+  } finally {
+    await client?.stop();
+    cleanup();
+  }
+});
+
+test("desktop auto mode prefers official desktop proxy when available", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  let client: CodexClient | null = null;
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_auto";
+    config.codex.desktopProxyCommand = `node ${join(process.cwd(), "tests", "fixtures", "mock-codex-proxy.mjs")}`;
+    client = new CodexClient(config, makeLogger(dir));
+
+    const started = await client.startThread({ cwd: dir, prompt: "auto proxy thread" });
+    const turns = Array.isArray(started.raw.turns) ? started.raw.turns as Array<Record<string, unknown>> : [];
+    const firstTurnParams = turns[0]?.params as Record<string, unknown> | undefined;
+    const firstTurnInput = Array.isArray(firstTurnParams?.input) ? firstTurnParams.input as Array<Record<string, unknown>> : [];
+
+    assert.equal(client.connectionKind, "desktop_proxy");
+    assert.equal(started.id, "thr_proxy");
+    assert.equal(Array.isArray(started.raw.turns), true);
+    assert.equal(firstTurnInput[0]?.text, "auto proxy thread");
+    assert.equal((started.raw as Record<string, unknown>).goal, null);
+  } finally {
+    await client?.stop();
+    cleanup();
+  }
+});
+
+test("codex client desktop_auto falls back to desktop ipc transport for direct startThread callers", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir);
+  let client: CodexClient | null = null;
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_auto";
+    config.codex.desktopProxyCommand = "node does-not-exist.js";
+    config.codex.desktopIpcPipePath = ipc.pipePath;
+    config.codex.desktopIpcInitialSnapshotWaitMs = 50;
+    client = new CodexClient(config, makeLogger(dir));
+
+    const started = await client.startThread({ cwd: dir, prompt: "auto ipc fallback" });
+
+    assert.equal(client.connectionKind, "desktop_ipc");
+    assert.equal(started.id, "thr_desktop_new");
+    assert.equal(ipc.requests.some((entry) => entry.method === "start-conversation"), true);
+  } finally {
+    await client?.stop();
+    await ipc.stop();
+    cleanup();
+  }
+});
+
+test("desktop proxy mode falls back to desktop ipc transport when official proxy is unavailable", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir);
+  let client: CodexClient | null = null;
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_proxy";
+    config.codex.desktopProxyCommand = "node does-not-exist.js";
+    config.codex.desktopIpcPipePath = ipc.pipePath;
+    config.codex.desktopIpcInitialSnapshotWaitMs = 50;
+    client = new CodexClient(config, makeLogger(dir));
+
+    const threads = await client.listThreads(10);
+
+    assert.equal(client.connectionKind, "desktop_ipc");
+    assert.equal(client.status, "connected");
+    assert.equal(threads[0]?.id, "thr_desktop");
+  } finally {
+    await client?.stop();
+    await ipc.stop();
+    cleanup();
+  }
+});
+
+test("desktop proxy command resolution on Windows prefers executable wrappers over extensionless shims", async (t) => {
+  if (process.platform !== "win32") {
+    t.skip("Windows-only command resolution scenario");
+    return;
+  }
+  const { dir, cleanup } = makeTempRepo();
+  let client: CodexClient | null = null;
+  const originalPath = process.env.PATH;
+  try {
+    const shimDir = join(dir, "shim-bin");
+    mkdirSync(shimDir, { recursive: true });
+    writeFileSync(join(shimDir, "codex"), "not directly spawnable", "utf8");
+    writeFileSync(
+      join(shimDir, "codex.cmd"),
+      `@echo off\r\n"${process.execPath}" "${join(process.cwd(), "tests", "fixtures", "mock-codex-proxy.mjs")}" %*\r\n`,
+      "utf8"
+    );
+    process.env.PATH = `${shimDir};${originalPath ?? ""}`;
+
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_proxy";
+    config.codex.desktopProxyCommand = "codex";
+    client = new CodexClient(config, makeLogger(dir));
+
+    const threads = await client.listThreads(10);
+
+    assert.equal(client.connectionKind, "desktop_proxy");
+    assert.equal(threads[0]?.id, "thr_proxy");
+  } finally {
+    process.env.PATH = originalPath;
+    await client?.stop();
+    cleanup();
+  }
+});
+
 test("desktop ipc mode startThread and startTurn pass personal defaults to ordinary Desktop", async () => {
   const { dir, cleanup } = makeTempRepo();
   const ipc = await startMockDesktopIpcServer(dir);
   let client: CodexClient | null = null;
   try {
     const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
     config.codex.desktopIpcPipePath = ipc.pipePath;
     config.codex.desktopIpcInitialSnapshotWaitMs = 50;
     client = new CodexClient(config, makeLogger(dir));
@@ -67,6 +233,7 @@ test("desktop ipc mode setThreadName and listLoadedThreads operate on observed o
   let client: CodexClient | null = null;
   try {
     const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
     config.codex.desktopIpcPipePath = ipc.pipePath;
     config.codex.desktopIpcInitialSnapshotWaitMs = 50;
     client = new CodexClient(config, makeLogger(dir));
@@ -103,6 +270,7 @@ test("desktop ipc mode lists ordinary Desktop snapshots without starting a separ
   let client: CodexClient | null = null;
   try {
     const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
     config.codex.desktopIpcPipePath = ipc.pipePath;
     config.codex.desktopIpcInitialSnapshotWaitMs = 50;
     client = new CodexClient(config, makeLogger(dir));
@@ -130,6 +298,7 @@ test("desktop ipc mode targets the Desktop owner client for follower start turn"
   let client: CodexClient | null = null;
   try {
     const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
     config.codex.desktopIpcPipePath = ipc.pipePath;
     config.codex.desktopIpcInitialSnapshotWaitMs = 50;
     client = new CodexClient(config, makeLogger(dir));
@@ -154,7 +323,9 @@ test("desktop ipc mode targets the Desktop owner client for follower start turn"
   }
 });
 
-test("desktop ipc mode creates ordinary Desktop threads through start-conversation and applies goal/title", async () => {
+// Low-level IPC creation tests below are transport probes only.
+// TaskService does not advertise this path as a supported Feishu new-task capability.
+test("desktop ipc low-level transport probe can create ordinary Desktop threads without auto-applying goal", async () => {
   const { dir, cleanup } = makeTempRepo();
   const ipc = await startMockDesktopIpcServer(dir);
   let client: DesktopIpcClient | null = null;
@@ -192,7 +363,7 @@ test("desktop ipc mode creates ordinary Desktop threads through start-conversati
     const configPayload = startConversationParams.config as Record<string, unknown> | undefined;
     assert.equal(collaborationMode?.mode, "default");
     assert.equal(configPayload?.serviceName, "feishu_codex_bridge_test");
-    assert.equal(ipc.requests.some((entry) => entry.method === "set-thread-goal"), true);
+    assert.equal(ipc.requests.some((entry) => entry.method === "set-thread-goal"), false);
     assert.equal(ipc.requests.some((entry) => entry.method === "set-thread-title"), true);
   } finally {
     await client?.stop();
@@ -207,6 +378,7 @@ test("desktop ipc mode passes local image inputs to ordinary Desktop", async () 
   let client: CodexClient | null = null;
   try {
     const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
     config.codex.desktopIpcPipePath = ipc.pipePath;
     config.codex.desktopIpcInitialSnapshotWaitMs = 50;
     client = new CodexClient(config, makeLogger(dir));
@@ -244,7 +416,7 @@ test("desktop ipc mode passes local image inputs to ordinary Desktop", async () 
   }
 });
 
-test("desktop ipc mode does not bind a new Desktop thread unless the prompt matches", async () => {
+test("desktop ipc low-level transport probe does not bind a new Desktop thread unless the prompt matches", async () => {
   const { dir, cleanup } = makeTempRepo();
   const ipc = await startMockDesktopIpcServer(dir, { startConversationPromptOverride: "别的 Desktop 任务" });
   let client: DesktopIpcClient | null = null;
@@ -270,6 +442,70 @@ test("desktop ipc mode does not bind a new Desktop thread unless the prompt matc
     assert.equal(ipc.requests.some((entry) => entry.method === "start-conversation"), true);
     assert.equal(ipc.requests.some((entry) => entry.method === "set-thread-goal"), false);
     assert.equal(ipc.requests.some((entry) => entry.method === "set-thread-title"), false);
+  } finally {
+    await client?.stop();
+    await ipc.stop();
+    cleanup();
+  }
+});
+
+test("desktop ipc low-level transport probe does not mistake an old thread with the same prompt for a newly created thread", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir, { startConversationReturnsSuccessWithoutSnapshot: true });
+  let client: DesktopIpcClient | null = null;
+  try {
+    client = new DesktopIpcClient(
+      { pipePath: ipc.pipePath, initialSnapshotWaitMs: 50, creationSnapshotWaitMs: 300 },
+      makeLogger(dir)
+    );
+
+    await assert.rejects(
+      () => client!.startThread({
+        prompt: "飞书创建普通 Desktop thread",
+        cwd: dir,
+        model: "gpt-5.5",
+        reasoningEffort: "xhigh",
+        approvalPolicy: "never",
+        sandboxMode: "danger-full-access",
+        serviceName: "feishu_codex_bridge_test"
+      }),
+      /Timed out waiting for ordinary Codex Desktop/
+    );
+
+    assert.equal(ipc.requests.some((entry) => entry.method === "start-conversation"), true);
+    assert.equal(ipc.requests.some((entry) => entry.method === "set-thread-goal"), false);
+    assert.equal(ipc.requests.some((entry) => entry.method === "set-thread-title"), false);
+  } finally {
+    await client?.stop();
+    await ipc.stop();
+    cleanup();
+  }
+});
+
+test("desktop ipc low-level transport probe can fall back to thread/start when start-conversation returns no-client-found", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir, { failStartConversationWithNoClientFound: true });
+  let client: DesktopIpcClient | null = null;
+  try {
+    client = new DesktopIpcClient(
+      { pipePath: ipc.pipePath, initialSnapshotWaitMs: 50 },
+      makeLogger(dir)
+    );
+
+    const thread = await client.startThread({
+      prompt: "飞书回退到 thread/start 再补首轮 turn",
+      cwd: dir,
+      model: "gpt-5.5",
+      reasoningEffort: "xhigh",
+      approvalPolicy: "never",
+      sandboxMode: "danger-full-access",
+      serviceName: "feishu_codex_bridge_test"
+    });
+
+    assert.equal(thread.id, "thr_desktop_new");
+    assert.equal(ipc.requests.some((entry) => entry.method === "start-conversation"), true);
+    assert.equal(ipc.requests.some((entry) => entry.method === "thread/start"), true);
+    assert.equal(ipc.requests.some((entry) => entry.method === "thread-follower-start-turn"), true);
   } finally {
     await client?.stop();
     await ipc.stop();
@@ -386,6 +622,7 @@ test("desktop ipc mode converts Desktop stream snapshots into bridge turn notifi
   let client: CodexClient | null = null;
   try {
     const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
     config.codex.desktopIpcPipePath = ipc.pipePath;
     config.codex.desktopIpcInitialSnapshotWaitMs = 50;
     client = new CodexClient(config, makeLogger(dir));
@@ -424,6 +661,7 @@ test("desktop ipc mode does not duplicate synthetic turn notification for the sa
   let client: CodexClient | null = null;
   try {
     const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
     config.codex.desktopIpcPipePath = ipc.pipePath;
     config.codex.desktopIpcInitialSnapshotWaitMs = 50;
     client = new CodexClient(config, makeLogger(dir));
@@ -446,8 +684,63 @@ test("desktop ipc mode does not duplicate synthetic turn notification for the sa
   }
 });
 
+test("desktop ipc snapshot prefers active turn over older terminal turn", async () => {
+  const { dir, cleanup } = makeTempRepo();
+  const ipc = await startMockDesktopIpcServer(dir, { skipInitialSnapshot: true });
+  let client: CodexClient | null = null;
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
+    config.codex.desktopIpcPipePath = ipc.pipePath;
+    config.codex.desktopIpcInitialSnapshotWaitMs = 50;
+    client = new CodexClient(config, makeLogger(dir));
+    const notifications: Record<string, unknown>[] = [];
+    client.on("notification", (message) => notifications.push(message));
+
+    await client.start();
+    ipc.broadcastSnapshot(dir, {
+      conversationId: "thr_active_after_terminal",
+      title: "Active after terminal",
+      prompt: "继续处理",
+      threadRuntimeStatus: { type: "idle" },
+      turns: [
+        { turnId: "turn_old_interrupted", status: "interrupted", items: [] },
+        { turnId: "turn_new_running", status: "running", items: [] }
+      ]
+    });
+
+    await waitForCondition(
+      () => notifications.some((message) => message.method === "turn/started"),
+      "desktop ipc active turn notification was not observed"
+    );
+    const started = notifications.find((message) => message.method === "turn/started");
+    assert.deepEqual(started?.params, {
+      threadId: "thr_active_after_terminal",
+      turn: {
+        params: {
+          threadId: "thr_active_after_terminal",
+          cwd: dir,
+          input: [{ type: "text", text: "继续处理", text_elements: [] }]
+        },
+        turnId: "turn_new_running",
+        id: "turn_new_running",
+        status: "running",
+        items: []
+      }
+    });
+    assert.equal(notifications.some((message) => message.method === "turn/completed"), false);
+  } finally {
+    await client?.stop();
+    await ipc.stop();
+    cleanup();
+  }
+});
+
 const startMockDesktopIpcServer = async (cwd: string, options: {
   startConversationPromptOverride?: string;
+  failStartConversationWithNoClientFound?: boolean;
+  startConversationReturnsSuccessWithoutSnapshot?: boolean;
+  skipInitialSnapshot?: boolean;
 } = {}): Promise<{
   pipePath: string;
   requests: Array<{ method: string; targetClientId?: string; version?: number; params?: unknown }>;
@@ -497,7 +790,7 @@ const startMockDesktopIpcServer = async (cwd: string, options: {
             resultType: "success",
             result: { clientId: "bridge-client" }
           });
-          writeDesktopIpcFrame(socket, desktopSnapshotMessage(cwd));
+          if (!options.skipInitialSnapshot) writeDesktopIpcFrame(socket, desktopSnapshotMessage(cwd));
           continue;
         }
         if (message.type === "request") {
@@ -521,15 +814,37 @@ const startMockDesktopIpcServer = async (cwd: string, options: {
             });
           }
           if (message.method === "start-conversation") {
+            if (options.failStartConversationWithNoClientFound) {
+              writeDesktopIpcFrame(socket, {
+                type: "response",
+                method: message.method,
+                requestId: message.requestId,
+                resultType: "error",
+                error: "no-client-found"
+              });
+              continue;
+            }
+            if (!options.startConversationReturnsSuccessWithoutSnapshot) {
+              const params = message.params as Record<string, unknown>;
+              const input = Array.isArray(params.input) ? params.input : [];
+              const textInput = input[0] && typeof input[0] === "object" ? input[0] as Record<string, unknown> : {};
+              broadcastSnapshot(String(params.cwd ?? cwd), {
+                conversationId: "thr_desktop_new",
+                title: "Feishu-created Desktop thread",
+                prompt: options.startConversationPromptOverride ?? (typeof textInput.text === "string" ? textInput.text : ""),
+                turnId: "turn_new",
+                status: "running"
+              });
+            }
+          }
+          if (message.method === "thread/start") {
             const params = message.params as Record<string, unknown>;
-            const input = Array.isArray(params.input) ? params.input : [];
-            const textInput = input[0] && typeof input[0] === "object" ? input[0] as Record<string, unknown> : {};
             broadcastSnapshot(String(params.cwd ?? cwd), {
               conversationId: "thr_desktop_new",
               title: "Feishu-created Desktop thread",
-              prompt: options.startConversationPromptOverride ?? (typeof textInput.text === "string" ? textInput.text : ""),
-              turnId: "turn_new",
-              status: "running"
+              prompt: "",
+              turnId: null,
+              status: "idle"
             });
           }
           if (message.method === "set-thread-title") {
@@ -593,6 +908,8 @@ interface DesktopSnapshotOptions {
   prompt: string;
   turnId: string | null;
   status: string;
+  turns: Array<Record<string, unknown>>;
+  threadRuntimeStatus: Record<string, unknown>;
 }
 
 const desktopSnapshotMessage = (cwd: string, options: Partial<DesktopSnapshotOptions> = {}): Record<string, unknown> => {
@@ -600,7 +917,7 @@ const desktopSnapshotMessage = (cwd: string, options: Partial<DesktopSnapshotOpt
   const turnId = options.turnId === null ? null : options.turnId ?? "turn_1";
   const status = options.status ?? "completed";
   const prompt = options.prompt ?? "继续处理";
-  const turns = turnId
+  const turns = options.turns ?? (turnId
     ? [
         {
           params: { threadId: conversationId, cwd, input: prompt ? [{ type: "text", text: prompt, text_elements: [] }] : [] },
@@ -609,7 +926,11 @@ const desktopSnapshotMessage = (cwd: string, options: Partial<DesktopSnapshotOpt
           items: [{ type: "agentMessage", id: "item_1", text: "完成了" }]
         }
       ]
-    : [];
+    : []);
+  const normalizedTurns = turns.map((turn) => ({
+    params: { threadId: conversationId, cwd, input: prompt ? [{ type: "text", text: prompt, text_elements: [] }] : [] },
+    ...turn
+  }));
   return {
     type: "broadcast",
     method: "thread-stream-state-changed",
@@ -625,9 +946,9 @@ const desktopSnapshotMessage = (cwd: string, options: Partial<DesktopSnapshotOpt
           title: options.title ?? "Desktop task",
           updatedAt: 1778451000000,
           source: "desktop",
-          threadRuntimeStatus: { type: status === "running" ? "active" : "idle" },
+          threadRuntimeStatus: options.threadRuntimeStatus ?? { type: status === "running" ? "active" : "idle" },
           cwd,
-          turns
+          turns: normalizedTurns
         }
       },
       version: 6,

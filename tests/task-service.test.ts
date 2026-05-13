@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { DatabaseSync } from "node:sqlite";
 import { TaskService } from "../src/bridge/task-service.js";
 import { makeConfig, makeLogger, makeTempRepo, MockCodex, MockFeishu } from "./helpers.js";
 import { CardRenderer } from "../src/domain/cards.js";
@@ -131,22 +132,25 @@ test("desktop ipc mode keeps new Feishu tasks on project selection before creati
   }
 });
 
-test("desktop ipc mode project start action creates ordinary Desktop thread without separate runtime turn", async () => {
+test("desktop ipc mode project start action keeps task as draft and explains claim-only boundary", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
     config.codex.connectionMode = "desktop_ipc";
+    const codexHome = join(dir, "codex-home");
+    const packageRoot = join(dir, "WindowsApps", "OpenAI.Codex_26.506.3741.0_x64__2p2nqsd0c76g0", "app", "resources");
+    mkdirSync(packageRoot, { recursive: true });
+    writeFileSync(
+      join(packageRoot, "app.asar"),
+      "r.add(n.addRequestHandler(`thread-follower-start-turn`,i,async t=>{}))\n" +
+      "r.add(n.addRequestHandler(`thread-follower-steer-turn`,i,async t=>{}))",
+      "utf8"
+    );
+    process.env.ProgramFiles = dir;
+    config.codex.appStatePath = join(codexHome, ".codex-global-state.json");
     const feishu = new MockFeishu();
     const codex = new MockCodex();
     codex.connectionKind = "desktop_ipc";
-    codex.threads = [{
-      id: "thr_desktop_project",
-      name: "Desktop project task",
-      preview: "Desktop project task",
-      cwd: dir,
-      status: { type: "idle" },
-      updatedAt: Date.now()
-    }];
     const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
     const project = repo.upsertProject({ id: "proj_desktop_ipc", name: "Desktop IPC", rootPath: dir });
     const pendingPrompt = repo.createPendingProjectPrompt({
@@ -166,23 +170,256 @@ test("desktop ipc mode project start action creates ordinary Desktop thread with
     });
 
     assert.equal(repo.getPendingProjectPrompt(pendingPrompt.id)?.status, "used");
-    assert.equal(codex.startedThreads.length, 1);
-    assert.equal(codex.startedThreads[0]?.prompt, "帮我执行新任务");
-    assert.equal(codex.startedThreads[0]?.cwd, dir);
+    assert.equal(codex.startedThreads.length, 0);
     assert.equal(codex.turns.length, 0);
     const binding = repo.listBindings()[0];
     assert.ok(binding);
-    assert.equal(binding.codexThreadId, "thr_new");
-    assert.equal(binding.status, "running");
-    assert.equal(binding.lastTurnId, "turn_1");
-    const events = repo.listEventsForBinding(binding.id);
-    assert.equal(events.some((event) => event.eventType === "task.created_from_feishu" && (event.eventPayload as any).desktopIpc === true), true);
+    assert.equal(binding.codexThreadId.startsWith("draft_"), true);
+    assert.equal(binding.status, "waiting_for_prompt");
+    assert.equal(binding.lastTurnId, null);
+    const sentText = feishu.sent
+      .filter((entry) => entry.type === "text")
+      .map((entry) => String(entry.payload))
+      .join("\n");
+    assert.equal(sentText.includes("不能从飞书直接新建新对话"), true);
+    assert.equal(sentText.includes("thread-follower IPC handler"), true);
+    assert.equal(sentText.includes("/tasks"), true);
+  } finally {
+    delete process.env.ProgramFiles;
+    cleanup();
+  }
+});
+
+test("desktop proxy mode new Feishu task does not auto-enable thread goal", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_proxy";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_proxy";
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({ id: "proj_desktop_proxy_goal", name: "Desktop Proxy", rootPath: dir });
+
+    await (service as any).startProjectTaskFromPrompt({
+      project,
+      prompt: "请修复飞书无法新建 Desktop 线程，普通消息不要自动成为 goal。",
+      userId: "user_1",
+      sourceMessageId: "msg_proxy_goal",
+      sourceChatId: "chat_1",
+      sourceRootMessageId: "msg_proxy_goal",
+      attachments: []
+    });
+
+    assert.equal(codex.startedThreads.length, 1);
+    assert.equal(codex.turns.length, 1);
+    assert.deepEqual(codex.goals, []);
+    assert.equal(codex.turns[0]?.text, "请修复飞书无法新建 Desktop 线程，普通消息不要自动成为 goal。");
   } finally {
     cleanup();
   }
 });
 
-test("desktop ipc mode starts ordinary Desktop thread with Feishu image attachments", async () => {
+test("desktop proxy mode keeps draft and explains direct app-server prerequisite when transport is unavailable", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_proxy";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "not_started";
+    codex.start = async () => {
+      throw new Error("failed to start codex app-server");
+    };
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({ id: "proj_desktop_proxy_unavailable", name: "Desktop Proxy", rootPath: dir });
+    const pendingPrompt = repo.createPendingProjectPrompt({
+      feishuMessageId: "msg_pending_desktop_proxy_unavailable",
+      feishuChatId: "chat_1",
+      feishuUserId: "user_1",
+      text: "帮我创建一个新的 desktop proxy 任务"
+    });
+
+    await service.handleCardAction({
+      actionId: "act_desktop_proxy_unavailable",
+      action: "project_start_prompt",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_desktop_proxy_unavailable",
+      payload: { projectId: project.id, pendingPromptId: pendingPrompt.id }
+    });
+
+    assert.equal(codex.startedThreads.length, 0);
+    const binding = repo.listBindings()[0];
+    assert.ok(binding);
+    assert.equal(binding.codexThreadId.startsWith("draft_"), true);
+    assert.equal(binding.status, "waiting_for_prompt");
+    const sentText = feishu.sent
+      .filter((entry) => entry.type === "text")
+      .map((entry) => String(entry.payload))
+      .join("\n");
+    assert.equal(sentText.includes("desktop_proxy"), true);
+    assert.equal(sentText.includes("codex app-server"), true);
+    assert.equal(sentText.includes("/tasks"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("desktop auto mode new Feishu task can run through proxy path without auto goal sync", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_auto";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_proxy";
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({ id: "proj_desktop_auto_goal", name: "Desktop Auto", rootPath: dir });
+
+    await (service as any).startProjectTaskFromPrompt({
+      project,
+      prompt: "请通过自动模式创建新线程，但不要默认进入 goal 模式。",
+      userId: "user_1",
+      sourceMessageId: "msg_auto_goal",
+      sourceChatId: "chat_1",
+      sourceRootMessageId: "msg_auto_goal",
+      attachments: []
+    });
+
+    assert.equal(codex.startedThreads.length, 1);
+    assert.equal(codex.turns.length, 1);
+    assert.deepEqual(codex.goals, []);
+    assert.equal(codex.turns[0]?.text, "请通过自动模式创建新线程，但不要默认进入 goal 模式。");
+  } finally {
+    cleanup();
+  }
+});
+
+test("draft task promoted into a real thread also avoids auto goal sync", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_proxy";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_proxy";
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+
+    repo.createOrUpdateBinding({
+      codexThreadId: "draft_existing",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Draft task",
+      cwd: dir,
+      status: "waiting_for_prompt",
+      createdFrom: "feishu_new_task"
+    });
+
+    await service.handleMessage({
+      messageId: "msg_promote_draft_without_goal",
+      chatId: "task_chat_1",
+      rootMessageId: "task-root",
+      threadId: null,
+      userId: "user_1",
+      text: "把这个草稿真正创建成线程，但不要自动设置 goal"
+    });
+
+    assert.equal(codex.startedThreads.length, 1);
+    assert.equal(codex.turns.length, 1);
+    assert.deepEqual(codex.goals, []);
+    assert.equal(codex.turns[0]?.text, "把这个草稿真正创建成线程，但不要自动设置 goal");
+  } finally {
+    cleanup();
+  }
+});
+
+test("official goal command text is forwarded to Codex instead of handled as a bridge command", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_proxy";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_proxy";
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+
+    repo.createOrUpdateBinding({
+      codexThreadId: "draft_goal_command",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Draft task",
+      cwd: dir,
+      status: "waiting_for_prompt",
+      createdFrom: "feishu_new_task"
+    });
+
+    await service.handleMessage({
+      messageId: "msg_official_goal_command",
+      chatId: "task_chat_1",
+      rootMessageId: "task-root",
+      threadId: null,
+      userId: "user_1",
+      text: "/goal 完成这个目标，只有官方指令才进入 goal 模式"
+    });
+
+    assert.equal(codex.startedThreads.length, 1);
+    assert.equal(codex.turns.length, 1);
+    assert.equal(codex.turns[0]?.text, "/goal 完成这个目标，只有官方指令才进入 goal 模式");
+    assert.deepEqual(codex.goals, []);
+    assert.equal(JSON.stringify(feishu.sent).includes("命令处理失败"), false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("desktop auto mode no-client-found guidance explains only claim-existing-thread fallback when Desktop IPC cannot create", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_auto";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_ipc";
+    codex.failStartThread = true;
+    codex.startThread = async (params: Record<string, unknown> = {}) => {
+      codex.startedThreads.push(params);
+      throw new Error("no-client-found");
+    };
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({ id: "proj_desktop_auto_no_client", name: "Desktop Auto", rootPath: dir });
+    const pendingPrompt = repo.createPendingProjectPrompt({
+      feishuMessageId: "msg_pending_desktop_auto_no_client",
+      feishuChatId: "chat_1",
+      feishuUserId: "user_1",
+      text: "帮我创建自动模式新对话"
+    });
+
+    await service.handleCardAction({
+      actionId: "act_desktop_auto_no_client",
+      action: "project_start_prompt",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_desktop_auto_no_client",
+      payload: { projectId: project.id, pendingPromptId: pendingPrompt.id }
+    });
+
+    const sentText = feishu.sent
+      .filter((entry) => entry.type === "text")
+      .map((entry) => String(entry.payload))
+      .join("\n");
+    assert.equal(sentText.includes("当前从飞书接管已打开线程可用"), true);
+    assert.equal(sentText.includes("/tasks"), true);
+    assert.equal(sentText.includes("desktop_auto"), true);
+    assert.equal(sentText.includes("ChatGPT/OpenAI 账户"), false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("desktop ipc mode image task stays as draft until user claims an existing Desktop thread", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
@@ -216,13 +453,16 @@ test("desktop ipc mode starts ordinary Desktop thread with Feishu image attachme
       payload: { projectId: project.id, pendingPromptId: pendingPrompt.id }
     });
 
-    assert.deepEqual(feishu.downloadedResources, [
-      { messageId: "msg_img_task", fileKey: "img_v3_task", resourceType: "image" }
-    ]);
-    assert.equal(codex.startedThreads[0]?.prompt, "请查看这张图片。");
-    assert.deepEqual(codex.startedThreads[0]?.attachments, [{ path: feishu.resourcePathByKey.get("img_v3_task") ?? (codex.startedThreads[0]?.attachments as any[])[0]?.path }]);
-    const event = repo.listEventsForBinding(repo.listBindings()[0]!.id).find((candidate) => candidate.eventType === "task.created_from_feishu");
-    assert.equal(((event?.eventPayload as any).attachments ?? [])[0]?.key, "img_v3_task");
+    assert.deepEqual(feishu.downloadedResources, []);
+    assert.equal(codex.startedThreads.length, 0);
+    const binding = repo.listBindings()[0];
+    assert.ok(binding);
+    assert.equal(binding.codexThreadId.startsWith("draft_"), true);
+    const sentText = feishu.sent
+      .filter((entry) => entry.type === "text")
+      .map((entry) => String(entry.payload))
+      .join("\n");
+    assert.equal(sentText.includes("不能从飞书直接新建新对话"), true);
   } finally {
     cleanup();
   }
@@ -268,7 +508,7 @@ test("running Desktop task steers Feishu image attachments into the same ordinar
   }
 });
 
-test("desktop ipc mode marks project task failed when ordinary Desktop thread creation fails", async () => {
+test("desktop ipc mode project start keeps draft state without attempting thread creation", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
@@ -276,7 +516,6 @@ test("desktop ipc mode marks project task failed when ordinary Desktop thread cr
     const feishu = new MockFeishu();
     const codex = new MockCodex();
     codex.connectionKind = "desktop_ipc";
-    codex.failStartThread = true;
     const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
     const project = repo.upsertProject({ id: "proj_desktop_ipc_fail", name: "Desktop IPC", rootPath: dir });
     const pendingPrompt = repo.createPendingProjectPrompt({
@@ -296,16 +535,235 @@ test("desktop ipc mode marks project task failed when ordinary Desktop thread cr
     });
 
     assert.equal(repo.getPendingProjectPrompt(pendingPrompt.id)?.status, "used");
-    assert.equal(codex.startedThreads.length, 1);
+    assert.equal(codex.startedThreads.length, 0);
     assert.equal(codex.turns.length, 0);
     const binding = repo.listBindings()[0];
     assert.ok(binding);
-    assert.equal(binding.codexThreadId.startsWith("pending_desktop_"), true);
-    assert.equal(binding.status, "failed");
+    assert.equal(binding.codexThreadId.startsWith("draft_"), true);
+    assert.equal(binding.status, "waiting_for_prompt");
     const events = repo.listEventsForBinding(binding.id);
-    assert.equal(events.some((event) => event.eventType === "task.failed" && (event.eventPayload as any).desktopIpc === true), true);
-    assert.equal(JSON.stringify(feishu.sent).includes("没有启动独立 runtime"), true);
-    assert.equal(feishu.updatedChatNames.some((entry) => entry.name.includes("[失败]")), true);
+    assert.equal(events.some((event) => event.eventType === "task.desktop_thread_creation_unavailable" && (event.eventPayload as any).desktopIpc === true), true);
+    assert.equal(JSON.stringify(feishu.sent).includes("已保留在飞书草稿会话里"), true);
+    assert.equal(feishu.updatedChatNames.length > 0, true);
+    assert.equal(feishu.updatedChatNames.some((entry) => entry.name.includes("[失败]")), false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("desktop proxy mode surfaces direct app-server failure details when new thread creation is unavailable", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_proxy";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "not_started";
+    codex.start = async () => {
+      throw new Error("codex app-server spawn failed");
+    };
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({ id: "proj_desktop_proxy_fail", name: "Desktop Proxy", rootPath: dir });
+    const pendingPrompt = repo.createPendingProjectPrompt({
+      feishuMessageId: "msg_pending_desktop_proxy_fail",
+      feishuChatId: "chat_1",
+      feishuUserId: "user_1",
+      text: "帮我创建一个真实新线程"
+    });
+
+    await service.handleCardAction({
+      actionId: "act_desktop_proxy_fail_start",
+      action: "project_start_prompt",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_desktop_proxy_fail_start",
+      payload: { projectId: project.id, pendingPromptId: pendingPrompt.id }
+    });
+
+    const payload = JSON.stringify(feishu.sent);
+    assert.match(payload, /当前不能从飞书直接新建真实 Desktop 线程/);
+    assert.match(payload, /desktop_proxy 只是兼容模式名/);
+    assert.match(payload, /codex app-server/);
+    assert.match(payload, /\/tasks/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("desktop proxy mode keeps draft when app-server auth is insufficient for first turn execution", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_proxy";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_proxy";
+    codex.executionReadiness = {
+      usable: false,
+      connectionKind: "desktop_proxy",
+      reason: "current app-server transport only has API key style auth, but the configured provider requires OpenAI account auth",
+      authMethod: "apikey",
+      requiresOpenaiAuth: true,
+      accountType: "apiKey",
+      accountEmail: null,
+      raw: {}
+    };
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({ id: "proj_desktop_proxy_auth_block", name: "Desktop Proxy", rootPath: dir });
+    const pendingPrompt = repo.createPendingProjectPrompt({
+      feishuMessageId: "msg_pending_desktop_proxy_auth_block",
+      feishuChatId: "chat_1",
+      feishuUserId: "user_1",
+      text: "帮我创建一个真实新线程，但不要 401"
+    });
+
+    await service.handleCardAction({
+      actionId: "act_desktop_proxy_auth_block",
+      action: "project_start_prompt",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_desktop_proxy_auth_block",
+      payload: { projectId: project.id, pendingPromptId: pendingPrompt.id }
+    });
+
+    assert.equal(codex.startedThreads.length, 0);
+    const binding = repo.listBindings()[0];
+    assert.ok(binding);
+    assert.equal(binding.codexThreadId.startsWith("draft_"), true);
+    assert.equal(binding.status, "waiting_for_prompt");
+    const payload = JSON.stringify(feishu.sent);
+    assert.match(payload, /当前不能从飞书直接新建真实 Desktop 线程/);
+    assert.match(payload, /第一轮直接失败/);
+    assert.match(payload, /API key style auth/);
+    assert.match(payload, /保留在飞书草稿会话里/);
+  } finally {
+    cleanup();
+  }
+});
+
+test("desktop ipc mode explains that only claiming existing Desktop threads is available when new-thread handler is missing", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_ipc";
+    codex.failStartThread = true;
+    codex.startThread = async (params: Record<string, unknown> = {}) => {
+      codex.startedThreads.push(params);
+      throw new Error("no-client-found");
+    };
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const project = repo.upsertProject({ id: "proj_desktop_ipc_no_client", name: "Desktop IPC", rootPath: dir });
+    const pendingPrompt = repo.createPendingProjectPrompt({
+      feishuMessageId: "msg_pending_desktop_ipc_no_client",
+      feishuChatId: "chat_1",
+      feishuUserId: "user_1",
+      text: "帮我创建一个新对话"
+    });
+
+    await service.handleCardAction({
+      actionId: "act_desktop_ipc_no_client",
+      action: "project_start_prompt",
+      userId: "user_1",
+      chatId: "chat_1",
+      rootMessageId: "root_desktop_ipc_no_client",
+      payload: { projectId: project.id, pendingPromptId: pendingPrompt.id }
+    });
+
+    const sentText = feishu.sent
+      .filter((entry) => entry.type === "text")
+      .map((entry) => String(entry.payload))
+      .join("\n");
+    assert.equal(sentText.includes("不能从飞书直接新建新对话"), true);
+    assert.equal(sentText.includes("/tasks"), true);
+    assert.equal(sentText.includes("desktop_proxy"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("desktop ipc mode waiting draft follow-up does not retry creating a new Desktop thread", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_ipc";
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    repo.createOrUpdateBinding({
+      codexThreadId: "draft_existing",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Draft task",
+      cwd: dir,
+      status: "waiting_for_prompt",
+      createdFrom: "feishu_new_task"
+    });
+
+    await service.handleMessage({
+      messageId: "msg_desktop_ipc_draft_followup",
+      chatId: "task_chat_1",
+      rootMessageId: null,
+      threadId: null,
+      userId: "user_1",
+      text: "补充一下需求细节"
+    });
+
+    assert.equal(codex.startedThreads.length, 0);
+    assert.equal(codex.turns.length, 0);
+    const sentText = feishu.sent
+      .filter((entry) => entry.type === "text")
+      .map((entry) => String(entry.payload))
+      .join("\n");
+    assert.equal(sentText.includes("不能从飞书直接新建新对话"), true);
+    assert.equal(sentText.includes("/tasks"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("desktop ipc mode auto-recovers legacy pending_desktop binding before absorbing follow-up messages", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_ipc";
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    codex.connectionKind = "desktop_ipc";
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "pending_desktop_legacy",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Legacy pending",
+      cwd: dir,
+      status: "running",
+      createdFrom: "manual_import"
+    });
+
+    await service.handleMessage({
+      messageId: "msg_pending_desktop_recover",
+      chatId: "task_chat_1",
+      rootMessageId: null,
+      threadId: null,
+      userId: "user_1",
+      text: "继续这个任务"
+    });
+
+    const repaired = repo.findBindingById(binding.id);
+    assert.ok(repaired);
+    assert.equal(repaired?.status, "waiting_for_prompt");
+    assert.equal(repaired?.codexThreadId.startsWith("draft_"), true);
+    assert.equal(codex.turns.length, 0);
+    assert.equal(codex.steerRequests.length, 0);
+    assert.equal(JSON.stringify(feishu.sent).includes("已自动恢复为可重试草稿"), true);
+    const events = repo.listEventsForBinding(binding.id);
+    assert.equal(events.some((event) => event.eventType === "task.desktop_placeholder_recovered"), true);
   } finally {
     cleanup();
   }
@@ -437,8 +895,10 @@ test("control-group task text waits for a project before starting Codex turn", a
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_proxy";
     const feishu = new MockFeishu();
     const codex = new MockCodex();
+    codex.connectionKind = "desktop_proxy";
     const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
     const project = repo.upsertProject({
       id: "proj_group_start",
@@ -689,7 +1149,9 @@ test("new task emits one running status and one completion notification", async 
   const { repo, dir, cleanup } = makeTempRepo();
   try {
     const config = makeConfig(dir);
+    config.codex.connectionMode = "desktop_proxy";
     const codex = new MockCodex();
+    codex.connectionKind = "desktop_proxy";
     codex.threads = [
       {
         id: "thr_new",
@@ -1900,6 +2362,52 @@ test("codex-only completed thread enqueues one control chat reminder", async () 
   }
 });
 
+test("codex-only completion scan skips subagent threads", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const completedAt = Date.now();
+    codex.threads = [
+      {
+        id: "thr_subagent_list_source",
+        name: "Subagent child",
+        preview: "Subagent child",
+        cwd: dir,
+        status: { type: "idle" },
+        updatedAt: completedAt,
+        source: { subAgent: "review" },
+        agentNickname: "worker-a"
+      },
+      {
+        id: "thr_subagent_detail_source",
+        name: "Subagent child detail",
+        preview: "Subagent child detail",
+        cwd: dir,
+        status: { type: "idle" },
+        updatedAt: completedAt
+      }
+    ];
+    (codex as unknown as { readThread: (threadId: string) => Promise<Record<string, unknown>> }).readThread = async (threadId: string) => ({
+      thread: {
+        id: threadId,
+        name: threadId,
+        cwd: dir,
+        status: { type: "idle" },
+        updatedAt: completedAt,
+        source: { subagent: { thread_spawn: { parent_thread_id: "thr_parent", depth: 1 } } },
+        turns: [{ id: `turn_${threadId}`, status: "completed", completedAt }]
+      }
+    });
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    assert.equal(await service.scanCodexOnlyCompletions(), 0);
+    assert.equal(repo.listDueOutbox(10).filter((item) => item.dedupeKey.startsWith("codex-only:")).length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
 test("codex-only completion scan skips bound, ignored and stale threads", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
@@ -1936,6 +2444,59 @@ test("codex-only completion scan skips bound, ignored and stale threads", async 
     const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
     assert.equal(await service.scanCodexOnlyCompletions(), 0);
     assert.equal(repo.listDueOutbox(10).filter((item) => item.dedupeKey.startsWith("codex-only:")).length, 0);
+  } finally {
+    cleanup();
+  }
+});
+
+test("codex-only completion scan repairs bound terminal task when thread has a newer active turn", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const now = Date.now();
+    codex.threads = [
+      {
+        id: "thr_bound_active_after_failed",
+        name: "Bound active after failed",
+        preview: "Bound active after failed",
+        cwd: dir,
+        status: { type: "idle" },
+        updatedAt: now
+      }
+    ];
+    (codex as unknown as { readThread: (threadId: string) => Promise<Record<string, unknown>> }).readThread = async (threadId: string) => ({
+      thread: {
+        id: threadId,
+        name: "Bound active after failed",
+        cwd: dir,
+        status: { type: "idle" },
+        updatedAt: now,
+        turns: [
+          { id: "turn_old_failed", status: "failed", completedAt: now - 2000, error: { message: "401 Unauthorized" } },
+          { id: "turn_new_running", status: "running", updatedAt: now }
+        ]
+      }
+    });
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_bound_active_after_failed",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Bound active after failed",
+      status: "failed",
+      createdFrom: "manual_import"
+    });
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+
+    assert.equal(await service.scanCodexOnlyCompletions(), 0);
+
+    const repaired = repo.findBindingById(binding.id);
+    assert.equal(repaired?.status, "running");
+    assert.equal(repaired?.lastTurnId, "turn_new_running");
+    assert.equal(repo.listDueOutbox(10).filter((item) => item.dedupeKey.startsWith("codex-only:")).length, 0);
+    assert.equal(repo.listEventsForBinding(binding.id).some((event) => event.eventType === "session.reconciled_active_turn"), true);
   } finally {
     cleanup();
   }
@@ -2938,6 +3499,67 @@ test("bootstrap restores terminal status from event history after stale idle rec
   }
 });
 
+test("bootstrap promotes stale failed binding to newer completed turn from thread detail", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    codex.threads = [
+      {
+        id: "thr_failed_then_completed",
+        name: "Failed then completed",
+        preview: "Failed then completed",
+        cwd: dir,
+        status: { type: "notLoaded" },
+        updatedAt: Date.now(),
+        turns: [
+          {
+            id: "turn_old_failed",
+            status: "failed",
+            completedAt: Date.now() - 10000,
+            error: { message: "401 Unauthorized" },
+            items: [{ type: "agentMessage", text: "old failed" }]
+          },
+          {
+            id: "turn_new_completed",
+            status: "completed",
+            completedAt: Date.now(),
+            items: [{ type: "agentMessage", text: "最终结论：后续轮次已经完成。" }]
+          }
+        ]
+      }
+    ];
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_failed_then_completed",
+      feishuChatId: "chat_1",
+      feishuTopicRootMessageId: "root_failed_then_completed",
+      title: "Failed then completed",
+      status: "failed",
+      createdFrom: "manual_import"
+    });
+    repo.updateBindingStatus(binding.id, "failed", "turn_old_failed");
+    repo.insertEvent({
+      sessionBindingId: binding.id,
+      codexThreadId: binding.codexThreadId,
+      codexTurnId: "turn_old_failed",
+      eventType: "task.failed",
+      eventPayload: { text: "任务状态：任务失败。原因：401 Unauthorized。发送 /logs 查看任务记录。" }
+    });
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+
+    await service.bootstrapProjectsFromConfig();
+
+    const repaired = repo.findBindingById(binding.id);
+    assert.equal(repaired?.status, "completed");
+    assert.equal(repaired?.lastTurnId, "turn_new_completed");
+    const events = repo.listEventsForBinding(binding.id);
+    assert.equal(events.some((event) => event.eventType === "session.reconciled_terminal_turn" && event.codexTurnId === "turn_new_completed"), true);
+    assert.equal(events.some((event) => event.eventType === "task.completed" && event.codexTurnId === "turn_new_completed"), true);
+  } finally {
+    cleanup();
+  }
+});
+
 test("bootstrap skips draft task chats that do not have real Codex thread ids yet", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
@@ -3120,6 +3742,28 @@ test("visible task and diagnostic buttons have concrete handlers", async () => {
       ),
       true
     );
+  } finally {
+    cleanup();
+  }
+});
+
+test("direct Feishu text replies are split instead of truncated", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    config.bridge.maxFeishuTextLength = 620;
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+    const longText = Array.from({ length: 80 }, (_, index) => `第${index + 1}段内容必须完整发送到飞书，不应该在桥接层被截断。`).join("\n");
+
+    await (service as any).sendTextToTarget({ chatId: "chat_1", rootMessageId: "root_long_reply" }, longText);
+
+    const textMessages = feishu.sent.filter((entry) => entry.type === "text");
+    assert.equal(textMessages.length > 1, true);
+    assert.equal(String(textMessages[0]?.payload).startsWith("(1/"), true);
+    assert.equal(textMessages.every((entry) => String(entry.payload).includes("已截断") === false), true);
+    assert.equal(textMessages.some((entry) => String(entry.payload).includes("第80段内容必须完整发送到飞书")), true);
   } finally {
     cleanup();
   }
@@ -3419,6 +4063,171 @@ test("completed notification preserves markdown final result from Codex thread",
     assert.equal(payload.includes("1. 先修复飞书卡片排版。"), true);
     assert.equal(payload.includes("| 项目 | 状态 |"), true);
     assert.equal(payload.includes("- npm run check"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("failed notification for old turn is ignored when the same thread has a newer active turn", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    codex.threads = [
+      {
+        id: "thr_failed_then_active",
+        name: "Failed then active",
+        preview: "Failed then active",
+        cwd: dir,
+        status: { type: "idle" },
+        turns: [
+          { id: "turn_old_failed", status: "failed", error: { message: "401 Unauthorized" } },
+          { id: "turn_new_running", status: "running" }
+        ],
+        updatedAt: Date.now()
+      }
+    ];
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_failed_then_active",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Failed then active",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+
+    await codex.notifications.notification![0]!({
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: { id: "turn_old_failed", status: "failed", error: { message: "401 Unauthorized" } }
+      }
+    });
+
+    const repaired = repo.findBindingById(binding.id);
+    assert.equal(repaired?.status, "running");
+    assert.equal(repaired?.lastTurnId, "turn_new_running");
+    assert.equal(repo.listDueOutbox(10).some((item) => item.notificationType === "task_failed"), false);
+    assert.equal(repo.listEventsForBinding(binding.id).some((event) => event.eventType === "turn.terminal_ignored_due_to_active_turn"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("failed notification summary includes the real turn error reason", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const codex = new MockCodex();
+    codex.threads = [
+      {
+        id: "thr_real_failed_reason",
+        name: "Real failed reason",
+        preview: "Real failed reason",
+        cwd: dir,
+        status: { type: "idle" },
+        turns: [
+          {
+            id: "turn_real_failed_reason",
+            status: "failed",
+            error: { message: "unexpected status 401 Unauthorized: 未提供认证凭据" },
+            items: []
+          }
+        ],
+        updatedAt: Date.now()
+      }
+    ];
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_real_failed_reason",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root",
+      feishuContainerKind: "dedicated_chat",
+      title: "Real failed reason",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+
+    await codex.notifications.notification![0]!({
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: { id: "turn_real_failed_reason", status: "failed", error: { message: "unexpected status 401 Unauthorized: 未提供认证凭据" } }
+      }
+    });
+
+    const failedEvent = repo.listEventsForBinding(binding.id).find((event) => event.eventType === "task.failed");
+    assert.equal(typeof failedEvent?.eventPayload.text, "string");
+    assert.equal(String(failedEvent?.eventPayload.text).includes("401 Unauthorized"), true);
+    assert.equal(String(failedEvent?.eventPayload.text).includes("未提供认证凭据"), true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("completed notification preserves code blocks and command lines from Codex thread", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const finalResult = [
+      "修复完成，关键代码如下：",
+      "",
+      "```ts",
+      "const enabled = true;",
+      "console.log(enabled);",
+      "```",
+      "",
+      "验证命令：",
+      "",
+      "npm run check"
+    ].join("\n");
+    const codex = new MockCodex();
+    codex.threads = [
+      {
+        id: "thr_code_report",
+        name: "Code report",
+        preview: "Code report",
+        cwd: dir,
+        status: { type: "idle" },
+        turns: [
+          {
+            id: "turn_code_report",
+            status: "completed",
+            items: [
+              { type: "reasoning", summary: ["保留代码块和命令。"], content: [] },
+              { type: "agentMessage", text: finalResult }
+            ]
+          }
+        ],
+        updatedAt: Date.now()
+      }
+    ];
+    const service = new TaskService(config, repo, codex as any, new MockFeishu(), makeLogger(dir));
+    const binding = repo.createOrUpdateBinding({
+      codexThreadId: "thr_code_report",
+      feishuChatId: "task_chat_1",
+      feishuTopicRootMessageId: "task-root-code",
+      feishuContainerKind: "dedicated_chat",
+      title: "Code report",
+      status: "running",
+      createdFrom: "manual_import"
+    });
+    await codex.notifications.notification![0]!( {
+      method: "turn/completed",
+      params: {
+        threadId: binding.codexThreadId,
+        turn: { id: "turn_code_report", status: "completed", items: [] }
+      }
+    });
+    const result = findTaskReportOutbox(repo.listDueOutbox(10));
+    assert.ok(result);
+    const payload = JSON.stringify(result.payload);
+    assert.equal(payload.includes("```ts"), true);
+    assert.equal(payload.includes("const enabled = true;"), true);
+    assert.equal(payload.includes("npm run check"), true);
+    assert.equal(payload.includes("代码块已省略"), false);
   } finally {
     cleanup();
   }

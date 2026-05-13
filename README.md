@@ -2,7 +2,14 @@
 
 Codex Feishu Helper 是一个本地桥接服务，用飞书群聊控制本机正在运行的 Codex Desktop 对话。它适合个人把飞书当作 Codex 任务控制台：在主控群里选择项目、创建任务、查看任务列表，在每个任务的独立飞书会话里持续追问和接收进度、结论。
 
-核心路线是 **desktop_ipc only**：bridge 只连接普通 Codex Desktop 暴露的本机 IPC 管道，不启动 helper 自己的 Codex runtime，也不要求补丁版 Desktop、canonical WebSocket 或代理共享启动。飞书发来的消息最终进入同一个普通 Desktop runtime，因此 Desktop 侧能看到真实 thread，飞书侧能继续控制同一个 thread。
+当前主线是 **官方 Codex App Server 直连 + Desktop IPC 兼容**：
+
+- `desktop_proxy`：唯一受支持的飞书新建真实 Desktop thread 路线。名字沿用旧配置，但当前实际底层是 direct `codex app-server` stdio，并通过官方 app-server 接口设置 thread name；goal 只在用户发送 Codex 官方 `/goal` 指令或其它显式 goal 操作时进入。
+- `desktop_ipc`：用于接管普通 Desktop 已打开线程和 follower 控制；对飞书新任务入口只保留草稿和接管提示，不再承诺直接新建线程。
+- 当 `connectionMode=desktop_proxy` 但本机 direct `codex app-server` 链路仍不可用时，bridge 会在 transport 层自动降级到 `desktop_ipc`，保证 `/tasks`、`/claim` 和已打开线程继续可用；但这不代表飞书已经恢复“直接新建真实线程”能力。
+- `desktop_proxy` 当前不是“复用 Desktop 已登录 server”的 attach 模式，而是 bridge 直接拉起一个 `codex app-server` 子进程走官方 app-server 协议。因此它是否能真正执行首轮，还取决于这个 app-server 进程自己的认证可用性，而不能只看 Desktop UI 是否已经打开。
+
+`desktop_ipc` 不会额外启动 helper 自己的 Codex runtime；`desktop_proxy` 则会直接拉起一个官方 `codex app-server` 子进程。当前这两条路径都不等价于“attach 到 Desktop 已登录的那条 app-server server”。
 
 当前默认设计是：
 
@@ -34,6 +41,7 @@ flowchart LR
   end
 
   subgraph Desktop["普通 Codex Desktop"]
+    Proxy["codex app-server<br/>direct stdio"]
     Pipe["Named Pipe<br/>\\\\.\\pipe\\codex-ipc"]
     Runtime["Desktop 自带 Codex runtime"]
     Thread["普通 Desktop thread"]
@@ -43,7 +51,9 @@ flowchart LR
   TaskChat --> LC
   LC --> TaskService
   TaskService <--> DB
+  TaskService <--> Proxy
   TaskService <--> Pipe
+  Proxy <--> Runtime
   Pipe <--> Runtime
   Runtime <--> Thread
   TaskService --> Outbox
@@ -53,7 +63,9 @@ flowchart LR
 
 ### 新任务流程
 
-用户在飞书发起任务后，bridge 不会创建第二套 Codex 服务。它会请求普通 Desktop 在同一个 IPC/runtime 下创建 thread，然后把这个 thread 和飞书任务会话绑定起来。
+用户在飞书发起任务后，bridge 不会创建第二套 Codex 服务。受支持的新线程路径只有官方 direct `codex app-server` stdio：它会请求普通 Desktop 创建 thread，并在同一个 Desktop runtime 下同步 thread title；不会把每条飞书需求自动写成 thread goal。goal 只由 Codex 官方 `/goal` 指令或其它显式 goal 操作触发。如果当前 direct app-server 链路不可用，bridge 不会伪造线程绑定，而是保留飞书草稿并提示先 `/tasks` 接管已有线程。此时 bridge 可能仍会降级到 `desktop_ipc` 并保持存活，但那只用于接管已有线程，不代表已经恢复新建线程。
+
+如果 direct `codex app-server` 虽然能启动，但 `getAuthStatus` / `account/read` 显示当前 provider 需要 OpenAI account auth 而该 app-server 进程并没有可用登录态，bridge 也会把任务保留为飞书草稿，不再创建一个首轮就会因 `401 Unauthorized` 失败的假成功线程。
 
 ```mermaid
 sequenceDiagram
@@ -66,13 +78,14 @@ sequenceDiagram
   U->>F: 在主控群发送需求或点击项目开始
   F->>B: 长连接投递消息/卡片事件
   B->>S: 记录 incoming message / pending prompt
-  B->>D: desktop_ipc start-conversation
-  D-->>B: 广播新 thread snapshot
+  B->>D: desktop_proxy thread/start
+  B->>D: desktop_proxy thread/name/set
+  D-->>B: thread/started / turn/item events
   B->>S: 写入 session binding
   B->>F: 创建任务会话并发送状态卡片
   U->>F: 在任务会话继续追问
   F->>B: 长连接投递后续消息
-  B->>D: follower start-turn / steer-turn
+  B->>D: turn/start / turn/steer
   D-->>B: 进度、审批、完成/失败事件
   B->>F: 更新进度卡片和最终结论
 ```
@@ -87,7 +100,7 @@ flowchart TD
   B --> C["下载资源<br/>GET /open-apis/im/v1/messages/{message_id}/resources/{file_key}?type=image"]
   C --> D["保存到<br/>~/.feishu-codex/attachments/..."]
   D --> E["构造 Codex 输入<br/>text + localImage"]
-  E --> F["发送到普通 Desktop IPC"]
+  E --> F["发送到 Desktop Proxy 或 IPC"]
   F --> G["同一个 Codex Desktop thread 处理图片"]
 ```
 
@@ -96,7 +109,7 @@ flowchart TD
 能做：
 
 - 在飞书主控群打开 Codex 控制台、查看项目、查看运行任务和历史任务。
-- 从飞书创建普通 Codex Desktop thread，并在独立任务会话里持续追问。
+- 在 `desktop_proxy` 可用时，从飞书创建真实普通 Codex Desktop thread，并在独立任务会话里持续追问。
 - 接管已经在普通 Desktop 中存在的 thread。
 - 把飞书图片消息下载到本机后作为 `localImage` 交给普通 Desktop thread。
 - 把审批、队列、进度、失败、完成结论以飞书卡片/消息形式回传。
@@ -196,12 +209,18 @@ notepad $env:USERPROFILE\.feishu-codex\config.json
 
 最小可运行配置示例：
 
+如果目标包含“飞书直接新建真实 Desktop 线程”，这里建议直接把 `connectionMode` 配成 `desktop_proxy`，不要再从 `desktop_ipc` 起步。
+
 ```json
 {
   "server": {
     "host": "127.0.0.1",
     "port": 8787,
     "adminToken": "change-this-local-token"
+  },
+  "codex": {
+    "connectionMode": "desktop_proxy",
+    "desktopProxyCommand": "codex"
   },
   "feishu": {
     "appId": "cli_xxx",
@@ -232,7 +251,7 @@ npm run doctor
 启动成功后，日志通常能看到：
 
 ```text
-codex desktop ipc transport ready
+codex desktop proxy transport ready
 codex app workspace sync completed
 feishu long connection ready
 ```
@@ -245,9 +264,30 @@ feishu long connection ready
 
 如果一切正常，机器人会回复 `Codex 控制台` 卡片。点击 `项目` 应能看到当前普通 Codex Desktop 已记录的 active 工作区。
 
+### 官方 Desktop Proxy 模式
+
+优先推荐 `desktop_proxy`。它沿用旧模式名，但当前实际使用官方 direct `codex app-server` 连接当前正在运行的 Codex Desktop：
+
+```json
+{
+  "codex": {
+    "connectionMode": "desktop_proxy",
+    "desktopProxyCommand": "codex"
+  }
+}
+```
+
+这个模式当前不再把 `codex app-server proxy` / Remote Control 作为飞书新建线程的前置条件。真正需要满足的是：本机 `codex` CLI 可用，并且 `codex app-server` 能被 bridge 直接拉起；如果这条链路失败，`/doctor` 里会看到 `Desktop Proxy ... / error`，并降级到 `desktop_ipc`。
+
+在该模式下：
+
+- 飞书新任务会通过官方 `thread/start` 创建真实 Desktop thread。
+- bridge 会继续通过官方 `thread/name/set` 同步线程标题；不会自动设置 `thread/goal`。如果用户在飞书里发送 Codex 官方 `/goal ...` 指令，它会作为普通 Codex 输入交给 Desktop，由 Codex 自己进入 goal 流程。
+- 后续继续对话走官方 `turn/start` / `turn/steer` / `turn/interrupt`。
+
 ### 普通 Desktop IPC 模式
 
-现在优先使用 `desktop_ipc` 连接普通正在运行的 Codex Desktop：
+`desktop_ipc` 现在主要作为兼容模式使用：
 
 ```json
 {
@@ -259,13 +299,14 @@ feishu long connection ready
 }
 ```
 
-该模式只连接普通 Desktop 自带的 `\\\\.\\pipe\\codex-ipc`，不会额外拉起独立 runtime。飞书侧可通过 `/tasks` 接管 Desktop 已打开的 thread；新任务选择项目后，bridge 通过 Desktop IPC host request `start-conversation` 请求普通 Desktop 创建新 thread，等待同一个 Desktop IPC pipe 广播包含同一 prompt 的新 thread snapshot，再绑定到该 Desktop owner client。后续继续 turn、steer、interrupt、设置模型/思考等级同样都走 Desktop owner IPC。
+该模式只连接普通 Desktop 自带的 `\\\\.\\pipe\\codex-ipc`，不会额外拉起独立 runtime。飞书侧可通过 `/tasks` 接管 Desktop 已打开的 thread；如果当前连接最终停留在 `desktop_ipc`，bridge 会把新需求保留为飞书草稿并提示先接管已有线程，不再把 Desktop IPC 的 `start-conversation` 当成当前受支持的飞书新建线程能力。底层仍保留 `start-conversation` / `thread/start` 协议探针代码，用于 transport 验证和兼容研究，但不作为当前产品承诺。
 
 使用顺序：
 
 1. 先打开普通 Codex Desktop。
-2. 启动 bridge：控制面板点 `Start Bridge`，或运行 `npm run start`。
-3. 在飞书主控群直接发送任务并选择项目，bridge 会在普通 Desktop 创建新 thread；也可以发送 `/tasks` 查看可接管线程，或发送 `/claim <threadId>` 绑定到飞书继续。
+2. 如果要走官方新线程主线，先确认本机 `codex --version` 与 `codex app-server` 可正常启动。
+3. 启动 bridge：控制面板点 `Start Bridge`，或运行 `npm run start`。
+4. 在飞书主控群直接发送任务并选择项目。`desktop_proxy` 可用时会通过官方 direct app-server 创建新 thread；如果最终只能停在 `desktop_ipc`，当前只能接管已有线程。
 
 工作区来源：
 
@@ -418,6 +459,14 @@ Get-Content $env:USERPROFILE\.feishu-codex\bridge.log -Tail 80
 ```
 
 正常应该有 `feishu long connection ready`。如果没有，重新启动 bridge 或使用控制面板的 `Start Bridge`。
+
+### 飞书能连上，但还是不能新建 Desktop 线程
+
+先看 `/doctor` 里的 `Desktop Proxy` 一行。
+
+- 如果是 `connected`，飞书新任务会优先通过官方 direct `codex app-server` 创建真实 Desktop thread。
+- 如果是 `error` 或 `not_started`，先检查 `codex --version`、`codex app-server` 和 bridge 日志里的 app-server 启动报错，然后重启 bridge 再试。
+- 如果你明确配置的是 `desktop_ipc`，当前飞书侧只支持接管已有线程，不支持直接新建新对话；bridge 会保留草稿并提示 `/tasks`，而不是伪造线程绑定。
 
 ### 项目列表不全
 

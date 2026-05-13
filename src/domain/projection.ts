@@ -13,7 +13,7 @@ export class ProjectionBuilder {
     const queuedMessages = this.repo.listQueuedMessages(bindingId).length;
     const pendingApprovals = this.repo.listPendingApprovals(bindingId).length + this.repo.listPendingServerRequests(bindingId).length;
     const lastSummaryEvent = [...events].reverse().find((event) =>
-      ["task.completed", "task.failed", "task.summary"].includes(event.eventType)
+      ["task.completed", "task.failed", "task.interrupted", "task.summary", "task.desktop_thread_creation_failed"].includes(event.eventType)
     );
     return {
       bindingId: binding.id,

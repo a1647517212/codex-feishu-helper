@@ -66,6 +66,7 @@ export interface FeishuChatInfoProvider {
 
 export class FeishuClient implements FeishuSender {
   private token: { value: string; expiresAt: number } | null = null;
+  private readonly requestTimeoutMs = 15000;
 
   constructor(
     private readonly config: BridgeConfig,
@@ -96,7 +97,7 @@ export class FeishuClient implements FeishuSender {
 
   async updateText(messageId: string, text: string): Promise<void> {
     const token = await this.getTenantAccessToken();
-    const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
+    const response = await this.fetchWithTimeout(`https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
       method: "PUT",
       headers: {
         authorization: `Bearer ${token}`,
@@ -106,13 +107,13 @@ export class FeishuClient implements FeishuSender {
         msg_type: "text",
         content: JSON.stringify({ text })
       })
-    });
+    }, "update text");
     await this.assertOk(response, "update text");
   }
 
   async updateCard(messageId: string, card: FeishuCard): Promise<void> {
     const token = await this.getTenantAccessToken();
-    const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
+    const response = await this.fetchWithTimeout(`https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}`, {
       method: "PATCH",
       headers: {
         authorization: `Bearer ${token}`,
@@ -122,7 +123,7 @@ export class FeishuClient implements FeishuSender {
         msg_type: "interactive",
         content: JSON.stringify(card)
       })
-    });
+    }, "update card");
     await this.assertOk(response, "update card");
   }
 
@@ -155,14 +156,14 @@ export class FeishuClient implements FeishuSender {
     };
     if (input.ownerId) body.owner_id = input.ownerId;
     if (input.userIds && input.userIds.length > 0) body.user_id_list = [...new Set(input.userIds)].slice(0, 50);
-    const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/chats?${params.toString()}`, {
+    const response = await this.fetchWithTimeout(`https://open.feishu.cn/open-apis/im/v1/chats?${params.toString()}`, {
       method: "POST",
       headers: {
         authorization: `Bearer ${token}`,
         "content-type": "application/json; charset=utf-8"
       },
       body: JSON.stringify(body)
-    });
+    }, "create task chat");
     const result = await this.assertOk(response, "create task chat");
     const data = getObject(result.data);
     return {
@@ -176,7 +177,7 @@ export class FeishuClient implements FeishuSender {
     const token = await this.getTenantAccessToken();
     const body: Record<string, unknown> = { name: truncateChatName(name) };
     if (description != null) body.description = description;
-    const response = await fetch(
+    const response = await this.fetchWithTimeout(
       `https://open.feishu.cn/open-apis/im/v1/chats/${encodeURIComponent(chatId)}?user_id_type=open_id`,
       {
         method: "PUT",
@@ -185,19 +186,21 @@ export class FeishuClient implements FeishuSender {
           "content-type": "application/json; charset=utf-8"
         },
         body: JSON.stringify(body)
-      }
+      },
+      "update chat name"
     );
     await this.assertOk(response, "update chat name");
   }
 
   async getChatInfo(chatId: string): Promise<FeishuChatInfo> {
     const token = await this.getTenantAccessToken();
-    const response = await fetch(
+    const response = await this.fetchWithTimeout(
       `https://open.feishu.cn/open-apis/im/v1/chats/${encodeURIComponent(chatId)}?user_id_type=open_id`,
       {
         method: "GET",
         headers: { authorization: `Bearer ${token}` }
-      }
+      },
+      "get chat info"
     );
     const body = await this.assertOk(response, "get chat info");
     const data = getObject(body.data);
@@ -215,14 +218,14 @@ export class FeishuClient implements FeishuSender {
 
   async setGroupMessageType(chatId: string, groupMessageType: "chat" | "thread"): Promise<void> {
     const token = await this.getTenantAccessToken();
-    const response = await fetch(`https://open.feishu.cn/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, {
+    const response = await this.fetchWithTimeout(`https://open.feishu.cn/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, {
       method: "PUT",
       headers: {
         authorization: `Bearer ${token}`,
         "content-type": "application/json; charset=utf-8"
       },
       body: JSON.stringify({ group_message_type: groupMessageType })
-    });
+    }, "update chat group message type");
     await this.assertOk(response, "update chat group message type");
   }
 
@@ -234,12 +237,13 @@ export class FeishuClient implements FeishuSender {
   }): Promise<DownloadedFeishuResource> {
     const token = await this.getTenantAccessToken();
     const params = new URLSearchParams({ type: input.resourceType });
-    const response = await fetch(
+    const response = await this.fetchWithTimeout(
       `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(input.messageId)}/resources/${encodeURIComponent(input.fileKey)}?${params.toString()}`,
       {
         method: "GET",
         headers: { authorization: `Bearer ${token}` }
-      }
+      },
+      "download message resource"
     );
     if (!response.ok) {
       const body = await safeResponseText(response);
@@ -274,7 +278,7 @@ export class FeishuClient implements FeishuSender {
 
   private async createMessage(chatId: string, msgType: "text" | "interactive", content: unknown): Promise<SentMessage> {
     const token = await this.getTenantAccessToken();
-    const response = await fetch("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
+    const response = await this.fetchWithTimeout("https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id", {
       method: "POST",
       headers: {
         authorization: `Bearer ${token}`,
@@ -285,7 +289,7 @@ export class FeishuClient implements FeishuSender {
         msg_type: msgType,
         content: JSON.stringify(content)
       })
-    });
+    }, "create message");
     const body = await this.assertOk(response, "create message");
     return extractMessage(body);
   }
@@ -297,7 +301,7 @@ export class FeishuClient implements FeishuSender {
     replyInThread = false
   ): Promise<SentMessage> {
     const token = await this.getTenantAccessToken();
-    const response = await fetch(
+    const response = await this.fetchWithTimeout(
       `https://open.feishu.cn/open-apis/im/v1/messages/${encodeURIComponent(messageId)}/reply`,
       {
         method: "POST",
@@ -310,7 +314,8 @@ export class FeishuClient implements FeishuSender {
           content: JSON.stringify(content),
           reply_in_thread: replyInThread
         })
-      }
+      },
+      "reply message"
     );
     const body = await this.assertOk(response, "reply message");
     return extractMessage(body);
@@ -322,14 +327,14 @@ export class FeishuClient implements FeishuSender {
     if (!this.config.feishu.appId || !this.config.feishu.appSecret) {
       throw new Error("Feishu appId/appSecret are required for sending messages.");
     }
-    const response = await fetch("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
+    const response = await this.fetchWithTimeout("https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal", {
       method: "POST",
       headers: { "content-type": "application/json; charset=utf-8" },
       body: JSON.stringify({
         app_id: this.config.feishu.appId,
         app_secret: this.config.feishu.appSecret
       })
-    });
+    }, "get tenant token");
     const body = (await response.json()) as Record<string, unknown>;
     if (!response.ok || body.code !== 0) {
       throw new Error(`Failed to get Feishu tenant token: ${JSON.stringify(body)}`);
@@ -348,6 +353,20 @@ export class FeishuClient implements FeishuSender {
       throw new Error(`Feishu ${operation} failed: ${JSON.stringify(body)}`);
     }
     return body;
+  }
+
+  private async fetchWithTimeout(url: string, init: RequestInit, operation: string): Promise<Response> {
+    try {
+      return await fetch(url, {
+        ...init,
+        signal: AbortSignal.timeout(this.requestTimeoutMs)
+      });
+    } catch (error) {
+      if (error instanceof Error && (error.name === "TimeoutError" || error.name === "AbortError")) {
+        throw new Error(`Feishu ${operation} timed out after ${this.requestTimeoutMs}ms`);
+      }
+      throw error;
+    }
   }
 }
 

@@ -346,6 +346,37 @@ export class Repository {
       .run(messageId, nowIso(), bindingId);
   }
 
+  resetBindingToWaitingForPrompt(input: {
+    bindingId: string;
+    codexThreadId: string;
+    title?: string | null;
+    cwd?: string | null;
+    projectId?: string | null;
+    lastTurnId?: string | null;
+  }): void {
+    this.database.db
+      .prepare(
+        `UPDATE session_bindings
+         SET codex_thread_id = ?,
+             project_id = COALESCE(?, project_id),
+             title = COALESCE(?, title),
+             cwd = COALESCE(?, cwd),
+             status = 'waiting_for_prompt',
+             last_turn_id = ?,
+             updated_at = ?
+         WHERE id = ?`
+      )
+      .run(
+        input.codexThreadId,
+        input.projectId ?? null,
+        input.title ?? null,
+        input.cwd ?? null,
+        input.lastTurnId ?? null,
+        nowIso(),
+        input.bindingId
+      );
+  }
+
   findBindingByTaskCardMessageId(chatId: string, messageId: string): SessionBinding | null {
     const row = this.database.db
       .prepare("SELECT * FROM session_bindings WHERE feishu_chat_id = ? AND feishu_task_card_message_id = ?")

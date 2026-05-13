@@ -11,7 +11,7 @@ const TaskChatTypeSchema = z.enum(["private", "public"]);
 const SandboxModeSchema = z.enum(["read-only", "workspace-write", "danger-full-access"]);
 const ApprovalPolicySchema = z.enum(["untrusted", "on-failure", "on-request", "never"]);
 const HttpServerModeSchema = z.enum(["auto", "enabled", "disabled"]);
-const CodexConnectionModeSchema = z.enum(["desktop_ipc"]);
+const CodexConnectionModeSchema = z.enum(["desktop_ipc", "desktop_proxy", "desktop_auto"]);
 
 const stringArrayFromEnv = z
   .union([z.array(z.string()), z.string()])
@@ -44,7 +44,8 @@ const ConfigSchema = z.object({
   codex: z
     .object({
       command: z.string().default("codex"),
-      connectionMode: CodexConnectionModeSchema.default("desktop_ipc"),
+      connectionMode: CodexConnectionModeSchema.default("desktop_auto"),
+      desktopProxyCommand: z.string().default("codex"),
       desktopIpcPipePath: z.string().default("\\\\.\\pipe\\codex-ipc"),
       desktopIpcInitialSnapshotWaitMs: z.number().int().nonnegative().default(1500),
       defaultModel: z.string().default("gpt-5.5"),
@@ -57,7 +58,8 @@ const ConfigSchema = z.object({
     })
     .default({
       command: "codex",
-      connectionMode: "desktop_ipc",
+      connectionMode: "desktop_auto",
+      desktopProxyCommand: "codex",
       desktopIpcPipePath: "\\\\.\\pipe\\codex-ipc",
       desktopIpcInitialSnapshotWaitMs: 1500,
       defaultModel: "gpt-5.5",

@@ -247,12 +247,46 @@ export interface DiagnosticSnapshot {
   nodeVersion: string;
   codexCommand: string;
   codexConnectionMode: string;
-  codexConnectionKind: "desktop_ipc" | "not_started" | "unknown";
+  codexConnectionKind: "desktop_ipc" | "desktop_proxy" | "not_started" | "unknown";
   codexDesktopIpc: {
     pipePath: string;
     status: "connected" | "disconnected" | "not_started" | "error";
     clientId: string | null;
     observedThreads: number;
+    capabilities?: {
+      appAsarPath: string | null;
+      requestHandlers: string[];
+      requestHandlerCount: number;
+      supportsHostThreadCreation: boolean;
+      supportsThreadGoal: boolean;
+      supportsThreadTitle: boolean;
+      supportsArchiveControl: boolean;
+      supportsFollowerControl: boolean;
+      probeError: string | null;
+    } | null;
+  } | null;
+  codexDesktopProxy: {
+    command: string;
+    status: "connected" | "disconnected" | "not_started" | "error";
+  } | null;
+  codexRemoteControl: {
+    codexHome: string;
+    configPath: string;
+    appStatePath: string;
+    featureEnabled: boolean | null;
+    stateDbPath: string | null;
+    enrollmentCount: number | null;
+    localFeatureStateDbPath: string | null;
+    localFeatureState: "enabled" | "disabled" | "unset" | "missing_db" | "missing_table" | "unknown";
+    localFeatureEntryCount: number | null;
+    localFeatureUpdatedAt: string | null;
+    controlSocketPath: string;
+    controlSocketExists: boolean;
+    loginStatus: string | null;
+    loginAuthMode: "api_key" | "account" | "logged_out" | "unknown" | "error";
+    cloudAccess: string | null;
+    authorizedClientCount: number | null;
+    probeError: string | null;
   } | null;
   codexAvailable: boolean;
   appServerStatus: "connected" | "disconnected" | "not_started" | "error";

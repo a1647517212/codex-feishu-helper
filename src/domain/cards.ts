@@ -13,6 +13,7 @@ import type {
   TaskSubAgentProjection,
   WorkspaceCheckpoint
 } from "../core/types.js";
+import { DiagnosticsService } from "../bridge/diagnostics.js";
 import type { WorkspaceImpactSummary, WorkspaceRestoreSummary } from "./checkpoints.js";
 import type { InteractionMode } from "../config.js";
 
@@ -833,6 +834,33 @@ export class CardRenderer {
           snapshot.codexDesktopIpc
             ? `Desktop IPC：${snapshot.codexDesktopIpc.pipePath} / ${snapshot.codexDesktopIpc.status} / ${snapshot.codexDesktopIpc.observedThreads} 个线程`
             : null,
+          snapshot.codexDesktopProxy
+            ? `Desktop Proxy：${snapshot.codexDesktopProxy.command} / ${snapshot.codexDesktopProxy.status}`
+            : null,
+          snapshot.codexRemoteControl
+            ? `Remote Control：${remoteControlFeatureText(snapshot.codexRemoteControl.featureEnabled)} / 登录 ${remoteControlAuthText(snapshot.codexRemoteControl.loginAuthMode)} / Cloud ${remoteControlCloudAccessText(snapshot.codexRemoteControl.cloudAccess)} / enrollment ${remoteControlEnrollmentText(snapshot.codexRemoteControl.enrollmentCount)}`
+            : null,
+          snapshot.codexRemoteControl
+            ? `Remote Control 本地特性：${remoteControlLocalFeatureStateText(snapshot.codexRemoteControl.localFeatureState)} / 记录 ${remoteControlLocalFeatureEntryCountText(snapshot.codexRemoteControl.localFeatureEntryCount)}`
+            : null,
+          snapshot.codexRemoteControl?.localFeatureStateDbPath
+            ? `Remote Control Feature DB：${snapshot.codexRemoteControl.localFeatureStateDbPath}`
+            : null,
+          snapshot.codexRemoteControl?.localFeatureUpdatedAt
+            ? `Remote Control 特性更新时间：${snapshot.codexRemoteControl.localFeatureUpdatedAt}`
+            : null,
+          snapshot.codexRemoteControl
+            ? `Remote Control Socket：${snapshot.codexRemoteControl.controlSocketExists ? "已存在" : "缺失"} / ${snapshot.codexRemoteControl.controlSocketPath}`
+            : null,
+          snapshot.codexRemoteControl
+            ? `Remote Control 控制端授权：${remoteControlAuthorizedClientText(snapshot.codexRemoteControl.authorizedClientCount)} / Global State ${snapshot.codexRemoteControl.appStatePath}`
+            : null,
+          snapshot.codexRemoteControl?.stateDbPath ? `Remote Control State DB：${snapshot.codexRemoteControl.stateDbPath}` : null,
+          snapshot.codexRemoteControl?.loginStatus ? `登录状态：${snapshot.codexRemoteControl.loginStatus}` : null,
+          snapshot.codexRemoteControl?.probeError ? `Remote Control 探测：${snapshot.codexRemoteControl.probeError}` : null,
+          DiagnosticsService.remoteControlRecommendation(snapshot),
+          DiagnosticsService.desktopProxyRecommendation(snapshot),
+          DiagnosticsService.desktopIpcRecommendation(snapshot),
           `飞书配置：${snapshot.feishuConfigured ? "已配置" : "未完整配置"}`,
           `消息接入：${snapshot.feishuMessageTransport === "long_connection" ? "长连接" : "HTTP 回调"}`,
           `卡片回调：${snapshot.feishuCardActionTransport === "long_connection" ? "长连接" : "HTTP 回调"}`,
@@ -857,9 +885,10 @@ export class CardRenderer {
           `最近错误：${snapshot.lastError ?? "无"}`
         ].join("\n")
       ),
-      commandText(["/doctor", "/notify test", "/notify history"]),
-      maybeActions(this.interactionMode, [button("恢复连接", "diagnostic_recover"), button("发送测试通知", "send_test_notification")]),
-      maybeActions(this.interactionMode, [button("通知历史", "notification_history"), button("通知设置", "notification_settings_global")])
+      commandText(["/doctor", "/tasks", "/notify test", "/notify history"]),
+      maybeActions(this.interactionMode, [button("恢复连接", "diagnostic_recover"), button("电脑任务", "claim_sessions")]),
+      maybeActions(this.interactionMode, [button("发送测试通知", "send_test_notification"), button("通知设置", "notification_settings_global")]),
+      maybeActions(this.interactionMode, [button("通知历史", "notification_history")])
     ].filter(Boolean) as Record<string, unknown>[];
     return card("Bridge 诊断", elements);
   }
@@ -1541,15 +1570,50 @@ const codexOnlyCompletionTitle = (status: string): string =>
   })[status] ?? "Codex Desktop 任务已结束";
 
 const codexConnectionText = (mode: string, kind: string): string => {
-  const modeText = ({ desktop_ipc: "Desktop IPC" } as Record<string, string>)[mode] ?? mode;
+  const modeText = ({ desktop_ipc: "Desktop IPC", desktop_proxy: "Desktop Proxy", desktop_auto: "Desktop Auto" } as Record<string, string>)[mode] ?? mode;
   const kindText =
     ({
       desktop_ipc: "普通 Desktop IPC",
+      desktop_proxy: "官方 App Server Proxy",
       not_started: "未启动",
       unknown: "未知"
     } as Record<string, string>)[kind] ?? kind;
   return `${modeText} / ${kindText}`;
 };
+
+const remoteControlFeatureText = (enabled: boolean | null): string =>
+  enabled === true ? "已开启" : enabled === false ? "未开启" : "未显式配置";
+
+const remoteControlCloudAccessText = (value: string | null): string =>
+  value ?? "未知";
+
+const remoteControlEnrollmentText = (count: number | null): string =>
+  count === null ? "未知" : String(count);
+
+const remoteControlAuthorizedClientText = (count: number | null): string =>
+  count === null ? "未知" : `${count} 台`;
+
+const remoteControlLocalFeatureStateText = (state: string): string =>
+  ({
+    enabled: "官方已启用",
+    disabled: "官方已禁用",
+    unset: "未写入",
+    missing_db: "缺少 codex-dev.db",
+    missing_table: "缺少特性表",
+    unknown: "未知"
+  })[state] ?? state;
+
+const remoteControlLocalFeatureEntryCountText = (count: number | null): string =>
+  count === null ? "未知" : `${count} 条`;
+
+const remoteControlAuthText = (mode: string): string =>
+  ({
+    api_key: "API key",
+    account: "账户登录",
+    logged_out: "未登录",
+    unknown: "未知",
+    error: "检测失败"
+  })[mode] ?? mode;
 
 const formatImpactSummary = (impact: WorkspaceImpactSummary | null): string => {
   if (!impact) return "还没有可对比的检查点。下一轮任务完成后会自动生成。";

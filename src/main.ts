@@ -32,7 +32,7 @@ if (command === "serve") {
   }
 } else if (command === "doctor") {
   const app = new BridgeApp(config);
-  await app.tasks.bootstrapProjectsFromConfig();
+  await app.tasks.bootstrapProjectsFromConfig({ reconcile: false });
   const snapshot = await app.diagnostics.snapshot();
   console.log(JSON.stringify(snapshot, null, 2));
   app.database.close();

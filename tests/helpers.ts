@@ -40,7 +40,8 @@ export const makeConfig = (dir: string): BridgeConfig => ({
   server: { host: "127.0.0.1", port: 0, mode: "auto", adminToken: "test-token" },
   codex: {
     command: "codex",
-    connectionMode: "desktop_ipc",
+    connectionMode: "desktop_auto",
+    desktopProxyCommand: "codex",
     desktopIpcPipePath: "\\\\.\\pipe\\codex-ipc",
     desktopIpcInitialSnapshotWaitMs: 1500,
     defaultModel: "gpt-5.5",
@@ -207,8 +208,28 @@ export class MockFeishu implements FeishuSender {
 
 export class MockCodex {
   status = "connected" as const;
-  connectionKind: "desktop_ipc" | "not_started" | "unknown" = "desktop_ipc";
+  connectionKind: "desktop_ipc" | "desktop_proxy" | "not_started" | "unknown" = "desktop_ipc";
   desktopIpcSnapshot = null;
+  desktopProxySnapshot = null;
+  executionReadiness: {
+    usable: boolean;
+    connectionKind: "desktop_ipc" | "desktop_proxy" | "not_started" | "unknown";
+    reason: string | null;
+    authMethod: string | null;
+    requiresOpenaiAuth: boolean | null;
+    accountType: string | null;
+    accountEmail: string | null;
+    raw: Record<string, unknown>;
+  } = {
+    usable: true,
+    connectionKind: "desktop_proxy",
+    reason: null,
+    authMethod: "chatgpt",
+    requiresOpenaiAuth: true,
+    accountType: "chatgpt",
+    accountEmail: "test@example.com",
+    raw: {}
+  };
   notifications: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
   requests: Record<string, Array<(message: Record<string, unknown>) => void>> = {};
   turns: Array<{ threadId: string; text: string; attachments?: unknown[] }> = [];
@@ -222,6 +243,8 @@ export class MockCodex {
   archived: string[] = [];
   unarchived: string[] = [];
   renamed: Array<{ threadId: string; name: string }> = [];
+  goals: Array<{ threadId: string; objective: string }> = [];
+  clearedGoals: string[] = [];
   threads: any[] = [];
   listCalls: Array<{ limit?: number; pageSize?: number; maxPages?: number }> = [];
   readFailures = new Map<string, Error>();
@@ -240,6 +263,10 @@ export class MockCodex {
   async listThreads(limit?: number, options?: { pageSize?: number; maxPages?: number }): Promise<any[]> {
     this.listCalls.push({ limit, ...options });
     return this.threads;
+  }
+
+  async getExecutionReadiness() {
+    return this.executionReadiness;
   }
 
   async readThread(threadId: string): Promise<Record<string, unknown>> {
@@ -314,6 +341,27 @@ export class MockCodex {
   async setThreadName(threadId: string, name: string): Promise<Record<string, unknown>> {
     this.renamed.push({ threadId, name });
     return {};
+  }
+
+  async setThreadGoal(threadId: string, objective: string): Promise<Record<string, unknown>> {
+    this.goals.push({ threadId, objective });
+    return {
+      goal: {
+        threadId,
+        objective,
+        status: "active",
+        tokenBudget: null,
+        tokensUsed: 0,
+        timeUsedSeconds: 0,
+        createdAt: Math.floor(Date.now() / 1000),
+        updatedAt: Math.floor(Date.now() / 1000)
+      }
+    };
+  }
+
+  async clearThreadGoal(threadId: string): Promise<Record<string, unknown>> {
+    this.clearedGoals.push(threadId);
+    return { cleared: true };
   }
 
   async respondToServerRequest(requestId: string | number, result: Record<string, unknown>): Promise<void> {
