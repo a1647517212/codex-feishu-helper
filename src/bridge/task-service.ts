@@ -3962,11 +3962,14 @@ const latestTerminalTurnFromThreadDetail = (detail: Record<string, unknown> | nu
     if (isActiveCodexTurnStatus(object.status)) return null;
     const status = normalizeCodexOnlyTurnStatus(object.status);
     if (!status) continue;
+    const completedAt = numberTimestamp(object.completedAt);
+    const updatedAt = numberTimestamp(object.updatedAt);
+    if (status === "interrupted" && !completedAt && !updatedAt) continue;
     const turnId = asString(object.id) ?? asString(object.turnId) ?? `turn_${index}`;
     return {
       status,
       id: turnId,
-      updatedAt: numberTimestamp(object.completedAt) ?? numberTimestamp(object.updatedAt) ?? numberTimestamp(rawThread.updatedAt),
+      updatedAt: completedAt ?? updatedAt ?? numberTimestamp(rawThread.updatedAt),
       report: mergeThreadReports(detail ? extractThreadReport(detail) : null, extractTurnReport(object)),
       raw: object
     };

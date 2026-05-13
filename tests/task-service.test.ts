@@ -2502,6 +2502,48 @@ test("codex-only completion scan repairs bound terminal task when thread has a n
   }
 });
 
+test("codex-only completion scan ignores interrupted turn without terminal timestamp", async () => {
+  const { repo, dir, cleanup } = makeTempRepo();
+  try {
+    const config = makeConfig(dir);
+    const feishu = new MockFeishu();
+    const codex = new MockCodex();
+    const now = Date.now();
+    codex.threads = [
+      {
+        id: "thr_interrupted_without_terminal_time",
+        name: "Interrupted without terminal time",
+        preview: "Interrupted without terminal time",
+        cwd: dir,
+        status: { type: "idle" },
+        updatedAt: now
+      }
+    ];
+    (codex as unknown as { readThread: (threadId: string) => Promise<Record<string, unknown>> }).readThread = async (threadId: string) => ({
+      thread: {
+        id: threadId,
+        name: "Interrupted without terminal time",
+        cwd: dir,
+        status: { type: "notLoaded" },
+        updatedAt: now,
+        turns: [
+          { id: "turn_old_completed", status: "completed", completedAt: now - 10000, items: [{ type: "agentMessage", text: "done" }] },
+          { id: "turn_new_interrupted", status: "interrupted", startedAt: now - 1000, completedAt: null, updatedAt: null, items: [] }
+        ]
+      }
+    });
+    const service = new TaskService(config, repo, codex as any, feishu, makeLogger(dir));
+
+    assert.equal(await service.scanCodexOnlyCompletions(), 1);
+    const outbox = repo.listDueOutbox(10).filter((item) => item.dedupeKey.startsWith("codex-only:"));
+    assert.equal(outbox.length, 1);
+    assert.equal(outbox[0]?.notificationType, "task_completed");
+    assert.equal(outbox[0]?.dedupeKey.includes("turn_old_completed:completed"), true);
+  } finally {
+    cleanup();
+  }
+});
+
 test("unclassified command lists only unclassified and non-ignored tasks", async () => {
   const { repo, dir, cleanup } = makeTempRepo();
   try {
